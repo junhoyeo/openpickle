@@ -69,7 +69,8 @@ pub struct RegisterResponse {
     pub registered: bool,
 }
 
-/// The body of `POST /api/session`.
+/// The body of `POST /api/session`. [`PickleClient::session_request`](crate::PickleClient::session_request)
+/// fills in what the app sends.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionRequest {
     pub bgm_library: Vec<String>,

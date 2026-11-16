@@ -245,7 +245,7 @@ pub struct SyncEvent {
     pub rev: i64,
 }
 
-/// An item of the `GET /api/events` stream.
+/// An item of [`PickleClient::events`](crate::PickleClient::events).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum PickleEvent {
     Chat(ChatEvent),
