@@ -1,11 +1,12 @@
 # @openpickle/client
 
 A typed TypeScript client for the Pickle character API (`https://character-api-prod.picklemem.com`),
-the backend of the Pickle iOS app. It was built from two Proxyman captures of the iOS app
-(version 1.1.19, build 202611071128) taken on 2026-11-16, 26 endpoints in all, and checked live
-by exporting a full account history. The client covers 24 endpoints. It has no runtime
-dependencies and uses `fetch`. It runs on Bun, and on Node versions that load TypeScript
-directly (tested on Node 26); older Node needs a bundler.
+the backend of the Pickle iOS app. It was built from three Proxyman captures of the iOS app
+(version 1.1.19, build 202611071128) taken on 2026-11-16, 30 endpoints in all. A full history
+export and login session refreshes were run against the live API; phone sign-in has only been
+replayed against its capture. The client covers 27 endpoints. It has no runtime dependencies and
+uses `fetch`. It runs on Bun, and on Node versions that load TypeScript directly (tested on
+Node 26); older Node needs a bundler.
 
 ```ts
 import { PickleClient } from "@openpickle/client";
@@ -23,7 +24,7 @@ for await (const event of pickle.events()) {
 
 ## Authentication
 
-Every call except `getUiDefinitions()` and the refresh itself sends `Authorization: Bearer <token>`.
+Every call except sign-in, the refresh and `getUiDefinitions()` sends `Authorization: Bearer <token>`.
 The token is an ES256 JWT issued by the API:
 
 | claim | meaning |
@@ -33,35 +34,49 @@ The token is an ES256 JWT issued by the API:
 | `exp` | access token expiry: **5 minutes** after `iat` |
 | `sexp` | login session expiry: 7 days after `iat` |
 
-New access tokens come from `POST /api/login-sessions/refresh`. It takes a refresh token
-(`{"login_session_token": "ls_…"}`, no bearer) and returns `login_session_jwt` (the access token),
-`expires_at` (7 days out) and a new `login_session_token`. The app sends
-`X-Pickle-Login-Session-Rotation: 1`: every refresh spends the token it was given.
-
-The client takes either credential:
+### Signing in with a phone number
 
 ```ts
-// An access token, or a function that returns a fresh one before every request.
-new PickleClient({ accessToken: "eyJ…" });
+const signedOut = new PickleClient();
+const { pending_id } = await signedOut.requestPhoneCode("+821012345678"); // texts a 6-digit code
+const issued = await signedOut.verifyPhoneCode(pending_id, "123456");
 
-// A refresh token. The client refreshes a minute before each access token expires, one refresh
-// at a time, and hands every new refresh token to onRotate. Store it: a lost token ends the
-// login session.
-new PickleClient({
-  loginSession: { token: savedToken, onRotate: (r) => save(r.login_session_token) },
+const pickle = new PickleClient({
+  loginSession: { token: issued.login_session_token, onRotate: (r) => save(r.login_session_token) },
 });
 ```
 
-**The refresh token in a capture belongs to the app on your phone.** Because each refresh spends
-the token, the app and this client cannot share one chain: whichever refreshes second holds a
-spent token. Using a token taken from the phone's traffic can sign the phone out (or the
-phone's next refresh ends the client's chain). How the server treats a spent token was not
-tested. A separate sign-in for the client would avoid this, but the sign-in calls (phone code,
-Apple, Kakao, LINE) are not in the captures.
+- `POST /api/login-sessions/phone-code` takes `{phone, region, carrier}` and returns
+  `{pending_id, expires_in: 600}`. The app sends the SIM's carrier (`lgu` was seen). Whether the
+  server needs it is untested, so the client sends `carrier` only when you pass it.
+- `POST /api/login-sessions` takes `{pending_id, code, kind: "phone_code"}` and returns
+  `{status: "issued", user_id, login_session_token, login_session_jwt, expires_at}`.
+
+A new sign-in starts its own login session and leaves the others alone: after the phone signed in
+again, an older session kept working. So the client and the phone app can both stay signed in.
+The app also offers Apple, Kakao and LINE sign-in; those calls are not in the captures.
+
+### Login sessions
+
+A login session is a chain of refresh tokens (`ls_…`). `POST /api/login-sessions/refresh` takes
+`{"login_session_token": "ls_…"}` and returns `login_session_jwt` (the access token), `expires_at`
+and the next `login_session_token`. Every refresh spends the token it was given. A spent token
+gets `401 {"detail":"session_not_found"}`; the chain itself keeps working for whoever holds the
+current token. `expires_at` is 7 days after the refresh, so a session lasts as long as it is
+refreshed at least once a week.
+
+A client built with `loginSession` refreshes a minute before each access token expires, one
+refresh at a time, and hands every new refresh token to `onRotate`. Store it: a lost token ends
+the login session. Two programs must not share one chain, because whichever refreshes second
+holds a spent token. That is also why a refresh token copied out of the phone's traffic signs the
+phone out.
+
+A client can also be built with `accessToken` (a token, or a function that returns a fresh one
+before every request) for one-off calls with a token copied from a capture.
 
 Any non-2xx response raises `PickleApiError`, with `error.detail` set when the body has a reason.
-A live probe with an expired token got `401 {"detail":"token_expired"}`, and one without a token
-got `401 {"detail":"unauthenticated"}`.
+A live probe with an expired access token got `401 {"detail":"token_expired"}`, and one without a
+token got `401 {"detail":"unauthenticated"}`.
 
 ## Identity headers
 
@@ -80,11 +95,14 @@ All of these were in the captures. `scripts/verify-capture.ts` checks each one a
 
 | Method | Path | Client method | Notes |
 | --- | --- | --- | --- |
+| POST | `/api/login-sessions/phone-code` | `requestPhoneCode(phone, { region?, carrier? })` | Texts a sign-in code. No token needed. |
+| POST | `/api/login-sessions` | `verifyPhoneCode(pendingId, code)` | Trades the code for a login session. No token needed. |
 | POST | `/api/login-sessions/refresh` | `refreshLoginSession(token)` | Rotates the refresh token. See [Authentication](#authentication). |
 | POST | `/api/account/register` | `registerAccount()` | Called on every launch. Returns account state; `registered: false` for an existing account. |
 | POST | `/api/session` | `startSession(overrides?)` | Account, plan, credits, character, and a LiveKit room token. About 100 keys; the useful ones are typed. |
 | GET | `/api/sync` | `sync()` | All rooms with `last_seq`, `read_seq`, unread counts. |
 | GET | `/api/events` | `events()` | Server-sent events. See [Events](#events). |
+| GET | `/api/rooms/{room}/history` | `getHistory(room)` | The newest messages of a room (up to 200), reactions inline. The app calls it after a fresh sign-in. |
 | GET | `/api/rooms/{room}/history/delta?after_seq=&limit=` | `getHistoryDelta(room, { afterSeq, limit })`, `history(room)` | Messages, reactions and card states after a sequence number, up to 500 per page. `history()` pages from the start. |
 | POST | `/api/rooms/{room}/messages` | `sendMessage(room, text, { clientMsgId?, inCall? })` | Returns `{ status, responder, seq: null }`. The reply arrives on `events()`. |
 | PUT | `/api/rooms/{room}/read` | `markRead(room, seq)` | Moves this device's read cursor. |
@@ -110,12 +128,17 @@ error handling.
 
 - `POST /api/telemetry`: the app's analytics batches. It authenticates with the LiveKit token from
   `startSession()`, not the API token.
+- `POST /api/push-token`: registers the device's Apple push token. A client without push
+  notifications has nothing to register.
 - `POST /api/secure/log/verified`: the app reports the result of its own credential-log
   verification. A client that did not run that verification should not report one.
 
 ### Not in the captures
 
-- **Sign-in.** Only the refresh of an existing login session was captured.
+- **Apple, Kakao and LINE sign-in.** Only phone sign-in was captured.
+- **Older history pages.** `getHistory()` returns the newest 200 messages; the request the app
+  uses to page further back was not captured. `history()` reads everything through
+  `history/delta` from sequence 0 instead.
 - **Other screen kinds.** The UI definitions name these data kinds: `activity`, `bubble`,
   `bubbles`, `character-voices`, `character_avatar_history`, `character_colors`,
   `character_settings`, `character_sharing`, `clone_brief`, `connection-catalog`,
@@ -162,6 +185,7 @@ An event name outside this list arrives as `{ event: "unknown", name, data }`.
 # A login session file: {"login_session_token": "ls_…"}. Every run refreshes once and writes the
 # next token back to the file, so do not run two commands at the same time.
 export PICKLE_SESSION_FILE=~/.config/pickle/login-session.json
+bun src/cli.ts login +821012345678  # texts a code, asks for it, writes the session file
 # Or an access token from the app's Authorization header, valid for 5 minutes:
 # export PICKLE_TOKEN='eyJhbGciOiJFUzI1NiIs...'
 
@@ -180,15 +204,17 @@ bun src/cli.ts token                # claims and seconds left of PICKLE_TOKEN
 bun install
 bun run typecheck
 bun test
-bun run verify:capture ~/Downloads/character-api-prod.picklemem.com_11-16-2026-19-15-36.proxymanlogv2
+bun run verify:capture ~/Downloads/character-api-prod.picklemem.com_11-16-2026-20-45-31.proxymanlogv2
 ```
 
 The client was also run against the live API. With an access token from the second capture,
 `export` read all 14 rooms (1,031 history items, 909 of them in the room with your own
 character). Then, with the owner's consent, the client took over the refresh token from that
-capture: three refreshes in a row each returned a working access token and the next refresh
-token, all within the same login session (`sid`), and `export` ran again through
-`PICKLE_SESSION_FILE`.
+capture: refreshes in a row each returned a working access token and the next refresh token, all
+within the same login session (`sid`), and `export` ran again through `PICKLE_SESSION_FILE`. The
+third capture shows the other side of that: the phone's next refresh, with its spent token, got
+`401 session_not_found`, and the client's chain still refreshed afterwards. Phone sign-in has not
+been run live; it needs a code texted to the owner's phone.
 
 `verify:capture` replays a Proxyman capture without touching the network. For every recorded
 request it calls the matching client method, with `fetch` replaced by one that answers with the
