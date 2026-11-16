@@ -1,0 +1,171 @@
+mod mock_server;
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use mock_server::{MockServer, Reply};
+use openpickle_api::{ClientOptions, Credentials, Error, LoginSession, PickleClient};
+
+fn jwt(exp_in: i64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let claims = format!(
+        r#"{{"sub":"user-live-test","sid":"sid-test","iat":{now},"exp":{},"sexp":{}}}"#,
+        now + exp_in,
+        now + 604800
+    );
+    format!(
+        "eyJhbGciOiJFUzI1NiJ9.{}.c2ln",
+        URL_SAFE_NO_PAD.encode(claims)
+    )
+}
+
+fn client(server: &MockServer, credentials: Credentials) -> PickleClient {
+    PickleClient::new(ClientOptions {
+        credentials,
+        base_url: Some(server.url()),
+        ..ClientOptions::default()
+    })
+    .unwrap()
+}
+
+const SYNC: &str = r#"{"rooms":[],"rev":4}"#;
+
+#[tokio::test]
+async fn login_session_refreshes_once_for_concurrent_requests() {
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let access = jwt(300);
+    let server = MockServer::start({
+        let refreshes = refreshes.clone();
+        let access = access.clone();
+        move |request| {
+            if request.path == "/api/login-sessions/refresh" {
+                let n = refreshes.fetch_add(1, Ordering::SeqCst) + 1;
+                let body = format!(
+                    r#"{{"login_session_jwt":"{access}","expires_at":"2026-11-23T00:00:00Z","login_session_token":"ls_next_{n}"}}"#
+                );
+                // Slow, so the other requests arrive while the refresh is in flight.
+                Reply { delay: Duration::from_millis(100), ..Reply::json(200, body) }
+            } else {
+                Reply::json(200, SYNC)
+            }
+        }
+    })
+    .await;
+
+    let rotated = Arc::new(Mutex::new(Vec::new()));
+    let session = LoginSession::new("ls_first", {
+        let rotated = rotated.clone();
+        move |refresh| {
+            rotated
+                .lock()
+                .unwrap()
+                .push(refresh.login_session_token.clone());
+            Ok(())
+        }
+    });
+    let pickle = client(&server, Credentials::LoginSession(session));
+
+    let calls = (0..8).map(|_| {
+        let pickle = pickle.clone();
+        tokio::spawn(async move { pickle.sync().await })
+    });
+    for call in calls {
+        assert_eq!(call.await.unwrap().unwrap().rev, 4);
+    }
+    pickle.sync().await.unwrap();
+
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    assert_eq!(*rotated.lock().unwrap(), ["ls_next_1"]);
+    let requests = server.take();
+    let refresh = &requests[0];
+    assert_eq!(refresh.path, "/api/login-sessions/refresh");
+    assert_eq!(refresh.body, br#"{"login_session_token":"ls_first"}"#);
+    assert_eq!(refresh.header("authorization"), None);
+    assert_eq!(refresh.header("x-pickle-login-session-rotation"), Some("1"));
+    let bearer = format!("Bearer {access}");
+    assert_eq!(requests.len(), 10);
+    assert!(
+        requests[1..]
+            .iter()
+            .all(|r| r.path == "/api/sync" && r.header("authorization") == Some(&bearer))
+    );
+}
+
+#[tokio::test]
+async fn seeded_access_token_skips_the_first_refresh_and_expired_one_rotates() {
+    let server = MockServer::start(|request| {
+        if request.path == "/api/login-sessions/refresh" {
+            Reply::json(401, r#"{"detail":"session_not_found"}"#)
+        } else {
+            Reply::json(200, SYNC)
+        }
+    })
+    .await;
+    let fresh = LoginSession::new("ls_a", |_| Ok(())).with_access_token(jwt(300));
+    client(&server, Credentials::LoginSession(fresh))
+        .sync()
+        .await
+        .unwrap();
+    assert_eq!(server.take().len(), 1);
+
+    // Less than a minute left: the client refreshes first, and a failed refresh fails the call.
+    let stale = LoginSession::new("ls_b", |_| Ok(())).with_access_token(jwt(30));
+    let error = client(&server, Credentials::LoginSession(stale))
+        .sync()
+        .await
+        .unwrap_err();
+    let api = error.api().expect("an API error");
+    assert_eq!(
+        (api.path.as_str(), api.status, api.detail.as_deref()),
+        (
+            "/api/login-sessions/refresh",
+            401,
+            Some("session_not_found")
+        )
+    );
+    assert_eq!(server.take().len(), 1, "the sync was not sent");
+}
+
+#[tokio::test]
+async fn api_errors_carry_status_detail_and_body() {
+    let server = MockServer::start(|request| match request.path.as_str() {
+        "/api/device/location/token" => Reply::json(409, r#"{"detail":"location_disabled"}"#),
+        _ => Reply {
+            content_type: "text/plain".into(),
+            ..Reply::json(502, "bad gateway")
+        },
+    })
+    .await;
+    let pickle = client(&server, Credentials::AccessToken("token".into()));
+
+    let error = pickle.request_location_token().await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "POST /api/device/location/token failed with 409: location_disabled"
+    );
+    let api = error.api().unwrap();
+    assert_eq!(api.method, "POST");
+    assert_eq!(api.detail.as_deref(), Some("location_disabled"));
+    assert_eq!(&api.body[..], br#"{"detail":"location_disabled"}"#);
+
+    let error = pickle.sync().await.unwrap_err();
+    let api = error.api().unwrap();
+    assert_eq!(
+        (api.status, api.detail.as_deref(), &api.body[..]),
+        (502, None, &b"bad gateway"[..])
+    );
+}
+
+#[tokio::test]
+async fn signed_out_client_sends_no_bearer_request() {
+    let server = MockServer::start(|_| Reply::json(200, "{}")).await;
+    let pickle = client(&server, Credentials::SignedOut);
+    assert!(matches!(pickle.sync().await, Err(Error::SignedOut)));
+    assert!(server.take().is_empty());
+}
