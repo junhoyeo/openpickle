@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { SseParser, toPickleEvent } from "../src/events";
+import { SseParser, toPickleEvent } from "../src/events.ts";
 
 const stream =
   "retry: 2200\n\n" +

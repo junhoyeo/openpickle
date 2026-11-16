@@ -4,7 +4,8 @@ A typed TypeScript client for the Pickle character API (`https://character-api-p
 the backend of the Pickle iOS app. It was built from two Proxyman captures of the iOS app
 (version 1.1.19, build 202611071128) taken on 2026-11-16, 26 endpoints in all, and checked live
 by exporting a full account history. The client covers 24 endpoints. It has no runtime
-dependencies and uses `fetch`.
+dependencies and uses `fetch`. It runs on Bun, and on Node versions that load TypeScript
+directly (tested on Node 26); older Node needs a bundler.
 
 ```ts
 import { PickleClient } from "picklemem-client";
@@ -68,7 +69,8 @@ The client sends the same app headers the iOS app sends (`X-Client-Version`, `X-
 the `User-Agent` and so on). The defaults in `IOS_PROFILE` are the values from the capture: an
 English-language iPhone in Korea with the KOR storefront. Override any of them with
 `profile: { ... }`. `deviceId` (sent with read cursors and device reports) and `launchId` default to
-new random UUIDs; pass your own to keep them stable.
+new random UUIDs; pass your own to keep them stable. Transport headers are left to the runtime's
+`fetch`; under Node it also adds `sec-fetch-mode` and its own `accept-encoding`.
 
 ## Endpoints
 

@@ -1,4 +1,4 @@
-import { SseParser, toPickleEvent, type PickleEvent } from "./events";
+import { SseParser, toPickleEvent, type PickleEvent } from "./events.ts";
 import type {
   ApiErrorBody,
   Character,
@@ -23,7 +23,7 @@ import type {
   StatusOk,
   SyncResponse,
   UiDefinitions,
-} from "./types";
+} from "./types.ts";
 
 export const DEFAULT_BASE_URL = "https://character-api-prod.picklemem.com";
 
@@ -97,7 +97,7 @@ export type PickleClientOptions = Credentials & {
   launchId?: string;
   profile?: Partial<ClientProfile>;
   baseUrl?: string;
-  fetch?: typeof fetch;
+  fetch?: (url: string, init: RequestInit) => Promise<Response>;
 };
 
 export interface RequestOptions {
@@ -115,20 +115,21 @@ export interface RequestOptions {
 
 /** A non-2xx response. `detail` is the server's reason code when it sent one. */
 export class PickleApiError extends Error {
-  constructor(
-    readonly method: string,
-    readonly path: string,
-    readonly status: number,
-    readonly body: unknown,
-  ) {
-    const detail = (body as Partial<ApiErrorBody> | null)?.detail;
-    super(`${method} ${path} failed with ${status}${detail ? `: ${detail}` : ""}`);
-    this.name = "PickleApiError";
-  }
+  readonly method: string;
+  readonly path: string;
+  readonly status: number;
+  readonly body: unknown;
+  readonly detail: string | undefined;
 
-  get detail(): string | undefined {
-    const detail = (this.body as Partial<ApiErrorBody> | null)?.detail;
-    return typeof detail === "string" ? detail : undefined;
+  constructor(method: string, path: string, status: number, body: unknown) {
+    const detail = (body as Partial<ApiErrorBody> | null)?.detail;
+    super(`${method} ${path} failed with ${status}${typeof detail === "string" ? `: ${detail}` : ""}`);
+    this.name = "PickleApiError";
+    this.method = method;
+    this.path = path;
+    this.status = status;
+    this.body = body;
+    this.detail = typeof detail === "string" ? detail : undefined;
   }
 }
 
@@ -140,7 +141,7 @@ export class PickleClient {
   readonly deviceId: string;
   readonly launchId: string;
   private readonly credentials: Credentials;
-  private readonly fetchImpl: typeof fetch;
+  private readonly fetchImpl: (url: string, init: RequestInit) => Promise<Response>;
   /** The access token from the last login session refresh, or the refresh in flight. */
   private sessionAccess: Promise<{ token: string; exp: number }> | undefined;
 
@@ -153,7 +154,8 @@ export class PickleClient {
     this.profile = { ...IOS_PROFILE, ...options.profile };
     this.deviceId = options.deviceId ?? crypto.randomUUID().toUpperCase();
     this.launchId = options.launchId ?? crypto.randomUUID();
-    this.fetchImpl = options.fetch ?? fetch;
+    // Calling the global fetch as a method of another object throws in browsers and Workers.
+    this.fetchImpl = options.fetch ?? ((url, init) => fetch(url, init));
   }
 
   // ---- Account and session ----

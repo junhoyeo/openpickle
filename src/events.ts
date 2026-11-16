@@ -1,6 +1,6 @@
 // `GET /api/events`: the server-sent event stream the app keeps open while in the foreground.
 
-import type { CharacterStatus, CreditUsage, JellyRewards, Plan, Room } from "./types";
+import type { CharacterStatus, CreditUsage, JellyRewards, Plan, Room } from "./types.ts";
 
 /** One parsed SSE frame. `data` is the raw text, lines joined with `\n`. */
 export interface SseFrame {

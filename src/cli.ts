@@ -4,7 +4,7 @@
 
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { PickleClient, decodeAccessToken } from "./client";
+import { PickleClient, decodeAccessToken } from "./client.ts";
 
 const USAGE = `usage: PICKLE_TOKEN=<jwt> pickle <command>
 

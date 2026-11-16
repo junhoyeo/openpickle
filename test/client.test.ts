@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { PickleApiError, PickleClient } from "../src/client";
+import { PickleApiError, PickleClient } from "../src/client.ts";
 
 function recorder(status: number, body: string) {
   const calls: { url: string; init: RequestInit }[] = [];

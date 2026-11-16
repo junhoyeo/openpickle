@@ -8,7 +8,7 @@
 
 import { execFileSync } from "node:child_process";
 import { isDeepStrictEqual } from "node:util";
-import { PickleApiError, PickleClient, type ClientProfile } from "../src/client";
+import { PickleApiError, PickleClient, type ClientProfile } from "../src/client.ts";
 
 interface Flow {
   name: string;

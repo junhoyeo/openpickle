@@ -1,3 +1,3 @@
-export * from "./client";
-export * from "./events";
-export type * from "./types";
+export * from "./client.ts";
+export * from "./events.ts";
+export type * from "./types.ts";
