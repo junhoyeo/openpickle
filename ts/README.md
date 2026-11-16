@@ -133,6 +133,8 @@ error handling.
   notifications has nothing to register.
 - `POST /api/secure/log/verified`: the app reports the result of its own credential-log
   verification. A client that did not run that verification should not report one.
+- `GET /api/screens/connection-catalog`: the catalog of services the character can connect to,
+  for the app's connections screen. `getScreen("connection-catalog")` returns it untyped.
 
 ### Not in the captures
 
