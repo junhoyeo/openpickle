@@ -26,6 +26,13 @@ pub const DEFAULT_BASE_URL: &str = "https://character-api-prod.picklemem.com";
 /// the async runtime.
 const BLOCKING_PARSE_THRESHOLD: usize = 256 * 1024;
 
+/// How long a request and its response may take together. The event stream is exempt.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A refresh gets longer. Giving up on one that the server has already processed loses the new
+/// token, and with it the login session, so a slow answer is worth waiting for.
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// What the app says about itself in request headers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientProfile {
@@ -308,7 +315,17 @@ impl PickleClient {
     pub fn new(options: ClientOptions) -> Result<Self> {
         let http = match options.http {
             Some(http) => http,
-            None => reqwest::Client::builder().gzip(true).brotli(true).build()?,
+            // Keep-alives let a connection that died quietly (sleep, a dropped network) fail
+            // instead of hanging; that matters most for the event stream, which has no timeout.
+            None => reqwest::Client::builder()
+                .gzip(true)
+                .brotli(true)
+                .connect_timeout(Duration::from_secs(15))
+                .tcp_keepalive(Duration::from_secs(30))
+                .http2_keep_alive_interval(Duration::from_secs(30))
+                .http2_keep_alive_timeout(Duration::from_secs(20))
+                .http2_keep_alive_while_idle(true)
+                .build()?,
         };
         let profile = options.profile;
         let device_id = options
@@ -454,7 +471,9 @@ impl PickleClient {
             .json(&json!({ "login_session_token": login_session_token }))?;
         const PATH: &str = "/api/login-sessions/refresh";
         // Not `request()`: `bearer_header()` calls this, and `request()` calls `bearer_header()`.
-        let response = self.execute(Method::POST, PATH, options, None).await?;
+        let response = self
+            .execute(Method::POST, PATH, options, None, Some(REFRESH_TIMEOUT))
+            .await?;
         parse_response(Method::POST, PATH, response).await
     }
 
@@ -593,7 +612,10 @@ impl PickleClient {
         options
             .headers
             .insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
-        let response = self.send(Method::GET, "/api/events", options).await?;
+        // No overall timeout: the stream stays open for as long as the app runs.
+        let response = self
+            .dispatch(Method::GET, "/api/events", options, None)
+            .await?;
         Ok(event_stream(response))
     }
 
@@ -789,11 +811,23 @@ impl PickleClient {
         path: &str,
         options: RequestOptions,
     ) -> Result<Response> {
+        self.dispatch(method, path, options, Some(REQUEST_TIMEOUT))
+            .await
+    }
+
+    /// `timeout` covers the whole exchange, body included; the event stream passes `None`.
+    async fn dispatch(
+        &self,
+        method: Method,
+        path: &str,
+        options: RequestOptions,
+        timeout: Option<Duration>,
+    ) -> Result<Response> {
         let bearer = match options.auth {
             Auth::Bearer => Some(self.bearer_header().await?),
             Auth::App | Auth::None => None,
         };
-        self.execute(method, path, options, bearer).await
+        self.execute(method, path, options, bearer, timeout).await
     }
 
     async fn execute(
@@ -802,6 +836,7 @@ impl PickleClient {
         path: &str,
         options: RequestOptions,
         bearer: Option<HeaderValue>,
+        timeout: Option<Duration>,
     ) -> Result<Response> {
         let inner = &self.inner;
         let mut headers = if options.auth == Auth::None {
@@ -823,6 +858,9 @@ impl PickleClient {
         append_query(&mut url, &options.query, path.contains('?'));
 
         let mut request = inner.http.request(method.clone(), url).headers(headers);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
         if let Some(body) = options.body {
             request = request.body(body);
         }
