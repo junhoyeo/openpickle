@@ -71,40 +71,53 @@ pub fn start() -> Result<
     Ok((commands, updates_rx))
 }
 
-/// Why a signed-in stretch ended.
+/// Why the backend stopped doing what it was doing.
 enum Ended {
     /// The server no longer knows the login session.
     SignedOut,
     /// The UI is gone.
     Closed,
+    /// Something on this computer failed. It says nothing about the login session, which
+    /// stays where it is.
+    Failed(String),
 }
 
 async fn run(store: Store, mut commands: Commands<Command>, updates: Updates<Update>) {
     let mut signed_in = store.session().map(|session| (session, None));
-    loop {
+    let ended = loop {
         let (session, access_token) = match signed_in.take() {
             Some(signed_in) => signed_in,
             None => {
                 updates.unbounded_send(Update::SignedOut).ok();
                 match sign_in(&store, &mut commands, &updates).await {
-                    Some((session, access_token)) => (session, Some(access_token)),
-                    None => return,
+                    Ok((session, access_token)) => (session, Some(access_token)),
+                    Err(ended) => break ended,
                 }
             }
         };
         match converse(&store, session, access_token, &mut commands, &updates).await {
+            // Without this, the next person to sign in would see the old conversations.
             Ended::SignedOut => {
-                // Without this, the next person to sign in would see the old conversations.
                 if let Err(error) = store.sign_out() {
-                    updates.unbounded_send(Update::SignedOut).ok();
-                    let reason = format!("Could not clear the previous session's data: {error}");
-                    updates.unbounded_send(Update::SignInFailed(reason)).ok();
-                    return;
+                    break Ended::Failed(format!(
+                        "Pickle ended this login session, but its data on this computer could \
+                         not be cleared: {error}"
+                    ));
                 }
             }
-            Ended::Closed => return,
+            ended => break ended,
         }
+    };
+    if let Ended::Failed(reason) = ended {
+        updates.unbounded_send(Update::Failed(reason)).ok();
     }
+}
+
+/// What to say when the HTTP client cannot be set up.
+fn cannot_start(error: &Error) -> Ended {
+    Ended::Failed(format!(
+        "Could not set up the connection to Pickle: {error}. You are still signed in."
+    ))
 }
 
 /// Runs the sign-in screen until a login session exists. Returns it with its first access token.
@@ -112,8 +125,9 @@ async fn sign_in(
     store: &Store,
     commands: &mut Commands<Command>,
     updates: &Updates<Update>,
-) -> Option<(Session, String)> {
-    let client = PickleClient::new(ClientOptions::default()).ok()?;
+) -> Result<(Session, String), Ended> {
+    let client =
+        PickleClient::new(ClientOptions::default()).map_err(|error| cannot_start(&error))?;
     let mut pending_id = None;
     while let Some(command) = commands.recv().await {
         let failure = match command {
@@ -136,7 +150,7 @@ async fn sign_in(
                             device_id: uuid::Uuid::new_v4().to_string().to_uppercase(),
                         };
                         match store.save_session(&session) {
-                            Ok(()) => return Some((session, issued.login_session_jwt)),
+                            Ok(()) => return Ok((session, issued.login_session_jwt)),
                             Err(error) => {
                                 format!("Signed in, but the session could not be saved: {error}")
                             }
@@ -150,7 +164,7 @@ async fn sign_in(
         };
         updates.unbounded_send(Update::SignInFailed(failure)).ok();
     }
-    None
+    Err(Ended::Closed)
 }
 
 /// What to tell the user when a sign-in call fails.
@@ -334,8 +348,10 @@ async fn converse(
         device_id: Some(device_id),
         ..Default::default()
     };
-    let Ok(client) = PickleClient::new(options) else {
-        return Ended::SignedOut;
+    // A failure here is local: only the server can say that the login session is gone.
+    let client = match PickleClient::new(options) {
+        Ok(client) => client,
+        Err(error) => return cannot_start(&error),
     };
 
     // First paint comes from the disk; the network is asked afterwards.
@@ -658,6 +674,29 @@ async fn download_avatar(store: &Store, url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_server_can_say_that_the_login_session_is_gone() {
+        let answered = |status, detail: &str| {
+            Error::Api(Box::new(openpickle_api::ApiError {
+                method: reqwest::Method::GET,
+                path: "/api/sync".into(),
+                status,
+                detail: Some(detail.into()),
+                body: Default::default(),
+            }))
+        };
+        assert!(session_is_gone(&answered(401, "session_not_found")));
+        // An expired access token is refreshed, and other answers are not about the session.
+        assert!(!session_is_gone(&answered(401, "token_expired")));
+        assert!(!session_is_gone(&answered(404, "session_not_found")));
+        // Failures on this computer must never sign anyone out: that deletes the session.
+        assert!(!session_is_gone(&Error::Rotate(std::io::Error::other(
+            "disk full"
+        ))));
+        assert!(!session_is_gone(&Error::RefreshAborted));
+        assert!(!session_is_gone(&Error::InvalidHeader));
+    }
 
     #[test]
     fn a_failed_write_stops_the_log_instead_of_leaving_a_gap() {

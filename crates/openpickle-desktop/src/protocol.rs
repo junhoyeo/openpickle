@@ -43,4 +43,7 @@ pub enum Update {
     Upsert(Vec<Message>),
     /// Whether the character is working on a reply, and on what when it says.
     Activity(Option<Option<String>>),
+    /// The backend stopped over something on this computer and cannot go on. The text says
+    /// what happened.
+    Failed(String),
 }

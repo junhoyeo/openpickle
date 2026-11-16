@@ -3,7 +3,8 @@
 use chrono::Local;
 use futures::{StreamExt, channel::mpsc::UnboundedReceiver};
 use gpui::{
-    AnyView, Context, Entity, Focusable, ImageSource, Subscription, Task, Window, div, prelude::*,
+    Context, Entity, Focusable, FontWeight, ImageSource, SharedString, Subscription, Task, Window,
+    div, prelude::*, px,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -22,6 +23,8 @@ enum Screen {
     Starting,
     Login(Entity<LoginView>),
     Chat(Entity<ChatView>),
+    /// The backend stopped; the text says why.
+    Failed(SharedString),
 }
 
 pub struct Shell {
@@ -115,6 +118,11 @@ impl Shell {
                 self.activity = activity;
                 self.refresh_rows(cx);
             }
+            Update::Failed(reason) => {
+                self._screen_events = None;
+                self.screen = Screen::Failed(reason.into());
+                cx.notify();
+            }
         }
     }
 
@@ -174,15 +182,34 @@ fn upsert(messages: &mut Vec<Message>, message: Message) {
 
 impl Render for Shell {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let screen: Option<AnyView> = match &self.screen {
-            Screen::Starting => None,
-            Screen::Login(login) => Some(login.clone().into()),
-            Screen::Chat(chat) => Some(chat.clone().into()),
-        };
-        div()
-            .size_full()
-            .bg(theme::color(theme::PAGE))
-            .children(screen)
+        let screen = div().size_full().bg(theme::color(theme::PAGE));
+        match &self.screen {
+            Screen::Starting => screen,
+            Screen::Login(login) => screen.child(login.clone()),
+            Screen::Chat(chat) => screen.child(chat.clone()),
+            Screen::Failed(reason) => screen
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(10.))
+                .px(px(36.))
+                .font_family(theme::FONT)
+                .text_size(theme::BODY)
+                .line_height(theme::BODY_LINE)
+                .text_center()
+                .text_color(theme::color(theme::TEXT_MUTED))
+                .child(
+                    div()
+                        .text_size(theme::LABEL)
+                        .line_height(theme::LABEL_LINE)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::color(theme::TEXT))
+                        .child("OpenPickle had to stop"),
+                )
+                .child(reason.clone())
+                .child("Quit and open the app again."),
+        }
     }
 }
 
