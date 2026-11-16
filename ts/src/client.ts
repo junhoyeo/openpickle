@@ -449,7 +449,13 @@ export class PickleClient {
     if (auth !== "none") Object.assign(headers, this.identityHeaders());
     if (auth === "bearer") headers.Authorization = `Bearer ${await this.bearerToken()}`;
     if (options.body !== undefined) headers["Content-Type"] = "application/json";
-    Object.assign(headers, options.headers);
+    // Header names are case-insensitive: `authorization` must replace `Authorization`, or fetch
+    // would send both values joined by a comma.
+    for (const [name, value] of Object.entries(options.headers ?? {})) {
+      const existing = Object.keys(headers).find((key) => key.toLowerCase() === name.toLowerCase());
+      if (existing !== undefined) delete headers[existing];
+      headers[name] = value;
+    }
 
     const response = await this.fetchImpl(this.baseUrl + path + queryString(options.query), {
       method,

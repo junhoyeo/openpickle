@@ -51,3 +51,12 @@ test("refreshes a login session once for concurrent requests and hands over the 
   expect(paths.filter((p) => p === "/api/login-sessions/refresh")).toHaveLength(1);
   expect(rotated).toEqual(["ls_2"]);
 });
+
+test("a header override replaces the generated header whatever its case", async () => {
+  const { calls, fetch } = recorder(200, "{}");
+  const pickle = new PickleClient({ accessToken: "generated", fetch });
+  await pickle.request("GET", "/api/sync", { headers: { authorization: "Bearer override" } });
+  const sent = Object.entries(calls[0]!.init.headers as Record<string, string>);
+  expect(sent.filter(([name]) => name.toLowerCase() === "authorization")).toEqual([["authorization", "Bearer override"]]);
+});
+
