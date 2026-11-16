@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Local, TimeZone};
 
-use crate::content::{Card, RichText};
+use crate::content::{Card, CardRow, RichText};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
@@ -67,6 +67,41 @@ pub struct Row {
 }
 
 impl Row {
+    /// The texts this row shows, in reading order. Selecting and copying address a text by its
+    /// place in this list, so drawing must show them in the same order.
+    pub fn texts(&self) -> Vec<&str> {
+        match &self.kind {
+            RowKind::Time(text) => vec![text.as_str()],
+            RowKind::Activity(_) => Vec::new(),
+            RowKind::Part(Part::Bubble(text)) => vec![&text.text],
+            RowKind::Part(Part::Task(title)) => vec![&**title],
+            RowKind::Part(Part::Card(card)) => {
+                let mut texts: Vec<&str> = card
+                    .title
+                    .iter()
+                    .chain(&card.subtitle)
+                    .map(|text| text.text.as_str())
+                    .collect();
+                for row in &card.rows {
+                    match row {
+                        CardRow::Field { label, value } => {
+                            texts.extend([label.text.as_str(), value.text.as_str()])
+                        }
+                        CardRow::Heading(text) | CardRow::Text(text) => texts.push(&text.text),
+                        CardRow::Table { cells, .. } => {
+                            texts.extend(cells.iter().map(|cell| cell.text.as_str()))
+                        }
+                    }
+                }
+                texts
+            }
+            RowKind::Part(Part::Request(request)) => std::iter::once(request.caption.as_str())
+                .chain(request.question.as_deref())
+                .chain(request.options.iter().map(|option| option.label.as_str()))
+                .collect(),
+        }
+    }
+
     /// Whether two rows draw the same thing. Parts are compared by identity, which is enough
     /// because a message's parts are parsed once and shared from then on.
     pub fn same_as(&self, other: &Row) -> bool {

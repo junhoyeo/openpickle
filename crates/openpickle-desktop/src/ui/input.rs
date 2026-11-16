@@ -60,6 +60,8 @@ pub enum InputEvent {
     /// Enter was pressed with text in the field.
     Submitted(String),
     Changed,
+    /// Text in the field was selected.
+    Selected,
 }
 
 pub struct TextInput {
@@ -100,6 +102,13 @@ impl TextInput {
 
     pub fn is_empty(&self) -> bool {
         self.content.trim().is_empty()
+    }
+
+    /// Drops the selection and leaves the cursor at its end.
+    pub fn deselect(&mut self, cx: &mut Context<Self>) {
+        if !self.selected_range.is_empty() {
+            self.move_to(self.selected_range.end, cx);
+        }
     }
 
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -149,6 +158,10 @@ impl TextInput {
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        if self.content.is_empty() {
+            // Nothing to select here; the screen around the field may have something.
+            return cx.propagate();
+        }
         self.move_to(0, cx);
         self.select_to(self.content.len(), cx)
     }
@@ -182,11 +195,13 @@ impl TextInput {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
-            ));
+        if self.selected_range.is_empty() {
+            // The selection to copy may be in the screen around the field.
+            return cx.propagate();
         }
+        cx.write_to_clipboard(ClipboardItem::new_string(
+            self.content[self.selected_range.clone()].to_string(),
+        ));
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
@@ -250,6 +265,9 @@ impl TextInput {
         if self.selected_range.end < self.selected_range.start {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
+        }
+        if !self.selected_range.is_empty() {
+            cx.emit(InputEvent::Selected);
         }
         cx.notify()
     }

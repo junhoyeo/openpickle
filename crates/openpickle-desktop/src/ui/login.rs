@@ -47,6 +47,7 @@ impl LoginView {
                 this.error = None;
                 cx.notify();
             }
+            InputEvent::Selected => {}
         };
         let subscriptions = vec![
             cx.subscribe(&phone, on_input),
