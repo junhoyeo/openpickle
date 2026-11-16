@@ -449,9 +449,17 @@ export class PickleClient {
     if (auth !== "none") Object.assign(headers, this.identityHeaders());
     if (auth === "bearer") headers.Authorization = `Bearer ${await this.bearerToken()}`;
     if (options.body !== undefined) headers["Content-Type"] = "application/json";
-    Object.assign(headers, options.headers);
+    // Header names are case-insensitive: `authorization` must replace `Authorization`, or fetch
+    // would send both values joined by a comma.
+    for (const [name, value] of Object.entries(options.headers ?? {})) {
+      const existing = Object.keys(headers).find((key) => key.toLowerCase() === name.toLowerCase());
+      if (existing !== undefined) delete headers[existing];
+      headers[name] = value;
+    }
 
-    const response = await this.fetchImpl(this.baseUrl + path + queryString(options.query), {
+    const query = queryString(options.query);
+    const separator = query === "" ? "" : path.includes("?") ? "&" : "?";
+    const response = await this.fetchImpl(this.baseUrl + path + separator + query, {
       method,
       headers,
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
@@ -516,13 +524,15 @@ export class PickleClient {
   }
 }
 
-/** The app leaves commas unescaped (`scopes=a,b`); everything else is percent-encoded. */
+/**
+ * `a=1&b=2`, without the leading `?`. The app leaves commas unescaped (`scopes=a,b`); everything
+ * else is percent-encoded.
+ */
 function queryString(query: RequestOptions["query"]): string {
-  if (!query) return "";
-  const pairs = Object.entries(query)
+  return Object.entries(query ?? {})
     .filter((entry): entry is [string, string | number] => entry[1] !== undefined)
-    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value).replace(/%2C/g, ",")}`);
-  return pairs.length ? `?${pairs.join("&")}` : "";
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value).replace(/%2C/g, ",")}`)
+    .join("&");
 }
 
 /** 32 random bytes in unpadded base64url, the nonce format the app uses. */
@@ -544,5 +554,7 @@ export function decodeAccessToken(token: string): {
 } {
   const payload = token.replace(/^Bearer\s+/i, "").split(".")[1];
   if (!payload) throw new Error("not a JWT");
-  return JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/")));
+  // atob yields one character per byte; the claims are UTF-8 and must be decoded as such.
+  const bytes = Uint8Array.from(atob(payload.replace(/-/g, "+").replace(/_/g, "/")), (byte) => byte.charCodeAt(0));
+  return JSON.parse(new TextDecoder().decode(bytes));
 }

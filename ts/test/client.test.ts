@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { PickleApiError, PickleClient } from "../src/client.ts";
+import { PickleApiError, PickleClient, decodeAccessToken } from "../src/client.ts";
 
 function recorder(status: number, body: string) {
   const calls: { url: string; init: RequestInit }[] = [];
@@ -50,4 +50,32 @@ test("refreshes a login session once for concurrent requests and hands over the 
   await pickle.sync();
   expect(paths.filter((p) => p === "/api/login-sessions/refresh")).toHaveLength(1);
   expect(rotated).toEqual(["ls_2"]);
+});
+
+test("a header override replaces the generated header whatever its case", async () => {
+  const { calls, fetch } = recorder(200, "{}");
+  const pickle = new PickleClient({ accessToken: "generated", fetch });
+  await pickle.request("GET", "/api/sync", { headers: { authorization: "Bearer override" } });
+  const sent = Object.entries(calls[0]!.init.headers as Record<string, string>);
+  expect(sent.filter(([name]) => name.toLowerCase() === "authorization")).toEqual([["authorization", "Bearer override"]]);
+});
+
+test("query options join a path that already has a query", async () => {
+  const { calls, fetch } = recorder(200, "{}");
+  const pickle = new PickleClient({ accessToken: "t", fetch });
+  await pickle.request("GET", "/api/profile?region=KR", { query: { scopes: "a,b" } });
+  await pickle.request("GET", "/api/profile", { query: { region: "KR" } });
+  await pickle.request("GET", "/api/profile", { query: {} });
+  expect(calls.map((call) => call.url.replace(pickle.baseUrl, ""))).toEqual([
+    "/api/profile?region=KR&scopes=a,b",
+    "/api/profile?region=KR",
+    "/api/profile",
+  ]);
+});
+
+test("token claims are read as UTF-8", () => {
+  const claims = { sub: "피클", sid: "s", iat: 1, exp: 2, sexp: 3 };
+  const bytes = new TextEncoder().encode(JSON.stringify(claims));
+  const payload = btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  expect(decodeAccessToken(`Bearer h.${payload}.s`)).toEqual(claims);
 });
