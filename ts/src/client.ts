@@ -3,6 +3,7 @@ import type {
   ApiErrorBody,
   Character,
   EnclaveNode,
+  ExploreSectionsScreen,
   HistoryDelta,
   HistoryWindow,
   KnownScreens,
@@ -353,8 +354,8 @@ export class PickleClient {
 
   /**
    * `GET /api/screens/{kind}`: data for a server-driven screen. `handoffs` (tasks and phone calls
-   * the character ran), `extra-conversations`, `roulette-promo` and `message-search` (see
-   * `searchMessages`) were present in traffic.
+   * the character ran), `extra-conversations`, `roulette-promo`, `message-search` (see
+   * `searchMessages`) and `explore-sections` (see `getExploreSections`) were present in traffic.
    */
   getScreen<K extends keyof KnownScreens>(kind: K): Promise<KnownScreens[K]>;
   getScreen(kind: string, query?: RequestOptions["query"]): Promise<unknown>;
@@ -368,6 +369,16 @@ export class PickleClient {
    */
   searchMessages(query: string): Promise<MessageSearchScreen> {
     return this.request("GET", "/api/screens/message-search", { query: { query } });
+  }
+
+  // ---- Explore ----
+
+  /**
+   * `GET /api/screens/explore-sections`: the Explore screen, things the character offers to do,
+   * in sections and as one ranked list.
+   */
+  getExploreSections(): Promise<ExploreSectionsScreen> {
+    return this.request("GET", "/api/screens/explore-sections");
   }
 
   // ---- Device ----
