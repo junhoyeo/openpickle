@@ -4,12 +4,19 @@
 //! Launch order is what makes the app feel instant: the cached conversation goes to the UI
 //! first, and only then does the network get asked for what is new.
 
-use std::{collections::HashMap, path::PathBuf, pin::Pin, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 
 use futures::{Stream, StreamExt, channel::mpsc::UnboundedSender as Updates};
 use openpickle_api::{
-    CardState, ClientOptions, Credentials, Error, HistoryItem, LoginSession, LoginSessionRefresh,
-    PickleClient, PickleEvent, SendMessageOptions,
+    ALL_SOCIAL_SCOPES, CardState, ClientOptions, Credentials, Error, ExploreSectionsScreen,
+    HistoryItem, LoginSession, LoginSessionRefresh, MessageContext, PickleClient, PickleEvent,
+    SendMessageOptions, SocialSnapshot,
     events::{ChatEvent, RoomEvent},
 };
 use serde::{Deserialize, Serialize};
@@ -187,7 +194,12 @@ async fn sign_in(
                 None => "Ask for a code first.".to_owned(),
             },
             Command::Quit => break,
-            Command::Send { .. } | Command::Search(_) | Command::Active(_) => continue,
+            Command::Send { .. }
+            | Command::Search(_)
+            | Command::LoadSocial
+            | Command::LoadExplore
+            | Command::OffersShown(_)
+            | Command::Active(_) => continue,
         };
         updates.unbounded_send(Update::SignInFailed(failure)).ok();
     }
@@ -378,6 +390,11 @@ struct Live {
     identity: Identity,
     /// Whether the window is in front; only then does reading count as "seen".
     active: bool,
+    /// The cache files that were shown to the window in this run.
+    shown_from_disk: HashSet<&'static str>,
+    /// The pictures the window was told about, or will be when they are downloaded.
+    pictures: HashSet<String>,
+    downloads: Arc<Downloads>,
     marked_read: i64,
 }
 
@@ -429,6 +446,9 @@ async fn converse(
         identity,
         // The window says when it comes to the front.
         active: false,
+        shown_from_disk: HashSet::new(),
+        pictures: HashSet::new(),
+        downloads: Arc::new(Downloads::new()),
         marked_read: 0,
     };
     live.send(Update::Conversation {
@@ -445,8 +465,8 @@ async fn converse(
         tokio::select! {
             command = commands.recv() => match command {
                 None | Some(Command::Quit) => return Ended::Closed,
-                Some(Command::Send { id, text }) => {
-                    if let Err(error) = live.send_message(id.clone(), &text).await {
+                Some(Command::Send { id, text, offer }) => {
+                    if let Err(error) = live.send_message(id.clone(), &text, offer).await {
                         live.send(Update::SendFailed { id, reason: not_sent(&error) });
                         if session_is_gone(&error) {
                             return Ended::SignedOut;
@@ -464,6 +484,40 @@ async fn converse(
                         Err(error) => Err(explain(&error)),
                     };
                     live.send(Update::Found { query, results });
+                }
+                Some(Command::LoadSocial) => {
+                    if let Some(cached) = live.cached_once::<SocialSnapshot>("social.json") {
+                        live.show_social(&cached);
+                    }
+                    match live.client.get_social_snapshot(&ALL_SOCIAL_SCOPES).await {
+                        Ok(snapshot) => {
+                            live.store.cache("social.json", &snapshot).ok();
+                            live.show_social(&snapshot);
+                        }
+                        Err(error) if session_is_gone(&error) => return Ended::SignedOut,
+                        Err(error) => live.send(Update::Social(Err(explain(&error)))),
+                    }
+                }
+                Some(Command::LoadExplore) => {
+                    if let Some(cached) = live.cached_once::<ExploreSectionsScreen>("explore.json") {
+                        live.show_explore(cached);
+                    }
+                    match live.client.get_explore_sections().await {
+                        Ok(screen) => {
+                            live.store.cache("explore.json", &screen).ok();
+                            live.show_explore(screen);
+                        }
+                        Err(error) if session_is_gone(&error) => return Ended::SignedOut,
+                        Err(error) => live.send(Update::Explore(Err(explain(&error)))),
+                    }
+                }
+                Some(Command::OffersShown(offers)) => {
+                    // Nothing on screen depends on this report, so a failure is not shown.
+                    if let Err(error) = live.client.report_offer_impressions(&offers).await
+                        && session_is_gone(&error)
+                    {
+                        return Ended::SignedOut;
+                    }
                 }
                 Some(Command::Active(active)) => {
                     live.active = active;
@@ -713,19 +767,84 @@ impl Live {
 
     /// Sends a message the UI already shows. The server's copy, which carries the same id,
     /// replaces it when it arrives.
-    async fn send_message(&mut self, id: String, text: &str) -> openpickle_api::Result<()> {
+    async fn send_message(
+        &mut self,
+        id: String,
+        text: &str,
+        offer: Option<String>,
+    ) -> openpickle_api::Result<()> {
         // Right after a first sign-in the room may not be known yet.
         if self.conversation.room_id.is_empty() {
             self.find_room().await?;
         }
         let options = SendMessageOptions {
             client_msg_id: Some(id),
+            context: offer.map(MessageContext::offer),
             ..Default::default()
         };
         self.client
             .send_message(&self.conversation.room_id, text, options)
             .await
             .map(drop)
+    }
+
+    /// What the disk has under `name`, the first time it is asked for in this run. The window
+    /// keeps what it was shown, so later reads only bring the server's answer.
+    fn cached_once<T: serde::de::DeserializeOwned>(&mut self, name: &'static str) -> Option<T> {
+        self.shown_from_disk
+            .insert(name)
+            .then(|| self.store.cached(name))
+            .flatten()
+    }
+
+    fn show_social(&mut self, snapshot: &SocialSnapshot) {
+        let (social, pictures) = convert::social(snapshot, chrono::Utc::now());
+        self.send(Update::Social(Ok(social)));
+        self.fetch_pictures(pictures);
+    }
+
+    fn show_explore(&mut self, screen: ExploreSectionsScreen) {
+        let (explore, pictures) = convert::explore(screen);
+        self.send(Update::Explore(Ok(explore)));
+        self.fetch_pictures(pictures);
+    }
+
+    /// Tells the UI where the pictures at these addresses are, now for those in the cache and
+    /// later, one by one, for those that have to be downloaded first.
+    fn fetch_pictures(&mut self, urls: Vec<String>) {
+        let mut ready = Vec::new();
+        for url in urls {
+            let key = convert::picture_key(&url).to_owned();
+            if !self.pictures.insert(key.clone()) {
+                continue;
+            }
+            let file = picture_file(&key);
+            let path = self.store.cache_path(&file);
+            if path.exists() {
+                ready.push((key, path));
+                continue;
+            }
+            let (store, updates, downloads) = (
+                self.store.clone(),
+                self.updates.clone(),
+                self.downloads.clone(),
+            );
+            tokio::spawn(async move {
+                let Ok(_slot) = downloads.slots.acquire().await else {
+                    return;
+                };
+                if let Some(bytes) = downloads.get(&url).await
+                    && store.cache_bytes(&file, &bytes).is_ok()
+                {
+                    updates
+                        .unbounded_send(Update::Pictures(vec![(key, path)]))
+                        .ok();
+                }
+            });
+        }
+        if !ready.is_empty() {
+            self.send(Update::Pictures(ready));
+        }
     }
 
     /// Tells the server how far the user has read, while the window is in front.
@@ -743,6 +862,53 @@ impl Live {
             self.marked_read = head;
         }
     }
+}
+
+/// Downloads pictures, a few at a time.
+struct Downloads {
+    http: reqwest::Client,
+    slots: tokio::sync::Semaphore,
+}
+
+impl Downloads {
+    fn new() -> Self {
+        Self {
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
+            slots: tokio::sync::Semaphore::new(6),
+        }
+    }
+
+    async fn get(&self, url: &str) -> Option<Vec<u8>> {
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?;
+        Some(response.bytes().await.ok()?.to_vec())
+    }
+}
+
+/// The cache file of the picture with this key. The extension tells GPUI how to decode it.
+fn picture_file(key: &str) -> String {
+    // FNV-1a: the name has to be the same in every run, which the standard hasher does not
+    // promise.
+    let hash = key.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    let extension = key
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.rsplit_once('.'))
+        .map(|(_, extension)| extension)
+        .filter(|extension| extension.len() <= 4 && extension.chars().all(char::is_alphanumeric))
+        .unwrap_or("png");
+    format!("picture-{hash:016x}.{extension}")
 }
 
 /// Saves the picture at `url` in the cache and returns its file name.
@@ -765,6 +931,23 @@ async fn download_avatar(store: &Store, url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_picture_keeps_its_file_name_and_its_kind() {
+        let icon = picture_file("https://img.example/explore/icons/0a1b.png");
+        assert_eq!(
+            icon,
+            picture_file("https://img.example/explore/icons/0a1b.png")
+        );
+        assert!(icon.starts_with("picture-") && icon.ends_with(".png"));
+        assert_ne!(
+            icon,
+            picture_file("https://img.example/explore/icons/0a1c.png")
+        );
+        assert!(picture_file("https://img.example/avatars/u1/face.JPG").ends_with(".JPG"));
+        // An address without a usable extension is taken to be a PNG.
+        assert!(picture_file("https://img.example/avatars/u1").ends_with(".png"));
+    }
 
     #[test]
     fn the_wait_to_reconnect_grows_until_a_stream_stays_open() {

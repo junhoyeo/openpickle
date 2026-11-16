@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use crate::model::{Message, SearchResult};
+use crate::model::{Explore, Message, SearchResult, Social};
 
 /// UI to backend. Neither side of the protocol can be printed with `{:?}`: a command may hold
 /// a phone number or a sign-in code, and both hold message text.
@@ -13,8 +13,18 @@ pub enum Command {
     /// Sign in with the texted code.
     VerifyCode(String),
     /// Send a message to the open conversation. The UI shows it already, under this id, which
-    /// the server keeps for its copy.
-    Send { id: String, text: String },
+    /// the server keeps for its copy. `offer` names the Explore offer the message asks for.
+    Send {
+        id: String,
+        text: String,
+        offer: Option<String>,
+    },
+    /// Read the friends and the invite link: what was cached first, then the server's answer.
+    LoadSocial,
+    /// Read the Explore tab's offers, in the same two steps.
+    LoadExplore,
+    /// These offers were on screen.
+    OffersShown(Vec<String>),
     /// Search the messages for this text.
     Search(String),
     /// The window came to the front (`true`) or went behind (`false`).
@@ -52,6 +62,12 @@ pub enum Update {
         query: String,
         results: Result<Vec<SearchResult>, String>,
     },
+    /// The friends and the invite link, or why they could not be read.
+    Social(Result<Social, String>),
+    /// The Explore tab's offers, or why they could not be read.
+    Explore(Result<Explore, String>),
+    /// Pictures that are on disk now, by their key.
+    Pictures(Vec<(String, PathBuf)>),
     /// Whether the character is working on a reply, and on what when it says.
     Activity(Option<Option<String>>),
     /// The backend stopped over something on this computer and cannot go on. The text says

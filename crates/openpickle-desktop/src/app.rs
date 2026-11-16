@@ -155,6 +155,8 @@ impl Shell {
                     search.update(cx, |search, cx| search.found(&query, results, cx));
                 }
             }
+            // Nothing shows these yet.
+            Update::Social(_) | Update::Explore(_) | Update::Pictures(_) => {}
             Update::Failed(reason) => {
                 self.forget_search();
                 self._screen_events = None;
@@ -262,6 +264,7 @@ impl Shell {
         let command = Command::Send {
             id: id.clone(),
             text: text.to_owned(),
+            offer: None,
         };
         if self.commands.send(command).is_err() {
             mark_not_sent(&mut self.messages, &id, "Not sent. OpenPickle has stopped.");
@@ -391,7 +394,7 @@ mod tests {
         // Nothing answers the command, as when the backend is busy. The message shows anyway.
         let (id, text) = std::iter::from_fn(|| sent.try_recv().ok())
             .find_map(|command| match command {
-                Command::Send { id, text } => Some((id, text)),
+                Command::Send { id, text, .. } => Some((id, text)),
                 _ => None,
             })
             .expect("the message goes to the backend");
