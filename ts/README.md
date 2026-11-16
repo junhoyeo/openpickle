@@ -1,10 +1,10 @@
 # @openpickle/client
 
 A typed TypeScript client for the Pickle character API (`https://character-api-prod.picklemem.com`),
-the backend of the Pickle iOS app. It was built from three Proxyman captures of the iOS app
-(version 1.1.19, build 202611071128) taken on 2026-11-16, 30 endpoints in all. A full history
-export and login session refreshes were run against the live API; phone sign-in has only been
-replayed against its capture. The client covers 27 endpoints. It has no runtime dependencies and
+the backend of the Pickle iOS app. It was built from four Proxyman captures of the iOS app
+(version 1.1.19, build 202611071128) taken on 2026-11-16 and 2026-11-17, 32 endpoints in all. A
+full history export and login session refreshes were run against the live API; phone sign-in has
+only been replayed against its capture. The client covers 28 endpoints. It has no runtime dependencies and
 uses `fetch`. It runs on Bun, and on Node versions that load TypeScript directly (tested on
 Node 26); older Node needs a bundler.
 
@@ -109,7 +109,8 @@ All of these were in the captures. `scripts/verify-capture.ts` checks each one a
 | GET | `/api/character` | `getCharacter()` | Look, level, XP, energy, jelly. |
 | GET | `/api/profile?region=` | `getProfile(region?)` | Your profile, including phone and birthday. |
 | GET | `/api/social/snapshot?scopes=` | `getSocialSnapshot(scopes?)` | Friends, requests, blocked, invite, activity. Each scope has its own status. |
-| GET | `/api/screens/{kind}` | `getScreen(kind, query?)` | Data for server-driven screens. `handoffs`, `extra-conversations` and `roulette-promo` are typed. |
+| GET | `/api/screens/{kind}` | `getScreen(kind, query?)` | Data for server-driven screens. `handoffs`, `extra-conversations`, `roulette-promo` and `message-search` are typed. |
+| GET | `/api/screens/message-search?query=` | `searchMessages(query)` | Messages containing the text, newest first. See [Message search](#message-search). |
 | PUT | `/api/device/permissions` | `reportPermissions(snapshots)` | Which device data sources the app may read. |
 | POST | `/api/device/location/token` | `requestLocationToken()` | `409 location_disabled` while location sharing is off. |
 | GET | `/api/ui-definitions` | `getUiDefinitions()` | The server-driven UI bundle (about 2 MB). No token needed. |
@@ -141,9 +142,9 @@ error handling.
   `history/delta` from sequence 0 instead.
 - **Other screen kinds.** The UI definitions name these data kinds: `activity`, `bubble`,
   `bubbles`, `character-voices`, `character_avatar_history`, `character_colors`,
-  `character_settings`, `character_sharing`, `clone_brief`, `connection-catalog`,
-  `connection-detail`, `connections`, `explore-sections`, `friend`, `friend-request`,
-  `handle_check`, `handoff`, `message-search`, `notification_settings`, `page`, `phone_call`,
+  `character_settings`, `character_sharing`, `clone_brief`, `connection-detail`, `connections`,
+  `explore-sections`, `friend`, `friend-request`, `handle_check`, `handoff`,
+  `notification_settings`, `page`, `phone_call`,
   `scheduled-action`, `scheduled-action-run`, `scheduled-actions`, `ticket-history`, `vault`.
   Whether each one is served at `/api/screens/{kind}` is unverified. `profile` is also a data kind,
   and it is served at `/api/profile`, so the pattern does not hold for every kind.
@@ -155,6 +156,51 @@ error handling.
 - **Credential writes.** `/api/secure/vault/*`, `/api/secure/connections/*`, `/api/secure/sealing`
   and the rest of the end-to-end credential protocol. The app runs that protocol in a signed
   JavaScript program shipped in `getUiDefinitions().secure_program.source`.
+
+## Message search
+
+`searchMessages(query)` calls `GET /api/screens/message-search?query=<text>`, the app's message
+search. The query is the only parameter; the client percent-encodes it as the app does (UTF-8,
+`%20` for a space). The response:
+
+```json
+{
+  "kind": "message-search",
+  "items": [
+    {
+      "id": "chat:42",
+      "kind": "chat",
+      "segments": [
+        { "text": "…see you at ", "match": false },
+        { "text": "lunch", "match": true },
+        { "text": " tomorrow…", "match": false }
+      ],
+      "label": "Chat",
+      "date_label": "Nov 3",
+      "room_id": "",
+      "call_id": "",
+      "seq": 42,
+      "line_id": ""
+    }
+  ]
+}
+```
+
+`segments` is a snippet of the message around the match, split into runs; `match` marks the runs
+that matched. Joined, the runs give the snippet, usually cut short with `…` at either end. `seq`
+is the message's sequence number in its room, and `id` is `chat:<seq>`.
+
+What the capture showed (5 searches, 115 results, all with Korean queries):
+
+- Every result had every field above. All were `kind: "chat"`, `label: "Chat"`, messages in the
+  chat with your own character, with `room_id`, `call_id` and `line_id` empty.
+- Results came newest first, at most 30 per search. No paging parameter was sent or returned.
+- A result can have several matching runs, and two matching runs can be adjacent.
+
+What it did not show: results of another `kind`. `call_id` and `line_id` suggest the search also
+covers phone call transcripts, and a non-empty `room_id` would point to another room, but none
+were seen, so `kind` is typed as an open string. Queries with spaces or ASCII text were not
+captured either; the client encodes them the same way.
 
 ## Events
 
