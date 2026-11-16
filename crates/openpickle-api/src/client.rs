@@ -178,6 +178,8 @@ pub enum Auth {
     /// App identity headers and the bearer token.
     #[default]
     Bearer,
+    /// The bearer token without the app identity headers, as the app loads pictures.
+    BearerOnly,
     /// App identity headers only.
     App,
     /// Neither.
@@ -529,6 +531,32 @@ impl PickleClient {
             .await
     }
 
+    /// `GET /api/rooms/{room}/history/page`: up to `limit` messages before `before_seq`, newest
+    /// first. The answer's `next_before` is the `before_seq` of the page before it. The app
+    /// asks for 250 at a time.
+    pub async fn get_history_page(
+        &self,
+        room_id: &str,
+        before_seq: i64,
+        limit: u32,
+    ) -> Result<HistoryPage> {
+        let path = format!("/api/rooms/{}/history/page", encode_component(room_id));
+        let options = RequestOptions::default()
+            .query("limit", limit)
+            .query("before_seq", before_seq);
+        self.request(Method::GET, &path, options).await
+    }
+
+    /// `GET /api/attachments/{path}/thumbnail`: a JPEG of a message's attachment, a picture or
+    /// a document's first page. `path` is as messages name it: `attachments/<day>/<file>`.
+    pub async fn get_attachment_thumbnail(&self, path: &str) -> Result<bytes::Bytes> {
+        let encoded: Vec<String> = path.split('/').map(encode_component).collect();
+        let path = format!("/api/attachments/{}/thumbnail", encoded.join("/"));
+        let options = RequestOptions::default().auth(Auth::BearerOnly);
+        let response = self.send(Method::GET, &path, options).await?;
+        Ok(response.bytes().await?)
+    }
+
     /// `GET /api/rooms/{room}/history`: the latest messages of a room (up to 200).
     pub async fn get_history(&self, room_id: &str) -> Result<HistoryWindow> {
         let path = format!("/api/rooms/{}/history", encode_component(room_id));
@@ -852,7 +880,7 @@ impl PickleClient {
         options: RequestOptions,
         timeout: Option<Duration>,
     ) -> Result<Response> {
-        if options.auth != Auth::Bearer {
+        if !matches!(options.auth, Auth::Bearer | Auth::BearerOnly) {
             return self.execute(method, path, options, None, timeout).await;
         }
         let bearer = self.bearer_header().await?;
@@ -883,10 +911,9 @@ impl PickleClient {
         timeout: Option<Duration>,
     ) -> Result<Response> {
         let inner = &self.inner;
-        let mut headers = if options.auth == Auth::None {
-            inner.base_headers.clone()
-        } else {
-            inner.app_headers.clone()
+        let mut headers = match options.auth {
+            Auth::None | Auth::BearerOnly => inner.base_headers.clone(),
+            Auth::Bearer | Auth::App => inner.app_headers.clone(),
         };
         if let Some(bearer) = bearer {
             headers.insert(AUTHORIZATION, bearer);

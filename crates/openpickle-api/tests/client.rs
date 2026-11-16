@@ -315,6 +315,40 @@ async fn an_offer_is_asked_for_with_its_text_and_its_id() {
 }
 
 #[tokio::test]
+async fn history_pages_go_back_and_thumbnails_are_asked_for_by_encoded_path() {
+    let server = MockServer::start(|request| match request.path.as_str() {
+        "/api/rooms/room/history/page" => Reply::json(
+            200,
+            r#"{"v":1,"messages":[{"role":"user","id":"m","text":"사진","at":1.0,"seq":40,"attachments":["attachments/2026-11-05/봄 소풍.jpg"],"image_meta":{"attachments/2026-11-05/봄 소풍.jpg":{"w":1200,"h":900,"blurhash":"LEHV6nWB2yk8"}}}],"reactions":[],"card_states":[],"has_more":true,"next_before":40}"#,
+        ),
+        _ => Reply {
+            content_type: "image/jpeg".into(),
+            ..Reply::json(200, "jpeg bytes")
+        },
+    })
+    .await;
+    let pickle = client(&server, Credentials::AccessToken("token".into()));
+
+    let page = pickle.get_history_page("room", 100, 250).await.unwrap();
+    let path = &page.messages[0].attachments.as_ref().unwrap()[0];
+    assert_eq!((page.has_more, page.next_before), (true, 40));
+    let thumbnail = pickle.get_attachment_thumbnail(path).await.unwrap();
+    assert_eq!(&thumbnail[..], b"jpeg bytes");
+
+    let requests = server.take();
+    assert_eq!(requests[0].query, "limit=250&before_seq=100");
+    // Each part of the path is encoded on its own; the slashes between them stay.
+    assert_eq!(
+        requests[1].path,
+        "/api/attachments/attachments/2026-11-05/%EB%B4%84%20%EC%86%8C%ED%92%8D.jpg/thumbnail"
+    );
+    // Pictures are loaded with the token and without the app's identity, as the app does.
+    assert_eq!(requests[1].header("authorization"), Some("Bearer token"));
+    assert!(requests[0].header("x-client-version").is_some());
+    assert!(requests[1].header("x-client-version").is_none());
+}
+
+#[tokio::test]
 async fn api_errors_carry_status_detail_and_body() {
     let server = MockServer::start(|request| match request.path.as_str() {
         "/api/device/location/token" => Reply::json(409, r#"{"detail":"location_disabled"}"#),

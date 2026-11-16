@@ -266,6 +266,20 @@ async fn call(client: &PickleClient, flow: &Flow, json: &Value) -> Option<Result
         ("GET", ["", "api", "sync"]) => done(client.sync().await),
         ("GET", ["", "api", "events"]) => return Some(drain_events(client).await),
         ("GET", ["", "api", "rooms", room, "history"]) => done(client.get_history(room).await),
+        ("GET", ["", "api", "rooms", room, "history", "page"]) => done(
+            client
+                .get_history_page(
+                    room,
+                    q("before_seq").parse().unwrap_or_default(),
+                    q("limit").parse().unwrap_or_default(),
+                )
+                .await,
+        ),
+        ("GET", ["", "api", "attachments", rest @ ..]) if rest.last() == Some(&"thumbnail") => {
+            // The segments are decoded already; the client encodes them again.
+            let path = rest[..rest.len() - 1].join("/");
+            done(client.get_attachment_thumbnail(&path).await)
+        }
         ("GET", ["", "api", "rooms", room, "history", "delta"]) => {
             let limit = q("limit").parse().ok();
             done(

@@ -596,6 +596,18 @@ pub struct HistoryWindow {
     pub read_seq: i64,
 }
 
+/// `GET /api/rooms/{room}/history/page`: messages before a sequence number, newest first.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HistoryPage {
+    pub v: i64,
+    pub messages: Vec<HistoryItem>,
+    pub reactions: Vec<Reaction>,
+    pub card_states: Vec<CardState>,
+    pub has_more: bool,
+    /// The `before_seq` of the page before this one.
+    pub next_before: i64,
+}
+
 /// `GET /api/rooms/{room}/history/delta`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HistoryDelta {
