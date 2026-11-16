@@ -85,13 +85,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let activation = cx.observe_window_activation(window, |this, window, _| {
-            this.commands
-                .send(Command::Active(window.is_window_active()))
-                .ok();
-        });
-        // The backend takes the window to be behind until told otherwise, and the observer
-        // only reports changes.
+        let activation =
+            cx.observe_window_activation(window, |this, window, _| this.report_reading(window));
+        // The backend takes the chat to be out of sight until told otherwise, and the
+        // observer only reports changes.
         commands
             .send(Command::Active(window.is_window_active()))
             .ok();
@@ -347,7 +344,15 @@ impl Shell {
             Tab::Archive | Tab::Profile => return,
         }
         self.tab = tab;
+        self.report_reading(window);
         self.close_over(window, cx);
+    }
+
+    /// Tells the backend whether the chat can be read now: the window is in front and shows
+    /// the chat. Only then do new messages count as read.
+    fn report_reading(&self, window: &Window) {
+        let reading = window.is_window_active() && self.tab == Tab::Chat;
+        self.commands.send(Command::Active(reading)).ok();
     }
 
     /// The view of the section the window is on.
@@ -638,6 +643,37 @@ mod tests {
             let parts = &shell.messages.last().unwrap().parts;
             assert_eq!(parts.last(), Some(&Part::Task("Not sent.".into())));
         });
+    }
+
+    #[gpui::test]
+    fn messages_count_as_read_only_while_the_chat_shows(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::ui::bind_keys);
+        let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, received) = futures::channel::mpsc::unbounded();
+        let conversation = Update::Conversation {
+            name: "Pickle".into(),
+            avatar: None,
+            messages: vec![message("a", 1)],
+        };
+        updates.unbounded_send(conversation).unwrap();
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            window.activate_window();
+            Shell::new(commands, received, window, cx)
+        });
+        let mut reading = |cx: &mut gpui::VisualTestContext, keys: &str| {
+            cx.simulate_keystrokes(keys);
+            std::iter::from_fn(|| sent.try_recv().ok())
+                .filter_map(|command| match command {
+                    Command::Active(reading) => Some(reading),
+                    _ => None,
+                })
+                .last()
+        };
+        reading(cx, "");
+        // Another section hides the chat, so what arrives meanwhile stays unread.
+        assert_eq!(reading(cx, "cmd-2"), Some(false));
+        assert_eq!(reading(cx, "cmd-3"), Some(false));
+        assert_eq!(reading(cx, "cmd-1"), Some(true));
     }
 
     #[gpui::test]

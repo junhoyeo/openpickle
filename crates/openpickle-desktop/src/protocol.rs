@@ -27,7 +27,8 @@ pub enum Command {
     OffersShown(Vec<String>),
     /// Search the messages for this text.
     Search(String),
-    /// The window came to the front (`true`) or went behind (`false`).
+    /// Whether the chat can be read now: the window is in front and shows the chat. Only
+    /// then do new messages count as read.
     Active(bool),
     /// The app is quitting: stop after the network call in flight, if there is one.
     Quit,
