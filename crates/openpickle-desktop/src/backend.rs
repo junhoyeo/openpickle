@@ -427,7 +427,8 @@ async fn converse(
         updates: updates.clone(),
         conversation,
         identity,
-        active: true,
+        // The window says when it comes to the front.
+        active: false,
         marked_read: 0,
     };
     live.send(Update::Conversation {

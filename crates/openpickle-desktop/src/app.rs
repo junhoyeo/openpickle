@@ -55,6 +55,11 @@ impl Shell {
                 .send(Command::Active(window.is_window_active()))
                 .ok();
         });
+        // The backend takes the window to be behind until told otherwise, and the observer
+        // only reports changes.
+        commands
+            .send(Command::Active(window.is_window_active()))
+            .ok();
         let mut shell = Self {
             commands,
             screen: Screen::Starting,
