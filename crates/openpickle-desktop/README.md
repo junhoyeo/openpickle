@@ -58,6 +58,9 @@ Everything is under the user's application-support directory
   may run. Deleting it signs the app out.
 - `cache/`: the room history as an append-only log, the character's picture, and a few small
   files. Deleting it only makes the next launch fetch everything again. Signing out clears it.
+  The log's format (`room.json`, `room-<id>.jsonl`, `identity.json`) is also read by the
+  [`pickle-sessions`](../../skills/pickle-sessions/SKILL.md) skill, so a change to it should change
+  the skill too.
 
 ## Code map
 

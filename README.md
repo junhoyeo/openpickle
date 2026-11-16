@@ -36,6 +36,18 @@ pictures and files, link previews, reactions, answering a request card, and room
 one with your character. The [desktop README](crates/openpickle-desktop/README.md) has the full
 list.
 
+## Searching your chat from coding agents
+
+[`skills/pickle-sessions`](skills/pickle-sessions/SKILL.md) is an agent skill that searches and
+reads the conversation the desktop app keeps on disk (the history log in
+`~/Library/Application Support/openpickle/cache/`). It finds messages by text, role and date, shows
+the messages around a hit, and says how old the cache is. It only reads, needs nothing but the
+Python standard library, and never opens the login session or the network:
+
+```sh
+python3 skills/pickle-sessions/scripts/pickle-sessions search "dinner" --since 2026-11-01
+```
+
 ## Get it
 
 ```sh
