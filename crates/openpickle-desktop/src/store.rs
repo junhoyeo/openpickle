@@ -63,9 +63,15 @@ impl Store {
         write_atomically(&path, &serde_json::to_vec(session)?, true)
     }
 
-    /// Forgets the login session, after the server stopped accepting it.
-    pub fn clear_session(&self) {
-        fs::remove_file(self.root.join("session.json")).ok();
+    /// Forgets the login session and everything cached for it. The next person to sign in on
+    /// this computer account must not be shown the previous conversations.
+    pub fn sign_out(&self) -> io::Result<()> {
+        match fs::remove_file(self.root.join("session.json")) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+        fs::remove_dir_all(self.root.join("cache"))?;
+        Self::at(self.root.clone()).map(drop)
     }
 
     /// A cached value, or `None` when it is missing or unreadable.
@@ -173,6 +179,25 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn signing_out_forgets_the_session_and_the_cache() {
+        let store = store("sign-out");
+        store
+            .save_session(&Session {
+                login_session_token: "ls_test".into(),
+                device_id: "device".into(),
+            })
+            .unwrap();
+        store.cache("room.json", &"room").unwrap();
+        store.append_log("room.jsonl", &[1]).unwrap();
+        store.sign_out().unwrap();
+        assert_eq!(store.session(), None);
+        assert_eq!(store.cached::<String>("room.json"), None);
+        assert!(store.log::<u32>("room.jsonl").is_empty());
+        // The store is still usable for the next sign-in.
+        store.cache("room.json", &"next").unwrap();
     }
 
     #[test]

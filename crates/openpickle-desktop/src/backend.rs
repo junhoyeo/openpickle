@@ -93,7 +93,15 @@ async fn run(store: Store, mut commands: Commands<Command>, updates: Updates<Upd
             }
         };
         match converse(&store, session, access_token, &mut commands, &updates).await {
-            Ended::SignedOut => store.clear_session(),
+            Ended::SignedOut => {
+                // Without this, the next person to sign in would see the old conversations.
+                if let Err(error) = store.sign_out() {
+                    updates.unbounded_send(Update::SignedOut).ok();
+                    let reason = format!("Could not clear the previous session's data: {error}");
+                    updates.unbounded_send(Update::SignInFailed(reason)).ok();
+                    return;
+                }
+            }
             Ended::Closed => return,
         }
     }
