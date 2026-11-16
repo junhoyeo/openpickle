@@ -179,6 +179,20 @@ class CommandTest(CacheTest):
         self.assertEqual(code, 0)
         self.assertIn("Red truck opens at 6", out)
 
+    def test_a_request_or_task_with_empty_text_is_read_from_its_own_fields(self) -> None:
+        self.write(
+            item(1, "agent_request", "", request={"question": "Which truck?", "options": [{"label": "Red truck"}]}),
+            item(2, "subagent", "", title="Looking up taco trucks"),
+        )
+        self.assertEqual([hit.seq for hit in search("truck")], [2, 1])
+        self.assertEqual(around(1, 0)[0].text, "Which truck?\n- Red truck")
+        self.assertEqual(around(2, 0)[0].text, "Looking up taco trucks")
+
+    def test_your_own_text_is_kept_as_written(self) -> None:
+        self.write(item(1, "user", "Please keep <bubble>hello</bubble> literally."))
+        self.assertEqual([hit.seq for hit in search("<bubble>")], [1])
+        self.assertEqual(around(1, 0)[0].text, "Please keep <bubble>hello</bubble> literally.")
+
     def test_missing_cache_exits_1_with_a_message(self) -> None:
         code, out, err = self.call("info")
         self.assertEqual((code, out), (1, ""))

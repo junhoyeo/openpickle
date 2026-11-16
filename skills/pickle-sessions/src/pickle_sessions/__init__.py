@@ -72,17 +72,22 @@ def cache_dir() -> Path:
 
 
 def body(item: dict) -> str:
-    """A history item as plain text: bubbles become paragraphs; requests and sub-agent runs use their question or title."""
-    text = item.get("text")
-    if isinstance(text, str):
-        parts = [part.strip() for part in BUBBLE.split(text)]
-        return "\n\n".join(part for part in parts if part)
+    """A history item as plain text, read by role the way the app reads it: your own text as written, a request card as its question and options, a sub-agent run as its title, and the character's bubbles as paragraphs."""
+    role = item.get("role")
+    text = item.get("text") if isinstance(item.get("text"), str) else ""
+    if role == "user":
+        return text
     request = item.get("request")
-    if isinstance(request, dict):
+    if role == "agent_request" and isinstance(request, dict):
         lines = [request.get("question") or ""]
         lines += [f"- {option.get('label', '')}" for option in request.get("options") or [] if isinstance(option, dict)]
-        return "\n".join(line for line in lines if line)
-    return item.get("title") or ""
+        asked = "\n".join(line for line in lines if line)
+        if asked:
+            return asked
+    if role == "subagent" and item.get("title"):
+        return item["title"]
+    parts = [part.strip() for part in BUBBLE.split(text)]
+    return "\n\n".join(part for part in parts if part)
 
 
 def load() -> Conversation:
