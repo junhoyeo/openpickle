@@ -197,29 +197,32 @@ pub fn rich_text(
         .into_any_element()
 }
 
-/// GPUI wants highlight ranges sorted and non-overlapping. Nested markup (a link inside bold
-/// text) is rare, so an inner range simply wins over the part of the outer one it covers.
+/// GPUI wants highlight ranges sorted and non-overlapping, and markup nests (a link inside bold
+/// text inside a quote). Every span start and end becomes a cut, and each piece between two
+/// cuts gets the styles of all spans that cover it, the innermost applied last.
 fn flatten(
     mut highlights: Vec<(Range<usize>, HighlightStyle)>,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
-    highlights.sort_by_key(|(range, _)| (range.start, std::cmp::Reverse(range.end)));
-    let mut flat: Vec<(Range<usize>, HighlightStyle)> = Vec::with_capacity(highlights.len());
-    for (range, style) in highlights {
-        if let Some((last, last_style)) = flat.last_mut()
-            && range.start < last.end
-        {
-            let (outer_end, outer_style) = (last.end, *last_style);
-            last.end = range.start;
-            let inner_end = range.end.min(outer_end);
-            flat.push((range.start..inner_end, style));
-            if inner_end < outer_end {
-                flat.push((inner_end..outer_end, outer_style));
-            }
-        } else {
-            flat.push((range, style));
+    // Widest first, so that a narrower span's color or weight wins where they overlap.
+    highlights.sort_by_key(|(range, _)| std::cmp::Reverse(range.len()));
+    let mut cuts: Vec<usize> = highlights
+        .iter()
+        .flat_map(|(range, _)| [range.start, range.end])
+        .collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut flat = Vec::with_capacity(cuts.len());
+    for piece in cuts.windows(2) {
+        let (start, end) = (piece[0], piece[1]);
+        let style = highlights
+            .iter()
+            .filter(|(range, _)| range.start <= start && end <= range.end)
+            .map(|(_, style)| *style)
+            .reduce(HighlightStyle::highlight);
+        if let Some(style) = style {
+            flat.push((start..end, style));
         }
     }
-    flat.retain(|(range, _)| !range.is_empty());
     flat
 }
 
@@ -376,4 +379,47 @@ fn activity(label: Option<&str>) -> impl IntoElement {
                 .with_easing(gpui::pulsating_between(0.45, 1.)),
             |bubble, delta| bubble.opacity(delta),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nested_spans_flatten_into_ordered_pieces_with_combined_styles() {
+        let bold = HighlightStyle {
+            font_weight: Some(FontWeight::SEMIBOLD),
+            ..Default::default()
+        };
+        let muted = HighlightStyle {
+            color: Some(theme::color(theme::TEXT_MUTED)),
+            ..Default::default()
+        };
+        let link = HighlightStyle {
+            color: Some(theme::color(theme::LINK)),
+            ..Default::default()
+        };
+        // A quote (0..30) holding bold text (2..20) holding a link (5..12), given innermost first
+        // as the parser produces them, plus a separate span after a gap.
+        let flat = flatten(vec![
+            (5..12, link),
+            (2..20, bold),
+            (0..30, muted),
+            (40..44, bold),
+        ]);
+
+        let ranges: Vec<Range<usize>> = flat.iter().map(|(range, _)| range.clone()).collect();
+        assert_eq!(ranges, [0..2, 2..5, 5..12, 12..20, 20..30, 40..44]);
+        // Inside the link: the link's color, still bold. Outside it: muted, bold only where bold.
+        assert_eq!(flat[2].1.color, link.color);
+        assert_eq!(flat[2].1.font_weight, bold.font_weight);
+        assert_eq!(
+            (flat[1].1.color, flat[1].1.font_weight),
+            (muted.color, bold.font_weight)
+        );
+        assert_eq!(
+            (flat[4].1.color, flat[4].1.font_weight),
+            (muted.color, None)
+        );
+    }
 }
