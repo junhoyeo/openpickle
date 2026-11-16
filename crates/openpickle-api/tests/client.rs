@@ -259,6 +259,62 @@ async fn a_search_sends_the_query_encoded_and_reads_the_matching_runs() {
 }
 
 #[tokio::test]
+async fn an_offer_is_asked_for_with_its_text_and_its_id() {
+    let server = MockServer::start(|request| match request.path.as_str() {
+        "/api/screens/explore-sections" => Reply::json(
+            200,
+            r#"{"kind":"explore-sections","areas":["home"],"popular_ids":["o1"],"sections":[{"section_id":"popular","title":"Popular lately","items":[{"offer_id":"o1","title":"I'll water your plants.","detail":"Every other day.","cta_label":"Water my plants","icon_image":"https://example.com/o1.png","icon_symbol":"house","area":"home","accepted_users_label":"12 people asked for this","steps":["You say which plants","I water them"],"areas":["home"]}],"preview_count":3,"expand_count":0,"areas":["home"]}],"more_items":[],"ranked_items":[{"offer_id":"o1","section_id":"popular","title":"I'll water your plants.","detail":"Every other day.","cta_label":"Water my plants","icon_image":"https://example.com/o1.png","icon_symbol":"house","area":"home","areas":["home"],"accepted_users_label":""}]}"#,
+        ),
+        "/api/offers/impressions" => Reply::json(200, "{}"),
+        "/api/rooms/room/messages" => {
+            Reply::json(200, r#"{"status":"ok","responder":"character","seq":null}"#)
+        }
+        _ => Reply::json(404, "{}"),
+    })
+    .await;
+    let pickle = client(&server, Credentials::AccessToken("token".into()));
+
+    let explore = pickle.get_explore_sections().await.unwrap();
+    let offer = &explore.sections[0].items[0];
+    assert_eq!(offer.steps.len(), 2);
+    // Ranked offers come without their steps and name their section.
+    let ranked = &explore.ranked_items[0];
+    assert_eq!(
+        (ranked.steps.len(), ranked.section_id.as_deref()),
+        (0, Some("popular"))
+    );
+
+    pickle
+        .report_offer_impressions(std::slice::from_ref(&offer.offer_id))
+        .await
+        .unwrap();
+    let options = openpickle_api::SendMessageOptions {
+        client_msg_id: Some("m1".into()),
+        context: Some(openpickle_api::MessageContext::offer(&offer.offer_id)),
+        ..Default::default()
+    };
+    pickle
+        .send_message("room", &offer.cta_label, options)
+        .await
+        .unwrap();
+
+    let sent: Vec<serde_json::Value> = server.take()[1..]
+        .iter()
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .collect();
+    assert_eq!(sent[0], serde_json::json!({ "offer_ids": ["o1"] }));
+    assert_eq!(
+        sent[1],
+        serde_json::json!({
+            "text": "Water my plants",
+            "client_msg_id": "m1",
+            "in_call": false,
+            "context": { "kind": "offer", "id": "o1" },
+        })
+    );
+}
+
+#[tokio::test]
 async fn api_errors_carry_status_detail_and_body() {
     let server = MockServer::start(|request| match request.path.as_str() {
         "/api/device/location/token" => Reply::json(409, r#"{"detail":"location_disabled"}"#),

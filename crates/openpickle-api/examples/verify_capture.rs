@@ -19,8 +19,8 @@ use base64::engine::general_purpose::STANDARD;
 use futures_util::StreamExt as _;
 use mock_server::{MockServer, Recorded, Reply};
 use openpickle_api::{
-    ClientOptions, ClientProfile, Credentials, Error, LogStoreListingsRequest, PermissionSnapshot,
-    PickleClient, PickleEvent, SendMessageOptions, SessionRequest,
+    ClientOptions, ClientProfile, Credentials, Error, LogStoreListingsRequest, MessageContext,
+    PermissionSnapshot, PickleClient, PickleEvent, SendMessageOptions, SessionRequest,
 };
 use serde_json::Value;
 
@@ -278,6 +278,7 @@ async fn call(client: &PickleClient, flow: &Flow, json: &Value) -> Option<Result
             let options = SendMessageOptions {
                 client_msg_id: Some(s("client_msg_id")),
                 in_call: json["in_call"].as_bool().unwrap_or_default(),
+                context: json.get("context").map(from::<MessageContext>),
             };
             done(client.send_message(room, &s("text"), options).await)
         }
@@ -296,6 +297,14 @@ async fn call(client: &PickleClient, flow: &Flow, json: &Value) -> Option<Result
                     .await,
             )
         }
+        ("GET", ["", "api", "screens", "explore-sections"]) => {
+            done(client.get_explore_sections().await)
+        }
+        ("POST", ["", "api", "offers", "impressions"]) => done(
+            client
+                .report_offer_impressions(&from::<Vec<String>>(&json["offer_ids"]))
+                .await,
+        ),
         ("GET", ["", "api", "screens", "message-search"]) => {
             done(client.search_messages(&q("query")).await)
         }

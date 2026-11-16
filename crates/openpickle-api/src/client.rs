@@ -224,6 +224,9 @@ pub struct SendMessageOptions {
     /// Defaults to a new random UUID.
     pub client_msg_id: Option<String>,
     pub in_call: bool,
+    /// What the message is about, when it is sent from something on screen: an offer on the
+    /// Explore tab ([`MessageContext::offer`]).
+    pub context: Option<MessageContext>,
 }
 
 /// The claims of an access token.
@@ -587,8 +590,11 @@ impl PickleClient {
             .client_msg_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let path = format!("/api/rooms/{}/messages", encode_component(room_id));
-        let body =
+        let mut body =
             json!({ "text": text, "client_msg_id": client_msg_id, "in_call": options.in_call });
+        if let Some(context) = &options.context {
+            body["context"] = serde_json::to_value(context).map_err(Error::Encode)?;
+        }
         let mut response: SendMessageResponse = self
             .request(Method::POST, &path, RequestOptions::default().json(&body)?)
             .await?;
@@ -679,6 +685,23 @@ impl PickleClient {
     /// `GET /api/screens/extra-conversations`.
     pub async fn get_extra_conversations(&self) -> Result<ExtraConversationsScreen> {
         self.get_screen_as("extra-conversations", &[]).await
+    }
+
+    /// `GET /api/screens/explore-sections`: what the character offers to do, in sections.
+    pub async fn get_explore_sections(&self) -> Result<ExploreSectionsScreen> {
+        self.get_screen_as("explore-sections", &[]).await
+    }
+
+    /// `POST /api/offers/impressions`: tells the server which offers were shown on screen.
+    pub async fn report_offer_impressions(&self, offer_ids: &[String]) -> Result<()> {
+        let body = json!({ "offer_ids": offer_ids });
+        self.request::<serde_json::Value>(
+            Method::POST,
+            "/api/offers/impressions",
+            RequestOptions::default().json(&body)?,
+        )
+        .await
+        .map(drop)
     }
 
     /// `GET /api/screens/message-search`: searches your messages for `query`.

@@ -720,7 +720,7 @@ impl Live {
         }
         let options = SendMessageOptions {
             client_msg_id: Some(id),
-            in_call: false,
+            ..Default::default()
         };
         self.client
             .send_message(&self.conversation.room_id, text, options)
