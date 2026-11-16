@@ -1,6 +1,7 @@
 pub mod app;
 pub mod assets;
 pub mod content;
+pub mod convert;
 pub mod model;
 pub mod protocol;
 pub mod store;
