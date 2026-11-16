@@ -6,7 +6,7 @@
 
 use std::{
     fs::{self, File, OpenOptions, TryLockError},
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -93,16 +93,27 @@ impl Store {
         if records.is_empty() {
             return Ok(());
         }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(self.cache_path(name))?;
         let mut lines = Vec::new();
+        // A crash can leave the last line unfinished. Starting on a fresh line keeps that
+        // fragment from swallowing the first new record.
+        if file.metadata()?.len() > 0 {
+            let mut last = [0];
+            file.seek(SeekFrom::End(-1))?;
+            file.read_exact(&mut last)?;
+            if last != *b"\n" {
+                lines.push(b'\n');
+            }
+        }
         for record in records {
             serde_json::to_writer(&mut lines, record)?;
             lines.push(b'\n');
         }
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.cache_path(name))?
-            .write_all(&lines)
+        file.write_all(&lines)
     }
 
     /// Where a cached file (an avatar image, say) lives.
@@ -175,10 +186,11 @@ mod tests {
     }
 
     #[test]
-    fn log_appends_and_skips_a_torn_last_line() {
+    fn a_torn_last_line_costs_only_itself() {
         let store = store("log");
         store.append_log("room.jsonl", &[1, 2]).unwrap();
         store.append_log("room.jsonl", &[3]).unwrap();
+        // A crash in the middle of a write leaves an unfinished line.
         fs::OpenOptions::new()
             .append(true)
             .open(store.cache_path("room.jsonl"))
@@ -186,5 +198,8 @@ mod tests {
             .write_all(b"{\"cut")
             .unwrap();
         assert_eq!(store.log::<u32>("room.jsonl"), vec![1, 2, 3]);
+        // What is appended next must not be joined to the fragment and lost with it.
+        store.append_log("room.jsonl", &[4, 5]).unwrap();
+        assert_eq!(store.log::<u32>("room.jsonl"), vec![1, 2, 3, 4, 5]);
     }
 }

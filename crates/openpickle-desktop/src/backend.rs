@@ -185,27 +185,51 @@ struct Identity {
     avatar_file: Option<String>,
 }
 
+/// A room's history log on disk. After a failed write it stops for the rest of the run: a later
+/// page would record a cursor past the missing one, and the next launch, which reads on from
+/// the last cursor on disk, would never fetch the gap.
+struct HistoryLog {
+    store: Store,
+    name: String,
+    broken: bool,
+}
+
+impl HistoryLog {
+    fn new(store: &Store, room_id: &str) -> Self {
+        Self {
+            store: store.clone(),
+            name: format!("room-{room_id}.jsonl"),
+            broken: false,
+        }
+    }
+
+    fn append(&mut self, records: &[Record]) {
+        if !self.broken {
+            self.broken = self.store.append_log(&self.name, records).is_err();
+        }
+    }
+}
+
 /// The open room as the server described it.
 #[derive(Default)]
 struct Conversation {
     room_id: String,
     items: HashMap<String, HistoryItem>,
     card_states: HashMap<String, CardState>,
-    /// Sequence number up to which `history/delta` has been read and logged.
+    /// Sequence number up to which `history/delta` has been read.
     synced: i64,
+    /// `None` until the room is known.
+    log: Option<HistoryLog>,
 }
 
 impl Conversation {
-    fn log_name(room_id: &str) -> String {
-        format!("room-{room_id}.jsonl")
-    }
-
     fn load(store: &Store, room_id: &str) -> Self {
+        let log = HistoryLog::new(store, room_id);
         let mut conversation = Self {
             room_id: room_id.to_owned(),
             ..Default::default()
         };
-        for record in store.log::<Record>(&Self::log_name(room_id)) {
+        for record in store.log::<Record>(&log.name) {
             match record {
                 Record::Item(item) => {
                     conversation.items.insert(item.id.clone(), *item);
@@ -216,6 +240,7 @@ impl Conversation {
                 Record::Synced(seq) => conversation.synced = seq,
             }
         }
+        conversation.log = Some(log);
         conversation
     }
 
@@ -442,7 +467,9 @@ impl Live {
                 .get_history_delta(&self.conversation.room_id, self.conversation.synced, None)
                 .await?;
             // A page that brings nothing new leaves the log as it is.
-            if delta.next_after > self.conversation.synced {
+            if delta.next_after > self.conversation.synced
+                && let Some(log) = &mut self.conversation.log
+            {
                 let mut records: Vec<Record> = delta
                     .items
                     .iter()
@@ -451,12 +478,7 @@ impl Live {
                     .collect();
                 records.extend(delta.card_states.iter().cloned().map(Record::Card));
                 records.push(Record::Synced(delta.next_after));
-                self.store
-                    .append_log(
-                        &Conversation::log_name(&self.conversation.room_id),
-                        &records,
-                    )
-                    .ok();
+                log.append(&records);
             }
 
             let advanced = delta.next_after > self.conversation.synced;
@@ -627,4 +649,34 @@ async fn download_avatar(store: &Store, url: &str) -> Option<String> {
     let file = format!("avatar.{extension}");
     std::fs::write(store.cache_path(&file), &bytes).ok()?;
     Some(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_write_stops_the_log_instead_of_leaving_a_gap() {
+        let root = std::env::temp_dir().join(format!(
+            "openpickle-test-history-log-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root).unwrap();
+        let mut log = HistoryLog::new(&store, "room");
+
+        log.append(&[Record::Synced(100)]);
+        // A directory where the file should be makes the next write fail.
+        let path = store.cache_path(&log.name);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        log.append(&[Record::Synced(500)]);
+        // The disk works again, but a cursor of 900 must not be recorded: the page up to 500
+        // never reached the log.
+        std::fs::remove_dir(&path).unwrap();
+        log.append(&[Record::Synced(900)]);
+
+        assert!(log.broken);
+        assert!(store.log::<Record>(&log.name).is_empty());
+    }
 }
