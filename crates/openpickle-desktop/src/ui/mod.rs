@@ -141,8 +141,14 @@ fn face(picture: Option<ImageSource>, size: f32) -> impl IntoElement {
         .bg(theme::alpha(0xffffff, 0.05))
         .border_1()
         .border_color(theme::alpha(0xffffff, 0.05));
+    // The picture is rounded itself: clipping to the disc only cuts a rectangle.
     match picture {
-        Some(source) => disc.child(img(source).size_full().object_fit(ObjectFit::Cover)),
+        Some(source) => disc.child(
+            img(source)
+                .size_full()
+                .rounded_full()
+                .object_fit(ObjectFit::Cover),
+        ),
         None => disc,
     }
 }
@@ -165,7 +171,12 @@ fn tab_header(
         .overflow_hidden()
         .bg(theme::color(theme::TEXT));
     let picture = match avatar {
-        Some(source) => picture.child(img(source).size_full().object_fit(ObjectFit::Cover)),
+        Some(source) => picture.child(
+            img(source)
+                .size_full()
+                .rounded_full()
+                .object_fit(ObjectFit::Cover),
+        ),
         None => picture,
     };
     div()
