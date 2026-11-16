@@ -154,3 +154,14 @@ test("reportOfferImpressions sends the shown offer ids", async () => {
   expect(calls[0]!.init.method).toBe("POST");
   expect(calls[0]!.init.body).toBe('{"offer_ids":["offer-1","offer-2"]}');
 });
+
+test("sendMessage sends a context only when given one", async () => {
+  const { calls, fetch } = recorder(200, '{"status":"ok","responder":"chat","seq":null}');
+  const pickle = new PickleClient({ accessToken: "t", fetch });
+  await pickle.sendMessage("room-1", "hi", { clientMsgId: "m1" });
+  await pickle.sendMessage("room-1", offer.cta_label, { clientMsgId: "m2", context: { id: offer.offer_id, kind: "offer" } });
+  expect(calls.map((call) => call.init.body)).toEqual([
+    '{"text":"hi","client_msg_id":"m1","in_call":false}',
+    '{"text":"Find refunds I am owed","client_msg_id":"m2","in_call":false,"context":{"id":"offer-1","kind":"offer"}}',
+  ]);
+});

@@ -436,6 +436,12 @@ export interface HistoryDelta {
   read_seq: number;
 }
 
+/** What a message was sent from. Only `offer` (an Explore offer, `id` = its `offer_id`) was seen. */
+export interface MessageContext {
+  id: string;
+  kind: Open<"offer">;
+}
+
 export interface SendMessageResponse {
   status: "ok";
   responder: Open<"chat">;

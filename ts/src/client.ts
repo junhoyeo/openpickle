@@ -10,6 +10,7 @@ import type {
   LoginSessionIssued,
   LoginSessionRefresh,
   LogNodeSummary,
+  MessageContext,
   MessageSearchScreen,
   LogStoreListings,
   LogStoreListingsRequest,
@@ -282,18 +283,19 @@ export class PickleClient {
 
   /**
    * `POST /api/rooms/{room}/messages`. The reply arrives on `events()`: `chat` events carry
-   * `client_msg_id` as the message `id` and as the `target_id` of reactions to it.
+   * `client_msg_id` as the message `id` and as the `target_id` of reactions to it. The app sends
+   * `context` when the message comes from an Explore offer, with the offer's `cta_label` as text.
    */
   async sendMessage(
     roomId: string,
     text: string,
-    options: { clientMsgId?: string; inCall?: boolean } = {},
+    options: { clientMsgId?: string; inCall?: boolean; context?: MessageContext } = {},
   ): Promise<SendMessageResponse & { client_msg_id: string }> {
     const clientMsgId = options.clientMsgId ?? crypto.randomUUID();
     const response = await this.request<SendMessageResponse>(
       "POST",
       `/api/rooms/${encodeURIComponent(roomId)}/messages`,
-      { body: { text, client_msg_id: clientMsgId, in_call: options.inCall ?? false } },
+      { body: { text, client_msg_id: clientMsgId, in_call: options.inCall ?? false, context: options.context } },
     );
     return { ...response, client_msg_id: clientMsgId };
   }
