@@ -17,14 +17,20 @@ export class SseParser {
   private data: string[] = [];
   private id: string | undefined;
   private retry: number | undefined;
+  private afterCarriageReturn = false;
 
   push(chunk: string): SseFrame[] {
+    // A "\r" ends its line without waiting for what follows, because nothing may follow. A "\n"
+    // that opens the next chunk is then the second half of the same "\r\n".
+    if (this.afterCarriageReturn && chunk.startsWith("\n")) {
+      chunk = chunk.slice(1);
+      this.afterCarriageReturn = false;
+    }
+    if (chunk !== "") this.afterCarriageReturn = chunk.endsWith("\r");
     this.buffer += chunk;
     const frames: SseFrame[] = [];
     let newline: number;
     while ((newline = this.buffer.search(/\r\n|\r|\n/)) !== -1) {
-      // A lone trailing "\r" may be the first half of "\r\n"; wait for more input.
-      if (this.buffer[newline] === "\r" && newline === this.buffer.length - 1) break;
       const line = this.buffer.slice(0, newline);
       const width = this.buffer.startsWith("\r\n", newline) ? 2 : 1;
       this.buffer = this.buffer.slice(newline + width);
