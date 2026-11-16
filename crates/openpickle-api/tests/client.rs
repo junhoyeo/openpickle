@@ -9,6 +9,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use mock_server::{MockServer, Reply};
 use openpickle_api::{
     ClientOptions, Credentials, Error, LoginSession, Method, PickleClient, RequestOptions,
+    decode_access_token,
 };
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
@@ -212,4 +213,11 @@ async fn request_options_merge_into_the_generated_request() {
         .map(|(_, value)| value.as_str())
         .collect();
     assert_eq!(authorization, ["Bearer override"]);
+}
+
+#[test]
+fn token_claims_are_read_as_utf8() {
+    let claims = r#"{"sub":"피클","sid":"s","iat":1,"exp":2,"sexp":3}"#;
+    let token = format!("Bearer h.{}.s", URL_SAFE_NO_PAD.encode(claims));
+    assert_eq!(decode_access_token(&token).unwrap().sub, "피클");
 }
