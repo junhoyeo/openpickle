@@ -1,27 +1,31 @@
-use gpui::{
-    App, Application, Bounds, Context, Window, WindowBounds, WindowOptions, div, prelude::*, px,
-    rgb, size,
-};
+use gpui::{App, AppContext, Application, KeyBinding, Menu, MenuItem, actions};
+use openpickle_desktop::{app::Shell, assets::Assets, backend, ui};
 
-struct Empty;
-
-impl Render for Empty {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().bg(rgb(0x101113))
-    }
-}
+actions!(openpickle, [Quit]);
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(440.), px(900.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            |_, cx| cx.new(|_| Empty),
-        )
-        .unwrap();
-        cx.activate(true);
-    });
+    // Started before GPUI so the cached conversation loads while the window is being created.
+    let (commands, updates) = backend::start();
+    Application::new()
+        .with_assets(Assets)
+        .run(move |cx: &mut App| {
+            ui::input::bind_keys(cx);
+            cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+            cx.on_action(|_: &Quit, cx| cx.quit());
+            cx.set_menus(vec![Menu {
+                name: "Pickle".into(),
+                items: vec![MenuItem::action("Quit Pickle", Quit)],
+            }]);
+            cx.on_window_closed(|cx| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+            cx.open_window(ui::window_options(cx), |window, cx| {
+                cx.new(|cx| Shell::new(commands, updates, window, cx))
+            })
+            .expect("the main window");
+            cx.activate(true);
+        });
 }

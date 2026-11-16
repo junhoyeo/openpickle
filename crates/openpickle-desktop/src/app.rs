@@ -30,7 +30,8 @@ pub struct Shell {
     /// The open conversation, oldest first.
     messages: Vec<Message>,
     activity: Option<Option<String>>,
-    _subscription: Option<Subscription>,
+    _screen_events: Option<Subscription>,
+    _activation: Subscription,
     _updates: Task<()>,
 }
 
@@ -41,7 +42,26 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let task = cx.spawn_in(window, async move |this, cx| {
+        let activation = cx.observe_window_activation(window, |this, window, _| {
+            this.commands
+                .send(Command::Active(window.is_window_active()))
+                .ok();
+        });
+        let mut shell = Self {
+            commands,
+            screen: Screen::Starting,
+            messages: Vec::new(),
+            activity: None,
+            _screen_events: None,
+            _activation: activation,
+            _updates: Task::ready(()),
+        };
+        // The backend started before the window did, so the cached conversation is usually
+        // waiting already. Applying it here puts it in the very first frame.
+        while let Ok(update) = updates.try_recv() {
+            shell.apply(update, window, cx);
+        }
+        shell._updates = cx.spawn_in(window, async move |this, cx| {
             while let Some(update) = updates.next().await {
                 let applied = this.update_in(cx, |this, window, cx| this.apply(update, window, cx));
                 if applied.is_err() {
@@ -49,14 +69,7 @@ impl Shell {
                 }
             }
         });
-        Self {
-            commands,
-            screen: Screen::Starting,
-            messages: Vec::new(),
-            activity: None,
-            _subscription: None,
-            _updates: task,
-        }
+        shell
     }
 
     fn apply(&mut self, update: Update, window: &mut Window, cx: &mut Context<Self>) {
@@ -107,7 +120,7 @@ impl Shell {
 
     fn show_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let login = cx.new(LoginView::new);
-        self._subscription = Some(cx.subscribe(&login, |this, _, event, _| {
+        self._screen_events = Some(cx.subscribe(&login, |this, _, event, _| {
             let command = match event {
                 LoginEvent::RequestCode(phone) => Command::RequestCode(phone.clone()),
                 LoginEvent::VerifyCode(code) => Command::VerifyCode(code.clone()),
@@ -124,7 +137,7 @@ impl Shell {
             return chat.clone();
         }
         let chat = cx.new(ChatView::new);
-        self._subscription = Some(cx.subscribe(&chat, |this, _, ChatEvent::Send(text), _| {
+        self._screen_events = Some(cx.subscribe(&chat, |this, _, ChatEvent::Send(text), _| {
             this.commands.send(Command::Send(text.clone())).ok();
         }));
         window.focus(&chat.focus_handle(cx));
