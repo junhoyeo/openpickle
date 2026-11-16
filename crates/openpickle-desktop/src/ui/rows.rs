@@ -55,11 +55,17 @@ pub fn render_row(row: &Row, index: usize, cx: &RowContext) -> AnyElement {
             let surface = shaped(row, matches!(part, Part::Bubble(_) | Part::Task(_)));
             let content = match part {
                 Part::Bubble(text) => bubble(surface, row.side, text, index, cx),
+                // A note, not speech: a started task, attachments, a failed send.
                 Part::Task(title) => surface
                     .px(px(14.))
                     .py(px(11.))
                     .max_w(relative(THEIRS_MAX))
-                    .text_color(theme::color(theme::TEXT_MUTED))
+                    .when(row.side == Side::Theirs, |note| {
+                        note.text_color(theme::color(theme::TEXT_MUTED))
+                    })
+                    .when(row.side == Side::Mine, |note| {
+                        note.text_color(theme::alpha(theme::ON_MINE, 0.6))
+                    })
                     .child(SharedString::from(title.to_string())),
                 // Cards sit 2 pt further from their neighbors than bubbles do.
                 Part::Card(card) => div()

@@ -30,6 +30,13 @@ pub fn message(item: &HistoryItem, card_state: Option<&CardState>) -> Message {
         _ if item.mine == Some(true) => (Side::Mine, bubbles(text, true)),
         _ => (Side::Theirs, bubbles(text, true)),
     };
+    let mut parts = parts;
+    // Pictures and files cannot be downloaded yet, so a message says how many it carries.
+    match item.attachments.as_ref().map_or(0, Vec::len) {
+        0 => {}
+        1 => parts.push(Part::Task("1 attachment".into())),
+        count => parts.push(Part::Task(format!("{count} attachments").into())),
+    }
     Message {
         id: item.id.clone(),
         seq: item.seq.max(0) as u64,
@@ -142,6 +149,17 @@ mod tests {
             None,
         );
         assert!(matches!(&task.parts[..], [Part::Task(title)] if &**title == "📞 전화"));
+    }
+
+    #[test]
+    fn a_picture_without_text_still_shows_up() {
+        let photo = message(
+            &item(
+                serde_json::json!({"role": "user", "id": "p", "at": 1.0, "seq": 7, "attachments": ["attachments/2026-01-01/a.jpg", "attachments/2026-01-01/b.jpg"]}),
+            ),
+            None,
+        );
+        assert!(matches!(&photo.parts[..], [Part::Task(note)] if &**note == "2 attachments"));
     }
 
     #[test]
