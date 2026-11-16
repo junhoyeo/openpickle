@@ -345,12 +345,15 @@ impl Render for FriendsView {
             .text_size(theme::BODY)
             .line_height(theme::BODY_LINE)
             .child(
+                // A column, so the content is as tall as it is: in a row it would be stretched
+                // to the window's height and leave nothing to scroll.
                 div()
                     .id("friends-scroll")
                     .size_full()
                     .overflow_y_scroll()
                     .flex()
-                    .justify_center()
+                    .flex_col()
+                    .items_center()
                     .child(content),
             )
             .child(header_cover())
@@ -367,5 +370,64 @@ impl Render for FriendsView {
 impl Focusable for FriendsView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::Cell, rc::Rc};
+
+    use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase, point, size};
+
+    use super::*;
+
+    fn friend(n: usize) -> Person {
+        Person {
+            id: n.to_string(),
+            name: format!("친구 {n}"),
+            picture: String::new(),
+            note: String::new(),
+        }
+    }
+
+    #[gpui::test]
+    fn a_long_list_of_friends_scrolls_to_its_end(cx: &mut TestAppContext) {
+        cx.update(crate::ui::bind_keys);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let pictures = cx.new(|_| Pictures::default());
+            FriendsView::new(Identity::default(), pictures, cx)
+        });
+        cx.simulate_resize(size(px(440.), px(900.)));
+        let social = Social {
+            friends: (0..30).map(friend).collect(),
+            ..Social::default()
+        };
+        view.update(cx, |view, cx| view.set_social(Ok(social), cx));
+        let invited = Rc::new(Cell::new(false));
+        cx.update(|_, cx| {
+            let invited = invited.clone();
+            cx.subscribe(&view, move |_, event, _| {
+                if matches!(event, FriendsEvent::Invite) {
+                    invited.set(true);
+                }
+            })
+            .detach();
+        });
+        cx.run_until_parked();
+
+        // The row to the invite sheet comes after thirty friends, far below the window.
+        let above_the_tab_bar = point(px(200.), px(750.));
+        cx.simulate_click(above_the_tab_bar, Modifiers::none());
+        assert!(!invited.get(), "the row is not on screen yet");
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(220.), px(450.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-5000.))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        cx.simulate_click(above_the_tab_bar, Modifiers::none());
+        assert!(invited.get(), "scrolled to the end, the row is there");
     }
 }
