@@ -229,6 +229,36 @@ async fn a_token_the_server_calls_expired_is_refreshed_once_and_the_request_repe
 }
 
 #[tokio::test]
+async fn a_search_sends_the_query_encoded_and_reads_the_matching_runs() {
+    let server = MockServer::start(|request| match request.path.as_str() {
+        "/api/screens/message-search" => Reply::json(
+            200,
+            r#"{"kind":"message-search","items":[{"id":"chat:42","kind":"chat","segments":[{"text":"내일 ","match":false},{"text":"비","match":true},{"text":" 온대요","match":false}],"label":"Chat","date_label":"Nov 16","room_id":"","call_id":"","seq":42,"line_id":""},{"id":"call:7","kind":"call","segments":[],"label":"Call","date_label":"Nov 2"}]}"#,
+        ),
+        _ => Reply::json(404, "{}"),
+    })
+    .await;
+    let pickle = client(&server, Credentials::AccessToken("token".into()));
+
+    let found = pickle.search_messages("비 & 눈").await.unwrap();
+    assert_eq!(server.take()[0].query, "query=%EB%B9%84%20%26%20%EB%88%88");
+    let first = &found.items[0];
+    assert_eq!((first.id.as_str(), first.seq), ("chat:42", 42));
+    let matching: Vec<&str> = first
+        .segments
+        .iter()
+        .filter(|segment| segment.is_match)
+        .map(|segment| segment.text.as_str())
+        .collect();
+    assert_eq!(matching, ["비"]);
+    // A kind that was never captured may leave out where the result is.
+    assert_eq!(
+        (found.items[1].seq, found.items[1].room_id.as_str()),
+        (0, "")
+    );
+}
+
+#[tokio::test]
 async fn api_errors_carry_status_detail_and_body() {
     let server = MockServer::start(|request| match request.path.as_str() {
         "/api/device/location/token" => Reply::json(409, r#"{"detail":"location_disabled"}"#),

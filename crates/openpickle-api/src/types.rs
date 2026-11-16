@@ -776,6 +776,48 @@ pub struct ExtraConversationsScreen {
     pub counterpart_name: String,
 }
 
+/// `GET /api/screens/message-search`: the messages that contain the query, newest first. The
+/// captures never held more than 30.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MessageSearchScreen {
+    pub kind: String,
+    pub items: Vec<MessageSearchItem>,
+}
+
+/// One search result. Only results in the chat with your character were captured; the four
+/// fields that say where a result is default to empty, in case other kinds leave them out.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MessageSearchItem {
+    /// `chat:<seq>` for a chat message.
+    pub id: String,
+    /// `chat` is the only kind seen.
+    pub kind: String,
+    /// The snippet, cut into runs that match the query and runs that do not.
+    pub segments: Vec<MessageSearchSegment>,
+    /// What the result is, for display: `Chat`.
+    pub label: String,
+    /// The day of the message, for display: `Nov 16`.
+    pub date_label: String,
+    /// Empty for the chat with your character.
+    #[serde(default)]
+    pub room_id: String,
+    #[serde(default)]
+    pub call_id: String,
+    /// The message's sequence number in its room.
+    #[serde(default)]
+    pub seq: i64,
+    #[serde(default)]
+    pub line_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageSearchSegment {
+    pub text: String,
+    /// Whether this run matches the query.
+    #[serde(rename = "match")]
+    pub is_match: bool,
+}
+
 /// `GET /api/screens/roulette-promo`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RoulettePromoScreen {

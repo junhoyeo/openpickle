@@ -681,6 +681,12 @@ impl PickleClient {
         self.get_screen_as("extra-conversations", &[]).await
     }
 
+    /// `GET /api/screens/message-search`: searches your messages for `query`.
+    pub async fn search_messages(&self, query: &str) -> Result<MessageSearchScreen> {
+        self.get_screen_as("message-search", &[("query", query)])
+            .await
+    }
+
     /// `GET /api/screens/roulette-promo`.
     pub async fn get_roulette_promo(&self) -> Result<RoulettePromoScreen> {
         self.get_screen_as("roulette-promo", &[]).await

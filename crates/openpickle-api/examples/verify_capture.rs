@@ -296,6 +296,9 @@ async fn call(client: &PickleClient, flow: &Flow, json: &Value) -> Option<Result
                     .await,
             )
         }
+        ("GET", ["", "api", "screens", "message-search"]) => {
+            done(client.search_messages(&q("query")).await)
+        }
         ("GET", ["", "api", "screens", kind]) if !query.is_empty() => {
             let pairs: Vec<(&str, &str)> = query
                 .iter()
