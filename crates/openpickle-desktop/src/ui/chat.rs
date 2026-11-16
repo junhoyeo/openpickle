@@ -6,27 +6,22 @@ use std::{
 };
 
 use gpui::{
-    App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    ImageSource, ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseUpEvent,
-    ObjectFit, Pixels, Point, SharedString, Subscription, Task, Window, anchored, deferred, div,
-    img, linear_color_stop, linear_gradient, list, point, prelude::*, px, relative,
+    App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, ImageSource,
+    ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point,
+    SharedString, Subscription, Task, Window, anchored, deferred, div, list, point, prelude::*, px,
 };
 
 use crate::{
     model::Row,
     theme,
     ui::{
-        Cancel, Find, chrome, icon,
+        Cancel, Find, HEADER_SOLID, Tab, chrome, header_cover, icon,
         input::{Copy, InputEvent, SelectAll, TextInput},
         rows::{RowContext, render_row},
         select::SharedSelection,
+        tab_bar, tab_header,
     },
 };
-
-/// The header hides the conversation down to here. Further down it fades out and the
-/// conversation shows through.
-const HEADER_SOLID: Pixels = px(49.);
-const HEADER_FADE_END: Pixels = px(140.);
 
 /// How long the message a search result opened stays marked.
 const FOUND_MARK: Duration = Duration::from_millis(1600);
@@ -42,14 +37,12 @@ pub enum ChatEvent {
     Send(String),
     /// The user asked for the search screen.
     Search,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Tab {
-    Chat,
-    Explore,
-    Library,
-    Profile,
+    /// The header's menu button was pressed.
+    Menu,
+    /// The header's Invite button was pressed.
+    Invite,
+    /// Another tab was chosen in the tab bar.
+    Open(Tab),
 }
 
 pub struct ChatView {
@@ -65,8 +58,6 @@ pub struct ChatView {
     menu: Option<ContextMenu>,
     /// When a drag past an edge last scrolled the list.
     scrolled_at: Option<Instant>,
-    /// Whether the menu on the left is open.
-    drawer: bool,
     /// The rows of the message a search result opened, marked for a moment.
     found: Option<Range<usize>>,
     _found: Option<Task<()>>,
@@ -117,7 +108,6 @@ impl ChatView {
             selection: SharedSelection::default(),
             menu: None,
             scrolled_at: None,
-            drawer: false,
             found: None,
             _found: None,
             _subscriptions: subscriptions,
@@ -183,103 +173,12 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Escape closes what is open on top of the conversation, or else drops the selection.
+    /// Escape closes the menu of a right click, or else drops the selection.
     fn cancel(&mut self, cx: &mut Context<Self>) {
-        if self.menu.take().is_none() && !std::mem::take(&mut self.drawer) {
+        if self.menu.take().is_none() {
             self.selection.borrow_mut().clear();
         }
         cx.notify();
-    }
-
-    /// The menu on the left: the search button and the sections of the app. Only Chat exists.
-    fn drawer_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let section = |name: &'static str, label: &'static str, color: u32| {
-            div()
-                .h(px(50.))
-                .px(px(14.))
-                .flex()
-                .items_center()
-                .gap(px(14.))
-                .rounded(px(17.))
-                .text_color(theme::color(color))
-                .child(icon(name, 23., color))
-                .child(label)
-        };
-        let panel = div()
-            .id("drawer")
-            .occlude()
-            .h_full()
-            .w(px(300.))
-            .max_w(relative(0.84))
-            .bg(theme::color(theme::CHROME))
-            .border_r_1()
-            .border_color(theme::color(theme::HAIRLINE))
-            .pt(px(50.))
-            .px(px(14.))
-            .flex()
-            .flex_col()
-            .gap(px(2.))
-            .text_size(px(17.))
-            .line_height(theme::LABEL_LINE)
-            .font_weight(FontWeight::MEDIUM)
-            .child(
-                div()
-                    .pl(px(12.))
-                    .pb(px(16.))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(22.))
-                            .line_height(px(28.))
-                            .font_weight(FontWeight::BOLD)
-                            .child("Pickle"),
-                    )
-                    .child(
-                        chrome("search")
-                            .size(px(43.))
-                            .rounded_full()
-                            .cursor_pointer()
-                            .child(icon("search", 20., theme::TEXT))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.drawer = false;
-                                cx.emit(ChatEvent::Search);
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                section("message-circle", "Chat", theme::TEXT)
-                    .id("section-chat")
-                    .bg(theme::color(theme::CHROME_SELECTED))
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.drawer = false;
-                        cx.notify();
-                    })),
-            )
-            .child(section("users-round", "Friends", theme::TEXT))
-            .child(section("compass", "Explore", theme::TEXT))
-            .child(section("archive", "Archive", theme::TEXT))
-            .child(section("globe", "3D World", theme::PLACEHOLDER))
-            .child(section("user-round", "My Pickle", theme::TEXT));
-        // A press beside the panel closes it.
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .occlude()
-            .bg(theme::alpha(0x000000, 0.5))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.drawer = false;
-                    cx.notify();
-                }),
-            )
-            .child(panel)
     }
 
     fn send(&mut self, input: &Entity<TextInput>, cx: &mut Context<Self>) {
@@ -434,89 +333,11 @@ impl ChatView {
         .with_priority(1)
     }
 
-    fn scroll_to_latest(&mut self, cx: &mut Context<Self>) {
+    pub fn scroll_to_latest(&mut self, cx: &mut Context<Self>) {
         // A reset is the list's way back to "follow the newest row".
         self.list.reset(self.rows.len());
         self.at_latest = true;
         cx.notify();
-    }
-
-    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let avatar = div()
-            .size(px(58.))
-            .rounded_full()
-            .overflow_hidden()
-            .bg(theme::color(theme::TEXT));
-        let avatar = match &self.avatar {
-            Some(source) => {
-                avatar.child(img(source.clone()).size_full().object_fit(ObjectFit::Cover))
-            }
-            None => avatar,
-        };
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
-            .h(HEADER_FADE_END)
-            .bg(linear_gradient(
-                180.,
-                linear_color_stop(theme::color(theme::PAGE), HEADER_SOLID / HEADER_FADE_END),
-                linear_color_stop(theme::alpha(theme::PAGE, 0.), 1.),
-            ))
-            .flex()
-            .justify_center()
-            .child(
-                div()
-                    .w_full()
-                    .max_w(theme::COLUMN_MAX)
-                    .px(theme::GUTTER)
-                    .pt(px(44.))
-                    .flex()
-                    .items_start()
-                    .justify_between()
-                    .text_size(theme::LABEL)
-                    .line_height(theme::LABEL_LINE)
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(
-                        div().w(px(74.)).child(
-                            chrome("menu")
-                                .size(px(43.))
-                                .rounded_full()
-                                .flex_col()
-                                .gap(px(3.8))
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.drawer = true;
-                                    cx.notify();
-                                }))
-                                .children((0..2).map(|_| {
-                                    div()
-                                        .w(px(15.5))
-                                        .h(px(2.2))
-                                        .rounded_full()
-                                        .bg(theme::color(theme::TEXT))
-                                })),
-                        ),
-                    )
-                    .child(
-                        div().flex().flex_col().items_center().child(avatar).child(
-                            chrome("name")
-                                .mt(px(-6.))
-                                .h(px(33.))
-                                .px(px(10.5))
-                                .rounded_full()
-                                .child(self.name.clone()),
-                        ),
-                    )
-                    .child(
-                        chrome("invite")
-                            .w(px(74.))
-                            .h(px(42.))
-                            .rounded_full()
-                            .child("Invite"),
-                    ),
-            )
     }
 
     fn bottom_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -555,35 +376,10 @@ impl ChatView {
             .child(div().w(px(4.)))
             .child(action);
 
-        let tabs = [
-            (Tab::Chat, "message-circle-filled"),
-            (Tab::Explore, "compass"),
-            (Tab::Library, "archive"),
-            (Tab::Profile, "user-round"),
-        ];
-        let tab_bar = chrome("tabs")
-            .w_full()
-            .max_w(px(399.))
-            .h(px(62.))
-            .rounded_full()
-            .p(px(4.))
-            .children(tabs.map(|(tab, name)| {
-                let selected = tab == Tab::Chat;
-                div()
-                    .h_full()
-                    .flex_1()
-                    .when(selected, |tab| {
-                        tab.flex_grow()
-                            .flex_shrink_0()
-                            .min_w(px(107.))
-                            .bg(theme::color(theme::CHROME_SELECTED))
-                    })
-                    .rounded_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icon(name, 23., theme::TEXT))
-            }));
+        let tab_bar = tab_bar(
+            Tab::Chat,
+            cx.listener(|_, tab: &Tab, _, cx| cx.emit(ChatEvent::Open(*tab))),
+        );
 
         // The bar takes the mouse, so a press on it is not a press in the conversation under it.
         div()
@@ -709,21 +505,15 @@ impl Render for ChatView {
                             .child(messages),
                     ),
             )
-            // The solid part of the header takes the mouse: text hidden under it cannot be
-            // pressed, and a press there is not a press in the conversation.
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .h(HEADER_SOLID)
-                    .occlude(),
-            )
-            .child(self.header(cx))
+            .child(header_cover())
+            .child(tab_header(
+                self.name.clone(),
+                self.avatar.clone(),
+                cx.listener(|_, _, _, cx| cx.emit(ChatEvent::Menu)),
+                cx.listener(|_, _, _, cx| cx.emit(ChatEvent::Invite)),
+            ))
             .when(!self.at_latest, |screen| screen.child(to_latest))
             .child(self.bottom_bar(cx))
-            .when(self.drawer, |screen| screen.child(self.drawer_panel(cx)))
             .children(self.menu.as_ref().map(|menu| self.context_menu(menu, cx)))
     }
 }

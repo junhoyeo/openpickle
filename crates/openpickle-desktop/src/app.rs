@@ -1,22 +1,28 @@
-//! The root view: shows sign-in or the chat, and applies what the backend reports.
+//! The root view: shows sign-in or the signed-in sections, and applies what the backend
+//! reports.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Local;
 use futures::{StreamExt, channel::mpsc::UnboundedReceiver};
 use gpui::{
-    Context, Entity, Focusable, FontWeight, ImageSource, SharedString, Subscription, Task, Window,
-    div, prelude::*, px,
+    AnyView, Context, Entity, Focusable, FontWeight, ImageSource, SharedString, Subscription, Task,
+    Window, div, prelude::*, px,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
     convert,
-    model::{Message, Part, UNCONFIRMED_SEQ, build_rows},
+    model::{Message, Part, Social, UNCONFIRMED_SEQ, build_rows},
     protocol::{Command, Update},
     theme,
     ui::{
+        Identity, OpenChat, OpenExplore, OpenFriends, Pictures, Tab,
         chat::{ChatEvent, ChatView},
+        drawer::{DrawerEvent, DrawerView},
+        explore::{ExploreEvent, ExploreView},
+        friends::{FriendsEvent, FriendsView},
+        invite::{InviteEvent, InviteView},
         login::{LoginEvent, LoginView},
         search::{SearchEvent, SearchView},
     },
@@ -26,14 +32,37 @@ enum Screen {
     /// Nothing is known yet; the backend answers within the first frames.
     Starting,
     Login(Entity<LoginView>),
+    /// Signed in. The chat always exists; the other sections are made when first opened.
     Chat(Entity<ChatView>),
     /// The backend stopped; the text says why.
     Failed(SharedString),
 }
 
+/// What is open on top of a section.
+enum Over {
+    Drawer(Entity<DrawerView>),
+    Invite(Entity<InviteView>),
+    /// The search screen, which lives in `Shell::search`.
+    Search,
+}
+
 pub struct Shell {
     commands: UnboundedSender<Command>,
     screen: Screen,
+    /// The section that shows while signed in.
+    tab: Tab,
+    explore: Option<Entity<ExploreView>>,
+    friends: Option<Entity<FriendsView>>,
+    over: Option<Over>,
+    /// The search screen. It is kept when it closes, so that opening it again shows the same
+    /// search: a result is opened to read around it, and then usually the next one.
+    search: Option<Entity<SearchView>>,
+    /// The character's name and picture, for the header of every section.
+    identity: Identity,
+    /// The pictures on disk, which the sections draw from.
+    pictures: Entity<Pictures>,
+    /// The friends and the invite link as last read.
+    social: Option<Social>,
     /// The open conversation, oldest first.
     messages: Vec<Message>,
     /// How many messages were typed here, which numbers the ones not confirmed yet.
@@ -41,13 +70,10 @@ pub struct Shell {
     activity: Option<Option<String>>,
     /// For each message, the index of its first row in the chat's list.
     row_starts: Vec<usize>,
-    /// The search screen. It is kept when it closes, so that opening it again shows the same
-    /// search: a result is opened to read around it, and then usually the next one.
-    search: Option<Entity<SearchView>>,
-    /// Whether the search screen is drawn, over the chat.
-    searching: bool,
-    _search_events: Option<Subscription>,
     _screen_events: Option<Subscription>,
+    _section_events: Vec<Subscription>,
+    _over_events: Option<Subscription>,
+    _search_events: Option<Subscription>,
     _activation: Subscription,
     _updates: Task<()>,
 }
@@ -72,14 +98,22 @@ impl Shell {
         let mut shell = Self {
             commands,
             screen: Screen::Starting,
+            tab: Tab::Chat,
+            explore: None,
+            friends: None,
+            over: None,
+            search: None,
+            identity: Identity::default(),
+            pictures: cx.new(|_| Pictures::default()),
+            social: None,
             messages: Vec::new(),
             sent: 0,
             activity: None,
             row_starts: Vec::new(),
-            search: None,
-            searching: false,
-            _search_events: None,
             _screen_events: None,
+            _section_events: Vec::new(),
+            _over_events: None,
+            _search_events: None,
             _activation: activation,
             _updates: Task::ready(()),
         };
@@ -103,7 +137,7 @@ impl Shell {
         match update {
             Update::SignedOut => {
                 self.messages.clear();
-                self.forget_search();
+                self.forget_account();
                 self.show_login(window, cx)
             }
             Update::CodeSent => {
@@ -123,18 +157,12 @@ impl Shell {
             } => {
                 open_conversation(&mut self.messages, messages);
                 self.activity = None;
-                let chat = self.show_chat(window, cx);
-                chat.update(cx, |chat, cx| {
-                    chat.set_identity(name, avatar.map(ImageSource::from), cx)
-                });
+                self.show_chat(window, cx);
+                self.set_identity(name, avatar.map(ImageSource::from), cx);
                 self.refresh_rows(cx);
             }
             Update::Identity { name, avatar } => {
-                if let Screen::Chat(chat) = &self.screen {
-                    chat.update(cx, |chat, cx| {
-                        chat.set_identity(name, avatar.map(ImageSource::from), cx)
-                    });
-                }
+                self.set_identity(name, avatar.map(ImageSource::from), cx);
             }
             Update::Upsert(messages) => {
                 for message in messages {
@@ -155,14 +183,67 @@ impl Shell {
                     search.update(cx, |search, cx| search.found(&query, results, cx));
                 }
             }
-            // Nothing shows these yet.
-            Update::Social(_) | Update::Explore(_) | Update::Pictures(_) => {}
+            Update::Social(social) => {
+                if let Ok(social) = &social {
+                    self.social = Some(social.clone());
+                    if let Some(Over::Invite(invite)) = &self.over {
+                        invite.update(cx, |invite, cx| {
+                            invite.set_invite(social.invite.clone(), cx)
+                        });
+                    }
+                }
+                if let Some(friends) = &self.friends {
+                    friends.update(cx, |friends, cx| friends.set_social(social, cx));
+                }
+            }
+            Update::Explore(explore) => {
+                if let Some(view) = &self.explore {
+                    view.update(cx, |view, cx| view.set_explore(explore, cx));
+                }
+            }
+            Update::Pictures(pictures) => self.pictures.update(cx, |known, cx| {
+                known.add(pictures);
+                cx.notify();
+            }),
             Update::Failed(reason) => {
-                self.forget_search();
+                self.forget_account();
                 self._screen_events = None;
                 self.screen = Screen::Failed(reason.into());
                 cx.notify();
             }
+        }
+    }
+
+    /// Drops what belongs to the signed-in account besides the conversation: the other
+    /// sections, what is open on top, and the search with what it found.
+    fn forget_account(&mut self) {
+        self.tab = Tab::Chat;
+        self.explore = None;
+        self.friends = None;
+        self.over = None;
+        self.search = None;
+        self.social = None;
+        self._section_events.clear();
+        self._over_events = None;
+        self._search_events = None;
+    }
+
+    fn set_identity(&mut self, name: String, avatar: Option<ImageSource>, cx: &mut Context<Self>) {
+        self.identity = Identity {
+            name: name.into(),
+            avatar,
+        };
+        let identity = &self.identity;
+        if let Screen::Chat(chat) = &self.screen {
+            chat.update(cx, |chat, cx| {
+                chat.set_identity(identity.name.clone(), identity.avatar.clone(), cx)
+            });
+        }
+        if let Some(explore) = &self.explore {
+            explore.update(cx, |explore, cx| explore.set_identity(identity.clone(), cx));
+        }
+        if let Some(friends) = &self.friends {
+            friends.update(cx, |friends, cx| friends.set_identity(identity.clone(), cx));
         }
     }
 
@@ -180,21 +261,152 @@ impl Shell {
         cx.notify();
     }
 
-    fn show_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<ChatView> {
-        if let Screen::Chat(chat) = &self.screen {
-            return chat.clone();
+    fn show_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Screen::Chat(_) = &self.screen {
+            return;
         }
         let chat = cx.new(ChatView::new);
         self._screen_events = Some(
             cx.subscribe_in(&chat, window, |this, _, event, window, cx| match event {
-                ChatEvent::Send(text) => this.send(text, cx),
+                ChatEvent::Send(text) => this.send(text, None, cx),
                 ChatEvent::Search => this.open_search(window, cx),
+                ChatEvent::Menu => this.open_drawer(window, cx),
+                ChatEvent::Invite => this.open_invite(window, cx),
+                ChatEvent::Open(tab) => this.open_tab(*tab, window, cx),
             }),
         );
         window.focus(&chat.focus_handle(cx));
-        self.screen = Screen::Chat(chat.clone());
+        self.screen = Screen::Chat(chat);
         cx.notify();
-        chat
+    }
+
+    /// Goes to a section and closes what was open on top. A section that is not built stays
+    /// where the window is.
+    fn open_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.screen, Screen::Chat(_)) {
+            return;
+        }
+        match tab {
+            Tab::Chat => {}
+            Tab::Explore => {
+                if self.explore.is_none() {
+                    let (identity, pictures) = (self.identity.clone(), self.pictures.clone());
+                    let explore = cx.new(|cx| ExploreView::new(identity, pictures, cx));
+                    self._section_events.push(cx.subscribe_in(
+                        &explore,
+                        window,
+                        |this, _, event, window, cx| match event {
+                            ExploreEvent::Menu => this.open_drawer(window, cx),
+                            ExploreEvent::Invite => this.open_invite(window, cx),
+                            ExploreEvent::Open(tab) => this.open_tab(*tab, window, cx),
+                            ExploreEvent::Ask { offer, text } => {
+                                this.open_tab(Tab::Chat, window, cx);
+                                this.send(text, Some(offer.clone()), cx);
+                                if let Screen::Chat(chat) = &this.screen {
+                                    chat.update(cx, |chat, cx| chat.scroll_to_latest(cx));
+                                }
+                            }
+                            ExploreEvent::Shown(offers) => {
+                                this.commands
+                                    .send(Command::OffersShown(offers.clone()))
+                                    .ok();
+                            }
+                            ExploreEvent::Reload => {
+                                this.commands.send(Command::LoadExplore).ok();
+                            }
+                        },
+                    ));
+                    self.explore = Some(explore);
+                }
+                self.commands.send(Command::LoadExplore).ok();
+            }
+            Tab::Friends => {
+                if self.friends.is_none() {
+                    let (identity, pictures) = (self.identity.clone(), self.pictures.clone());
+                    let friends = cx.new(|cx| FriendsView::new(identity, pictures, cx));
+                    if let Some(social) = &self.social {
+                        friends
+                            .update(cx, |friends, cx| friends.set_social(Ok(social.clone()), cx));
+                    }
+                    self._section_events.push(cx.subscribe_in(
+                        &friends,
+                        window,
+                        |this, _, event, window, cx| match event {
+                            FriendsEvent::Menu => this.open_drawer(window, cx),
+                            FriendsEvent::Invite => this.open_invite(window, cx),
+                            FriendsEvent::Open(tab) => this.open_tab(*tab, window, cx),
+                            FriendsEvent::Reload => {
+                                this.commands.send(Command::LoadSocial).ok();
+                            }
+                        },
+                    ));
+                    self.friends = Some(friends);
+                }
+                self.commands.send(Command::LoadSocial).ok();
+            }
+            Tab::Archive | Tab::Profile => return,
+        }
+        self.tab = tab;
+        self.close_over(window, cx);
+    }
+
+    /// The view of the section the window is on.
+    fn section(&self) -> Option<AnyView> {
+        let Screen::Chat(chat) = &self.screen else {
+            return None;
+        };
+        match self.tab {
+            Tab::Explore => self.explore.clone().map(AnyView::from),
+            Tab::Friends => self.friends.clone().map(AnyView::from),
+            _ => Some(chat.clone().into()),
+        }
+    }
+
+    /// Closes what is open on top and gives the keyboard back to the section.
+    fn close_over(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.over = None;
+        self._over_events = None;
+        let Screen::Chat(chat) = &self.screen else {
+            return;
+        };
+        let focus = match (self.tab, &self.explore, &self.friends) {
+            (Tab::Explore, Some(explore), _) => explore.focus_handle(cx),
+            (Tab::Friends, _, Some(friends)) => friends.focus_handle(cx),
+            _ => chat.focus_handle(cx),
+        };
+        window.focus(&focus);
+        cx.notify();
+    }
+
+    fn open_drawer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let tab = self.tab;
+        let drawer = cx.new(|cx| DrawerView::new(tab, cx));
+        self._over_events = Some(
+            cx.subscribe_in(&drawer, window, |this, _, event, window, cx| match event {
+                DrawerEvent::Search => this.open_search(window, cx),
+                DrawerEvent::Friends => this.open_tab(Tab::Friends, window, cx),
+                DrawerEvent::Open(tab) => this.open_tab(*tab, window, cx),
+                DrawerEvent::Close => this.close_over(window, cx),
+            }),
+        );
+        window.focus(&drawer.focus_handle(cx));
+        self.over = Some(Over::Drawer(drawer));
+        cx.notify();
+    }
+
+    fn open_invite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let invite = self.social.as_ref().map(|social| social.invite.clone());
+        let pictures = self.pictures.clone();
+        let sheet = cx.new(|cx| InviteView::new(invite.unwrap_or_default(), pictures, cx));
+        self._over_events = Some(cx.subscribe_in(
+            &sheet,
+            window,
+            |this, _, InviteEvent::Close, window, cx| this.close_over(window, cx),
+        ));
+        window.focus(&sheet.focus_handle(cx));
+        self.over = Some(Over::Invite(sheet));
+        self.commands.send(Command::LoadSocial).ok();
+        cx.notify();
     }
 
     fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -210,7 +422,7 @@ impl Shell {
                             this.commands.send(Command::Search(query.clone())).ok();
                         }
                         SearchEvent::Open(seq) => this.open_result(*seq, window, cx),
-                        SearchEvent::Close => this.close_search(window, cx),
+                        SearchEvent::Close => this.close_over(window, cx),
                     },
                 ));
                 self.search = Some(search.clone());
@@ -218,23 +430,15 @@ impl Shell {
             }
         };
         window.focus(&search.focus_handle(cx));
-        self.searching = true;
+        self._over_events = None;
+        self.over = Some(Over::Search);
         cx.notify();
     }
 
-    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.searching = false;
-        if let Screen::Chat(chat) = &self.screen {
-            window.focus(&chat.focus_handle(cx));
-        }
-        cx.notify();
-    }
-
-    /// Drops the search screen with what it found: the conversation it searched is gone.
-    fn forget_search(&mut self) {
-        self.search = None;
-        self.searching = false;
-        self._search_events = None;
+    /// Whether the search screen is open.
+    #[cfg(test)]
+    fn searching(&self) -> bool {
+        matches!(self.over, Some(Over::Search))
     }
 
     /// Leaves the search screen for the message a result names. A message that is not on
@@ -248,12 +452,13 @@ impl Shell {
         };
         let rows = start..start + self.messages[index].parts.len();
         chat.update(cx, |chat, cx| chat.reveal(rows, window, cx));
-        self.close_search(window, cx);
+        self.open_tab(Tab::Chat, window, cx);
     }
 
     /// Shows the message at once and hands it to the backend, which may be busy for a while:
-    /// connecting, or catching up after a long sleep.
-    fn send(&mut self, text: &str, cx: &mut Context<Self>) {
+    /// connecting, or catching up after a long sleep. `offer` is the Explore offer the
+    /// message asks for.
+    fn send(&mut self, text: &str, offer: Option<String>, cx: &mut Context<Self>) {
         let id = uuid::Uuid::new_v4().to_string();
         self.sent += 1;
         let now = SystemTime::now()
@@ -264,7 +469,7 @@ impl Shell {
         let command = Command::Send {
             id: id.clone(),
             text: text.to_owned(),
-            offer: None,
+            offer,
         };
         if self.commands.send(command).is_err() {
             mark_not_sent(&mut self.messages, &id, "Not sent. OpenPickle has stopped.");
@@ -326,14 +531,32 @@ fn upsert(messages: &mut Vec<Message>, message: Message) {
 }
 
 impl Render for Shell {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let screen = div().size_full().relative().bg(theme::color(theme::PAGE));
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let screen = div()
+            .size_full()
+            .relative()
+            .bg(theme::color(theme::PAGE))
+            .on_action(
+                cx.listener(|this, _: &OpenChat, window, cx| this.open_tab(Tab::Chat, window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &OpenExplore, window, cx| {
+                this.open_tab(Tab::Explore, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenFriends, window, cx| {
+                this.open_tab(Tab::Friends, window, cx)
+            }));
         match &self.screen {
             Screen::Starting => screen,
             Screen::Login(login) => screen.child(login.clone()),
-            Screen::Chat(chat) => screen
-                .child(chat.clone())
-                .children(self.search.clone().filter(|_| self.searching)),
+            Screen::Chat(_) => {
+                let over: Option<AnyView> = match &self.over {
+                    Some(Over::Drawer(drawer)) => Some(drawer.clone().into()),
+                    Some(Over::Invite(invite)) => Some(invite.clone().into()),
+                    Some(Over::Search) => self.search.clone().map(AnyView::from),
+                    None => None,
+                };
+                screen.children(self.section()).children(over)
+            }
             Screen::Failed(reason) => screen
                 .flex()
                 .flex_col()
@@ -418,6 +641,75 @@ mod tests {
     }
 
     #[gpui::test]
+    fn the_sections_load_when_opened_and_an_offer_is_asked_for_in_the_chat(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::ui::bind_keys);
+        let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, received) = futures::channel::mpsc::unbounded();
+        let conversation = Update::Conversation {
+            name: "Pickle".into(),
+            avatar: None,
+            messages: vec![message("a", 1)],
+        };
+        updates.unbounded_send(conversation).unwrap();
+        let (shell, cx) =
+            cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
+        let mut asked = |cx: &mut gpui::VisualTestContext, keys: &str| {
+            cx.simulate_keystrokes(keys);
+            std::iter::from_fn(|| sent.try_recv().ok()).collect::<Vec<Command>>()
+        };
+
+        // Each section asks the backend for its data when it is opened.
+        let commands = asked(cx, "cmd-3");
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, Command::LoadSocial))
+        );
+        shell.read_with(cx, |shell, _| assert_eq!(shell.tab, Tab::Friends));
+        let commands = asked(cx, "cmd-2");
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, Command::LoadExplore))
+        );
+
+        // Asking for an offer sends its text with the offer's id, and shows it in the chat.
+        let explore = shell.read_with(cx, |shell, _| shell.explore.clone().unwrap());
+        explore.update(cx, |_, cx| {
+            cx.emit(ExploreEvent::Ask {
+                offer: "offer-1".into(),
+                text: "환급금 찾아줘".into(),
+            })
+        });
+        cx.run_until_parked();
+        let commands = asked(cx, "");
+        let offer = commands.iter().find_map(|command| match command {
+            Command::Send { text, offer, .. } => Some((text.as_str(), offer.as_deref())),
+            _ => None,
+        });
+        assert_eq!(offer, Some(("환급금 찾아줘", Some("offer-1"))));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.tab, Tab::Chat);
+            assert!(shell.messages.last().unwrap().seq > UNCONFIRMED_SEQ);
+        });
+
+        // The invite sheet opens over a section and Escape closes it again.
+        let chat = shell.read_with(cx, |shell, _| match &shell.screen {
+            Screen::Chat(chat) => chat.clone(),
+            _ => panic!("signed in"),
+        });
+        chat.update(cx, |_, cx| cx.emit(ChatEvent::Invite));
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(matches!(shell.over, Some(Over::Invite(_))))
+        });
+        cx.simulate_keystrokes("escape");
+        shell.read_with(cx, |shell, _| assert!(shell.over.is_none()));
+    }
+
+    #[gpui::test]
     fn a_search_result_opens_its_message_and_closes_the_search(cx: &mut gpui::TestAppContext) {
         cx.update(crate::ui::bind_keys);
         let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
@@ -462,18 +754,18 @@ mod tests {
         cx.run_until_parked();
         let first = gpui::point(gpui::px(120.), gpui::px(75.));
         cx.simulate_click(first, gpui::Modifiers::none());
-        shell.read_with(cx, |shell, _| assert!(shell.searching));
+        shell.read_with(cx, |shell, _| assert!(shell.searching()));
         cx.simulate_click(
             first + gpui::point(gpui::px(0.), gpui::px(70.)),
             gpui::Modifiers::none(),
         );
-        shell.read_with(cx, |shell, _| assert!(!shell.searching));
+        shell.read_with(cx, |shell, _| assert!(!shell.searching()));
 
         // Escape closes the search too.
         cx.simulate_keystrokes("cmd-f");
-        shell.read_with(cx, |shell, _| assert!(shell.searching));
+        shell.read_with(cx, |shell, _| assert!(shell.searching()));
         cx.simulate_keystrokes("escape");
-        shell.read_with(cx, |shell, _| assert!(!shell.searching));
+        shell.read_with(cx, |shell, _| assert!(!shell.searching()));
     }
 
     #[test]

@@ -44,6 +44,17 @@ pub fn keep_words(text: &str, wrap_width: Pixels, window: &Window) -> SharedStri
     })
 }
 
+/// [`keep_words`] for text of another size than the body's. Character widths grow with the
+/// size, so the room is scaled instead. Two percent are held back for heavier weights.
+pub fn keep_words_at(
+    text: &str,
+    size: Pixels,
+    wrap_width: Pixels,
+    window: &Window,
+) -> SharedString {
+    keep_words(text, wrap_width * (theme::BODY / size) * 0.98, window)
+}
+
 fn break_lines(text: &str, wrap_width: f32, mut width_of: impl FnMut(char) -> f32) -> String {
     let mut out = String::with_capacity(text.len());
     for (index, paragraph) in text.split('\n').enumerate() {
