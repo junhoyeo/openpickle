@@ -438,7 +438,8 @@ async fn converse(
 
     let mut events: Option<EventStream> = None;
     let mut connect_at = Instant::now();
-    let mut backoff = Duration::from_secs(2);
+    let mut opened_at = Instant::now();
+    let mut backoff = Backoff::default();
     loop {
         tokio::select! {
             command = commands.recv() => match command {
@@ -458,7 +459,7 @@ async fn converse(
                 Some(Command::RequestCode(_) | Command::VerifyCode(_)) => {}
             },
             event = next_event(&mut events), if events.is_some() => match event {
-                Some(Ok(PickleEvent::Retry(delay))) => backoff = delay,
+                Some(Ok(PickleEvent::Retry(delay))) => backoff.server_asks(delay),
                 Some(Ok(event)) => {
                     if let Err(error) = live.handle(event).await
                         && session_is_gone(&error)
@@ -466,24 +467,64 @@ async fn converse(
                         return Ended::SignedOut;
                     }
                 }
-                // The stream ended or broke: catch up and reopen it after the server's delay.
+                // The stream ended or broke: catch up and open it again after a wait.
                 Some(Err(_)) | None => {
                     events = None;
-                    connect_at = Instant::now() + backoff;
+                    backoff.stream_ended(opened_at.elapsed());
+                    connect_at = Instant::now() + backoff.next();
                 }
             },
             _ = tokio::time::sleep_until(connect_at), if events.is_none() => match live.connect().await {
                 Ok(stream) => {
                     events = Some(stream);
-                    backoff = Duration::from_secs(2);
+                    opened_at = Instant::now();
                 }
                 Err(error) if session_is_gone(&error) => return Ended::SignedOut,
-                Err(_) => {
-                    connect_at = Instant::now() + backoff;
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
-                }
+                Err(_) => connect_at = Instant::now() + backoff.next(),
             },
         }
+    }
+}
+
+/// How long to wait before opening the event stream again. The wait doubles with every
+/// attempt and starts over only when a stream has stayed open for a while: a stream that
+/// opens and ends at once is as much a failure as one that does not open.
+struct Backoff {
+    /// The wait to start over with. The server may name it.
+    first: Duration,
+    wait: Duration,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self {
+            first: Duration::from_secs(2),
+            wait: Duration::from_secs(2),
+        }
+    }
+}
+
+impl Backoff {
+    const LONGEST: Duration = Duration::from_secs(30);
+    /// A stream that was open this long was a working connection.
+    const SETTLED: Duration = Duration::from_secs(30);
+
+    /// The wait before the next attempt.
+    fn next(&mut self) -> Duration {
+        let wait = self.wait;
+        self.wait = (wait * 2).min(Self::LONGEST).max(self.first);
+        wait
+    }
+
+    fn stream_ended(&mut self, open_for: Duration) {
+        if open_for >= Self::SETTLED {
+            self.wait = self.first;
+        }
+    }
+
+    fn server_asks(&mut self, wait: Duration) {
+        self.first = wait;
+        self.wait = self.wait.max(wait);
     }
 }
 
@@ -711,6 +752,27 @@ async fn download_avatar(store: &Store, url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_wait_to_reconnect_grows_until_a_stream_stays_open() {
+        let seconds = Duration::from_secs;
+        let mut backoff = Backoff::default();
+        backoff.server_asks(Duration::from_millis(1250));
+
+        // The stream opens and ends at once, again and again.
+        let waits: Vec<Duration> = (0..6)
+            .map(|_| {
+                backoff.stream_ended(seconds(1));
+                backoff.next()
+            })
+            .collect();
+        assert_eq!(waits, [2, 4, 8, 16, 30, 30].map(seconds));
+
+        // After a stream that stayed open, the wait starts over with what the server asked for.
+        backoff.stream_ended(seconds(120));
+        assert_eq!(backoff.next(), Duration::from_millis(1250));
+        assert_eq!(backoff.next(), Duration::from_millis(2500));
+    }
 
     #[test]
     fn a_message_announced_again_keeps_what_the_history_said_about_it() {
