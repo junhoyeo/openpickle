@@ -21,8 +21,8 @@ use openpickle_desktop::{
     assets::Assets,
     content::{Block, parse_message},
     model::{
-        Explore, Invite, Message, Offer, OfferSection, Part, Person, Request, RequestStatus,
-        SearchResult, Side, Social, build_rows,
+        Attachment, AttachmentKind, Explore, Invite, Message, Offer, OfferSection, Part, Person,
+        Request, RequestStatus, SearchResult, Side, Social, build_rows,
     },
     protocol::{Command, Update},
     ui::{self, chat::ChatView, login::LoginView},
@@ -57,6 +57,35 @@ fn sample_social() -> Social {
             inviters: vec![person("Mina", "Joined 40 days ago")],
         },
     }
+}
+
+/// Made-up attachments: pictures over three days and two documents. No picture files exist,
+/// so the tiles stay empty.
+fn sample_archive() -> Vec<Attachment> {
+    let day = 24. * 3600.;
+    let now = Local::now().timestamp() as f64;
+    let picture = |n: u32, days_ago: f64| Attachment {
+        path: format!("attachments/sample/IMG_{n:04}.jpg"),
+        seq: 1,
+        at: now - days_ago * day,
+        name: format!("IMG_{n:04}.jpg"),
+        detail: String::new(),
+        kind: AttachmentKind::Picture,
+    };
+    let file = |name: &str, detail: &str, days_ago: f64| Attachment {
+        path: format!("attachments/sample/{name}"),
+        seq: 2,
+        at: now - days_ago * day,
+        name: name.into(),
+        detail: detail.into(),
+        kind: AttachmentKind::File,
+    };
+    let mut attachments: Vec<Attachment> =
+        (0..7).map(|n| picture(n, (n / 3) as f64 * 2.)).collect();
+    attachments.push(file("모임 장소 비교.pdf", "PDF · 3 pages · 412 KB", 1.));
+    attachments.push(file("budget.xlsx", "XLSX · 20 KB", 6.));
+    attachments.sort_by(|a, b| b.at.total_cmp(&a.at));
+    attachments
 }
 
 /// Made-up offers in the shape of the server's: three sections, one of which expands.
@@ -356,6 +385,10 @@ fn main() {
                             },
                             Command::LoadSocial => Update::Social(Ok(sample_social())),
                             Command::LoadExplore => Update::Explore(Ok(sample_explore())),
+                            Command::LoadArchive => Update::Archive {
+                                attachments: sample_archive(),
+                                complete: true,
+                            },
                             _ => continue,
                         };
                         updates.unbounded_send(update).ok();

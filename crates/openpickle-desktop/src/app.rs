@@ -17,7 +17,8 @@ use crate::{
     protocol::{Command, Update},
     theme,
     ui::{
-        Identity, OpenChat, OpenExplore, OpenFriends, Pictures, Tab,
+        Identity, OpenArchive, OpenChat, OpenExplore, OpenFriends, Pictures, Tab,
+        archive::{ArchiveEvent, ArchiveView},
         chat::{ChatEvent, ChatView},
         drawer::{DrawerEvent, DrawerView},
         explore::{ExploreEvent, ExploreView},
@@ -53,6 +54,7 @@ pub struct Shell {
     tab: Tab,
     explore: Option<Entity<ExploreView>>,
     friends: Option<Entity<FriendsView>>,
+    archive: Option<Entity<ArchiveView>>,
     over: Option<Over>,
     /// The search screen. It is kept when it closes, so that opening it again shows the same
     /// search: a result is opened to read around it, and then usually the next one.
@@ -100,6 +102,7 @@ impl Shell {
             tab: Tab::Chat,
             explore: None,
             friends: None,
+            archive: None,
             over: None,
             search: None,
             identity: Identity::default(),
@@ -205,8 +208,16 @@ impl Shell {
                     view.update(cx, |view, cx| view.set_explore(explore, cx));
                 }
             }
-            // Nothing shows it yet.
-            Update::Archive { .. } => {}
+            Update::Archive {
+                attachments,
+                complete,
+            } => {
+                if let Some(archive) = &self.archive {
+                    archive.update(cx, |archive, cx| {
+                        archive.set_attachments(attachments, complete, cx)
+                    });
+                }
+            }
             Update::Pictures(pictures) => self.pictures.update(cx, |known, cx| {
                 known.add(pictures);
                 cx.notify();
@@ -226,6 +237,7 @@ impl Shell {
         self.tab = Tab::Chat;
         self.explore = None;
         self.friends = None;
+        self.archive = None;
         self.over = None;
         self.search = None;
         self.social = None;
@@ -250,6 +262,9 @@ impl Shell {
         }
         if let Some(friends) = &self.friends {
             friends.update(cx, |friends, cx| friends.set_identity(identity.clone(), cx));
+        }
+        if let Some(archive) = &self.archive {
+            archive.update(cx, |archive, cx| archive.set_identity(identity.clone(), cx));
         }
     }
 
@@ -350,7 +365,30 @@ impl Shell {
                 }
                 self.commands.send(Command::LoadSocial).ok();
             }
-            Tab::Archive | Tab::Profile => return,
+            Tab::Archive => {
+                if self.archive.is_none() {
+                    let (identity, pictures) = (self.identity.clone(), self.pictures.clone());
+                    let archive = cx.new(|cx| ArchiveView::new(identity, pictures, cx));
+                    self._section_events.push(cx.subscribe_in(
+                        &archive,
+                        window,
+                        |this, _, event, window, cx| match event {
+                            ArchiveEvent::Menu => this.open_drawer(window, cx),
+                            ArchiveEvent::Invite => this.open_invite(window, cx),
+                            ArchiveEvent::Open(tab) => this.open_tab(*tab, window, cx),
+                            ArchiveEvent::ShowInChat(seq) => this.show_message(*seq, window, cx),
+                            ArchiveEvent::Load(paths) => {
+                                this.commands
+                                    .send(Command::LoadAttachments(paths.clone()))
+                                    .ok();
+                            }
+                        },
+                    ));
+                    self.archive = Some(archive);
+                }
+                self.commands.send(Command::LoadArchive).ok();
+            }
+            Tab::Profile => return,
         }
         self.tab = tab;
         self.report_reading(window);
@@ -372,6 +410,7 @@ impl Shell {
         match self.tab {
             Tab::Explore => self.explore.clone().map(AnyView::from),
             Tab::Friends => self.friends.clone().map(AnyView::from),
+            Tab::Archive => self.archive.clone().map(AnyView::from),
             _ => Some(chat.clone().into()),
         }
     }
@@ -383,9 +422,10 @@ impl Shell {
         let Screen::Chat(chat) = &self.screen else {
             return;
         };
-        let focus = match (self.tab, &self.explore, &self.friends) {
-            (Tab::Explore, Some(explore), _) => explore.focus_handle(cx),
-            (Tab::Friends, _, Some(friends)) => friends.focus_handle(cx),
+        let focus = match (self.tab, &self.explore, &self.friends, &self.archive) {
+            (Tab::Explore, Some(explore), _, _) => explore.focus_handle(cx),
+            (Tab::Friends, _, Some(friends), _) => friends.focus_handle(cx),
+            (Tab::Archive, _, _, Some(archive)) => archive.focus_handle(cx),
             _ => chat.focus_handle(cx),
         };
         window.focus(&focus);
@@ -435,7 +475,7 @@ impl Shell {
                         SearchEvent::Query(query) => {
                             this.commands.send(Command::Search(query.clone())).ok();
                         }
-                        SearchEvent::Open(seq) => this.open_result(*seq, window, cx),
+                        SearchEvent::Open(seq) => this.show_message(*seq, window, cx),
                         SearchEvent::Close => this.close_over(window, cx),
                     },
                 ));
@@ -455,9 +495,9 @@ impl Shell {
         matches!(self.over, Some(Over::Search))
     }
 
-    /// Leaves the search screen for the message a result names. A message that is not on
-    /// this computer (yet) cannot be shown, and the search stays open.
-    fn open_result(&mut self, seq: u64, window: &mut Window, cx: &mut Context<Self>) {
+    /// Goes to the chat at the message with this sequence number, and marks it for a moment.
+    /// A message that is not on this computer (yet) cannot be shown; nothing changes then.
+    fn show_message(&mut self, seq: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.messages.iter().position(|message| message.seq == seq) else {
             return;
         };
@@ -561,6 +601,9 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|this, _: &OpenFriends, window, cx| {
                 this.open_tab(Tab::Friends, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenArchive, window, cx| {
+                this.open_tab(Tab::Archive, window, cx)
             }));
         match &self.screen {
             Screen::Starting => screen,

@@ -130,7 +130,11 @@ impl Render for DrawerView {
                 "Explore",
                 Some(DrawerEvent::Open(Tab::Explore)),
             ))
-            .child(row("archive", "Archive", None))
+            .child(row(
+                "archive",
+                "Archive",
+                Some(DrawerEvent::Open(Tab::Archive)),
+            ))
             .child(row("globe", "3D World", None))
             .child(row("user-round", "My Pickle", None));
         // A press beside the panel closes it.

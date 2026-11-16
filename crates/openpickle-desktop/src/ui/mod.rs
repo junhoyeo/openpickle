@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod chat;
 pub mod drawer;
 pub mod explore;
@@ -27,7 +28,8 @@ actions!(
         Next,
         OpenChat,
         OpenExplore,
-        OpenFriends
+        OpenFriends,
+        OpenArchive
     ]
 );
 
@@ -42,6 +44,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-1", OpenChat, None),
         KeyBinding::new("cmd-2", OpenExplore, None),
         KeyBinding::new("cmd-3", OpenFriends, None),
+        KeyBinding::new("cmd-4", OpenArchive, None),
     ]);
 }
 
@@ -86,7 +89,7 @@ fn icon(name: &'static str, size: f32, color: u32) -> impl IntoElement {
 }
 
 /// The sections of the app. The tab bar leads to four of them and the menu to Friends as
-/// well. Chat, Friends and Explore exist.
+/// well. All but Profile exist.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
     Chat,
@@ -255,7 +258,7 @@ fn header_cover() -> impl IntoElement {
         .occlude()
 }
 
-/// The pill with the four tabs. Only Chat and Explore can be chosen.
+/// The pill with the four tabs. All but Profile can be chosen.
 fn tab_bar(
     selected: Tab,
     on_select: impl Fn(&Tab, &mut Window, &mut App) + 'static,
@@ -275,7 +278,7 @@ fn tab_bar(
         .p(px(4.))
         .children(tabs.map(|(tab, name, chosen_name)| {
             let chosen = tab == selected;
-            let exists = matches!(tab, Tab::Chat | Tab::Explore);
+            let exists = tab != Tab::Profile;
             let on_select = on_select.clone();
             div()
                 .id(name)
