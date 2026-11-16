@@ -392,9 +392,7 @@ struct Live {
     active: bool,
     /// The cache files that were shown to the window in this run.
     shown_from_disk: HashSet<&'static str>,
-    /// The pictures the window was told about, or will be when they are downloaded.
-    pictures: HashSet<String>,
-    downloads: Arc<Downloads>,
+    pictures: PictureFetches,
     marked_read: i64,
 }
 
@@ -447,8 +445,7 @@ async fn converse(
         // The window says when it comes to the front.
         active: false,
         shown_from_disk: HashSet::new(),
-        pictures: HashSet::new(),
-        downloads: Arc::new(Downloads::new()),
+        pictures: PictureFetches::new(),
         marked_read: 0,
     };
     live.send(Update::Conversation {
@@ -812,36 +809,8 @@ impl Live {
     /// Tells the UI where the pictures at these addresses are, now for those in the cache and
     /// later, one by one, for those that have to be downloaded first.
     fn fetch_pictures(&mut self, urls: Vec<String>) {
-        let mut ready = Vec::new();
-        for url in urls {
-            let key = convert::picture_key(&url).to_owned();
-            if !self.pictures.insert(key.clone()) {
-                continue;
-            }
-            let file = picture_file(&key);
-            let path = self.store.cache_path(&file);
-            if path.exists() {
-                ready.push((key, path));
-                continue;
-            }
-            let (store, updates, downloads) = (
-                self.store.clone(),
-                self.updates.clone(),
-                self.downloads.clone(),
-            );
-            tokio::spawn(async move {
-                let Ok(_slot) = downloads.slots.acquire().await else {
-                    return;
-                };
-                if let Some(bytes) = downloads.get(&url).await
-                    && store.cache_bytes(&file, &bytes).is_ok()
-                {
-                    updates
-                        .unbounded_send(Update::Pictures(vec![(key, path)]))
-                        .ok();
-                }
-            });
-        }
+        self.pictures.forget_failed();
+        let ready = self.pictures.fetch(urls, &self.store, &self.updates);
         if !ready.is_empty() {
             self.send(Update::Pictures(ready));
         }
@@ -860,6 +829,78 @@ impl Live {
                 .is_ok()
         {
             self.marked_read = head;
+        }
+    }
+}
+
+/// The pictures the window was told about, or will be when their download is done. A
+/// download that fails is forgotten, so the next answer that names the picture tries again.
+struct PictureFetches {
+    known: HashSet<String>,
+    downloads: Arc<Downloads>,
+    failed: UnboundedSender<String>,
+    failures: tokio::sync::mpsc::UnboundedReceiver<String>,
+}
+
+impl PictureFetches {
+    fn new() -> Self {
+        let (failed, failures) = unbounded_channel();
+        Self {
+            known: HashSet::new(),
+            downloads: Arc::new(Downloads::new()),
+            failed,
+            failures,
+        }
+    }
+
+    /// Starts the downloads of the pictures that are new, and returns those already cached.
+    fn fetch(
+        &mut self,
+        urls: Vec<String>,
+        store: &Store,
+        updates: &Updates<Update>,
+    ) -> Vec<(String, PathBuf)> {
+        let mut ready = Vec::new();
+        for url in urls {
+            let key = convert::picture_key(&url).to_owned();
+            if !self.known.insert(key.clone()) {
+                continue;
+            }
+            let file = picture_file(&key);
+            let path = store.cache_path(&file);
+            if path.exists() {
+                ready.push((key, path));
+                continue;
+            }
+            let (store, updates, downloads, failed) = (
+                store.clone(),
+                updates.clone(),
+                self.downloads.clone(),
+                self.failed.clone(),
+            );
+            tokio::spawn(async move {
+                let Ok(_slot) = downloads.slots.acquire().await else {
+                    return;
+                };
+                match downloads.get(&url).await {
+                    Some(bytes) if store.cache_bytes(&file, &bytes).is_ok() => {
+                        updates
+                            .unbounded_send(Update::Pictures(vec![(key, path)]))
+                            .ok();
+                    }
+                    _ => {
+                        failed.send(key).ok();
+                    }
+                }
+            });
+        }
+        ready
+    }
+
+    /// Forgets the pictures whose download failed since the last call.
+    fn forget_failed(&mut self) {
+        while let Ok(key) = self.failures.try_recv() {
+            self.known.remove(&key);
         }
     }
 }
@@ -931,6 +972,49 @@ async fn download_avatar(store: &Store, url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_picture_that_could_not_be_downloaded_is_tried_again() {
+        let root =
+            std::env::temp_dir().join(format!("openpickle-test-pictures-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root).unwrap();
+        let (updates, _received) = futures::channel::mpsc::unbounded();
+        // A port that refuses the connection: the download fails at once.
+        let address = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let url = format!("http://{address}/icon.png?sig=1");
+        let mut pictures = PictureFetches::new();
+
+        assert!(
+            pictures
+                .fetch(vec![url.clone()], &store, &updates)
+                .is_empty()
+        );
+        // Asked again while the download runs, the picture is not fetched twice.
+        assert!(
+            pictures
+                .fetch(vec![url.clone()], &store, &updates)
+                .is_empty()
+        );
+        let key = convert::picture_key(&url).to_owned();
+        for _ in 0..200 {
+            pictures.forget_failed();
+            if !pictures.known.contains(&key) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !pictures.known.contains(&key),
+            "the failure was not reported"
+        );
+        // The next answer that names it starts a new download.
+        pictures.fetch(vec![url], &store, &updates);
+        assert!(pictures.known.contains(&key));
+    }
 
     #[test]
     fn a_picture_keeps_its_file_name_and_its_kind() {
