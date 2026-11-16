@@ -34,7 +34,15 @@ impl Store {
     }
 
     pub fn at(root: PathBuf) -> io::Result<Self> {
-        fs::create_dir_all(root.join("cache"))?;
+        // Everything here is private: a credential and copies of the user's conversations.
+        for directory in [root.clone(), root.join("cache")] {
+            fs::create_dir_all(&directory)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+            }
+        }
         Ok(Self { root })
     }
 
@@ -59,8 +67,10 @@ impl Store {
     }
 
     pub fn save_session(&self, session: &Session) -> io::Result<()> {
-        let path = self.root.join("session.json");
-        write_atomically(&path, &serde_json::to_vec(session)?, true)
+        write_atomically(
+            &self.root.join("session.json"),
+            &serde_json::to_vec(session)?,
+        )
     }
 
     /// Forgets the login session and everything cached for it. The next person to sign in on
@@ -80,7 +90,7 @@ impl Store {
     }
 
     pub fn cache<T: Serialize>(&self, name: &str, value: &T) -> io::Result<()> {
-        write_atomically(&self.cache_path(name), &serde_json::to_vec(value)?, false)
+        write_atomically(&self.cache_path(name), &serde_json::to_vec(value)?)
     }
 
     /// Every record of an append-only log, oldest first. A line cut short by a crash is skipped.
@@ -99,10 +109,7 @@ impl Store {
         if records.is_empty() {
             return Ok(());
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
+        let mut file = private(OpenOptions::new().create(true).read(true).append(true))
             .open(self.cache_path(name))?;
         let mut lines = Vec::new();
         // A crash can leave the last line unfinished. Starting on a fresh line keeps that
@@ -122,6 +129,11 @@ impl Store {
         file.write_all(&lines)
     }
 
+    /// Writes a cached file as it is, such as a downloaded picture.
+    pub fn cache_bytes(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        write_atomically(&self.cache_path(name), bytes)
+    }
+
     /// Where a cached file (an avatar image, say) lives.
     pub fn cache_path(&self, name: &str) -> PathBuf {
         self.root.join("cache").join(name)
@@ -132,18 +144,22 @@ impl Store {
     }
 }
 
-/// Writes through a temporary file and a rename, so a crash leaves the old or the new content,
-/// never half of one. That matters most for the session: a lost refresh token ends the login.
-fn write_atomically(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
-    let temporary = path.with_extension("tmp");
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+/// Files are readable by their owner only.
+fn private(options: &mut OpenOptions) -> &mut OpenOptions {
     #[cfg(unix)]
-    if private {
+    {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(&temporary)?;
+    options
+}
+
+/// Writes through a temporary file and a rename, so a crash leaves the old or the new content,
+/// never half of one. That matters most for the session: a lost refresh token ends the login.
+fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let temporary = path.with_extension("tmp");
+    let mut file =
+        private(OpenOptions::new().write(true).create(true).truncate(true)).open(&temporary)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     fs::rename(&temporary, path)
@@ -160,8 +176,14 @@ mod tests {
         Store::at(root).unwrap()
     }
 
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
     #[test]
-    fn session_round_trips_and_is_private() {
+    fn session_round_trips() {
         let store = store("session");
         assert_eq!(store.session(), None);
         let session = Session {
@@ -170,14 +192,28 @@ mod tests {
         };
         store.save_session(&session).unwrap();
         assert_eq!(store.session(), Some(session));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(store.root.join("session.json"))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nothing_is_readable_by_other_users() {
+        let store = store("private");
+        store
+            .save_session(&Session {
+                login_session_token: "ls_test".into(),
+                device_id: "device".into(),
+            })
+            .unwrap();
+        store.cache("room.json", &"room").unwrap();
+        store.append_log("room.jsonl", &[1]).unwrap();
+        assert_eq!(mode(&store.root), 0o700);
+        assert_eq!(mode(&store.root.join("cache")), 0o700);
+        for file in [
+            store.root.join("session.json"),
+            store.cache_path("room.json"),
+            store.cache_path("room.jsonl"),
+        ] {
+            assert_eq!(mode(&file), 0o600, "{}", file.display());
         }
     }
 

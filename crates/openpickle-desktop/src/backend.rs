@@ -655,7 +655,7 @@ async fn download_avatar(store: &Store, url: &str) -> Option<String> {
         .filter(|extension| extension.len() <= 4)
         .unwrap_or("png");
     let file = format!("avatar.{extension}");
-    std::fs::write(store.cache_path(&file), &bytes).ok()?;
+    store.cache_bytes(&file, &bytes).ok()?;
     Some(file)
 }
 
