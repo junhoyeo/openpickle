@@ -7,7 +7,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use mock_server::{MockServer, Reply};
-use openpickle_api::{ClientOptions, Credentials, Error, LoginSession, PickleClient};
+use openpickle_api::{
+    ClientOptions, Credentials, Error, LoginSession, Method, PickleClient, RequestOptions,
+};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
 fn jwt(exp_in: i64) -> String {
     let now = SystemTime::now()
@@ -168,4 +171,45 @@ async fn signed_out_client_sends_no_bearer_request() {
     let pickle = client(&server, Credentials::SignedOut);
     assert!(matches!(pickle.sync().await, Err(Error::SignedOut)));
     assert!(server.take().is_empty());
+}
+
+#[tokio::test]
+async fn request_options_merge_into_the_generated_request() {
+    let server = MockServer::start(|_| Reply::json(200, "{}")).await;
+    let pickle = client(&server, Credentials::AccessToken("generated".into()));
+
+    // Query options join a path that already has a query; commas stay unescaped.
+    let options = RequestOptions {
+        query: vec![("scopes".into(), "a,b".into())],
+        ..Default::default()
+    };
+    pickle
+        .request::<serde_json::Value>(Method::GET, "/api/profile?region=KR", options)
+        .await
+        .unwrap();
+
+    // A header override replaces the generated header instead of joining it.
+    let mut headers = HeaderMap::new();
+    headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer override"));
+    let options = RequestOptions {
+        headers,
+        ..Default::default()
+    };
+    pickle
+        .request::<serde_json::Value>(Method::GET, "/api/sync", options)
+        .await
+        .unwrap();
+
+    let requests = server.take();
+    assert_eq!(
+        (requests[0].path.as_str(), requests[0].query.as_str()),
+        ("/api/profile", "region=KR&scopes=a,b")
+    );
+    let authorization: Vec<&str> = requests[1]
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    assert_eq!(authorization, ["Bearer override"]);
 }

@@ -816,7 +816,7 @@ impl PickleClient {
         let mut url = String::with_capacity(inner.base_url.len() + path.len() + 64);
         url.push_str(&inner.base_url);
         url.push_str(path);
-        append_query(&mut url, &options.query);
+        append_query(&mut url, &options.query, path.contains('?'));
 
         let mut request = inner.http.request(method.clone(), url).headers(headers);
         if let Some(body) = options.body {
@@ -993,9 +993,11 @@ fn encode_into(out: &mut String, value: &str, keep_commas: bool) {
 
 /// The app leaves commas unescaped (`scopes=a,b`); everything else is encoded as by
 /// `encodeURIComponent`.
-fn append_query(url: &mut String, query: &[(String, String)]) {
+///
+/// `has_query` says the path already carries a query, so these pairs join it with `&`.
+fn append_query(url: &mut String, query: &[(String, String)], has_query: bool) {
     for (i, (key, value)) in query.iter().enumerate() {
-        url.push(if i == 0 { '?' } else { '&' });
+        url.push(if i == 0 && !has_query { '?' } else { '&' });
         encode_into(url, key, true);
         url.push('=');
         encode_into(url, value, true);
