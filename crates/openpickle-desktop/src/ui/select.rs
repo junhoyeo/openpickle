@@ -63,8 +63,9 @@ impl Selection {
         self.span().is_none()
     }
 
-    pub fn is_dragging(&self) -> bool {
-        self.dragging
+    /// Whether a drag is under way that has a place to start from.
+    pub fn is_extending(&self) -> bool {
+        self.dragging && self.anchor.is_some()
     }
 
     /// The part of one text that is selected. `len` is the length of that text.
@@ -542,6 +543,6 @@ mod tests {
         selection.rows_changed(3);
         assert!(!selection.is_empty());
         selection.rows_changed(2);
-        assert!(selection.is_empty() && !selection.is_dragging());
+        assert!(selection.is_empty() && !selection.is_extending());
     }
 }

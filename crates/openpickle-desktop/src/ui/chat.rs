@@ -1,5 +1,7 @@
 //! The chat screen: header, message list, composer and tab bar.
 
+use std::time::{Duration, Instant};
+
 use gpui::{
     App, ClipboardItem, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
     ImageSource, ListAlignment, ListState, MouseButton, MouseDownEvent, MouseUpEvent, ObjectFit,
@@ -16,6 +18,15 @@ use crate::{
         select::SharedSelection,
     },
 };
+
+/// The header hides the conversation down to here. Further down it fades out and the
+/// conversation shows through.
+const HEADER_SOLID: Pixels = px(49.);
+const HEADER_FADE_END: Pixels = px(140.);
+
+/// How fast a drag past an edge scrolls: pixels per second for each pixel past the edge.
+const DRAG_SCROLL_RATE: f32 = 14.;
+const DRAG_SCROLL_MAX: Pixels = px(2400.);
 
 pub enum ChatEvent {
     /// The user sent this text.
@@ -41,6 +52,8 @@ pub struct ChatView {
     /// The text selected in the conversation. Rows share it to draw and to change it.
     selection: SharedSelection,
     menu: Option<ContextMenu>,
+    /// When a drag past an edge last scrolled the list.
+    scrolled_at: Option<Instant>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -87,6 +100,7 @@ impl ChatView {
             at_latest: true,
             selection: SharedSelection::default(),
             menu: None,
+            scrolled_at: None,
             _subscriptions: subscriptions,
         }
     }
@@ -171,24 +185,37 @@ impl ChatView {
         cx.notify();
     }
 
-    /// While a selection is dragged past the top or bottom of the conversation, scrolls it
-    /// that way, so a drag can reach text that is off screen.
+    /// While a selection is dragged past the top or bottom of what the conversation shows,
+    /// scrolls it that way, so a drag can reach text that is off screen.
     fn follow_drag(&mut self, window: &mut Window) {
+        let mut selection = self.selection.borrow_mut();
+        if !window.is_window_active() {
+            // The release may have gone to whatever took the window's place.
+            selection.release();
+        }
         let pointer = window.mouse_position().y;
-        let top = theme::HEADER_HEIGHT;
         let bottom = window.viewport_size().height - theme::BOTTOM_BAR_HEIGHT;
-        let past = if pointer < top {
-            pointer - top
+        let past = if pointer < HEADER_SOLID {
+            pointer - HEADER_SOLID
         } else {
             (pointer - bottom).max(px(0.))
         };
-        let scrolling = self.selection.borrow().is_dragging() && past != px(0.);
-        self.selection.borrow_mut().set_scrolling(scrolling);
-        if scrolling {
-            // Deeper past the edge scrolls faster.
-            self.list.scroll_by((past * 0.15).clamp(px(-40.), px(40.)));
-            window.request_animation_frame();
+        let scrolling = selection.is_extending() && past != px(0.);
+        selection.set_scrolling(scrolling);
+        if !scrolling {
+            self.scrolled_at = None;
+            return;
         }
+        let now = Instant::now();
+        let elapsed = self
+            .scrolled_at
+            .replace(now)
+            .map_or(Duration::from_millis(16), |at| now - at)
+            .min(Duration::from_millis(50));
+        // Deeper past the edge scrolls faster.
+        let speed = (past * DRAG_SCROLL_RATE).clamp(-DRAG_SCROLL_MAX, DRAG_SCROLL_MAX);
+        self.list.scroll_by(speed * elapsed.as_secs_f32());
+        window.request_animation_frame();
     }
 
     fn context_menu(&self, menu: &ContextMenu, cx: &mut Context<Self>) -> impl IntoElement {
@@ -267,10 +294,10 @@ impl ChatView {
             .top_0()
             .left_0()
             .right_0()
-            .h(px(140.))
+            .h(HEADER_FADE_END)
             .bg(linear_gradient(
                 180.,
-                linear_color_stop(theme::color(theme::PAGE), 0.35),
+                linear_color_stop(theme::color(theme::PAGE), HEADER_SOLID / HEADER_FADE_END),
                 linear_color_stop(theme::alpha(theme::PAGE, 0.), 1.),
             ))
             .flex()
@@ -526,6 +553,17 @@ impl Render for ChatView {
                             .child(messages),
                     ),
             )
+            // The solid part of the header takes the mouse: text hidden under it cannot be
+            // pressed, and a press there is not a press in the conversation.
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(HEADER_SOLID)
+                    .occlude(),
+            )
             .child(self.header())
             .when(!self.at_latest, |screen| screen.child(to_latest))
             .child(self.bottom_bar(cx))
@@ -549,7 +587,7 @@ mod tests {
     const WIDTH: Pixels = px(440.);
     const HEIGHT: Pixels = px(900.);
 
-    /// A chat window with one bubble per text and the cursor in the composer.
+    /// A chat window in front, with one bubble per text and the cursor in the composer.
     fn open<'a>(
         cx: &'a mut TestAppContext,
         texts: &[String],
@@ -558,6 +596,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|window, cx| {
             let view = ChatView::new(cx);
             window.focus(&view.focus_handle(cx));
+            window.activate_window();
             view
         });
         cx.simulate_resize(size(WIDTH, HEIGHT));
@@ -609,6 +648,15 @@ mod tests {
         // A press on empty space drops the selection, so there is nothing to copy.
         cx.write_to_clipboard(ClipboardItem::new_string("before".into()));
         cx.simulate_click(from, Modifiers::none());
+        cx.simulate_keystrokes("cmd-c");
+        assert_eq!(copied(cx).as_deref(), Some("before"));
+
+        // A press on the header is not a press in the conversation, so a drag from it
+        // selects nothing.
+        let header = point(px(200.), HEADER_SOLID - px(10.));
+        cx.simulate_mouse_down(header, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
         cx.simulate_keystrokes("cmd-c");
         assert_eq!(copied(cx).as_deref(), Some("before"));
     }
