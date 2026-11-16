@@ -2,10 +2,29 @@ pub mod chat;
 pub mod input;
 pub mod login;
 pub mod rows;
+pub mod search;
 pub mod select;
 pub mod wrap;
 
-use gpui::{App, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size};
+use gpui::{
+    App, Bounds, Div, KeyBinding, Stateful, TitlebarOptions, WindowBounds, WindowOptions, actions,
+    div, point, prelude::*, px, size, svg,
+};
+
+use crate::theme;
+
+actions!(openpickle, [Find, Cancel, Previous, Next]);
+
+/// Binds the keys of the text field and of the screens.
+pub fn bind_keys(cx: &mut App) {
+    input::bind_keys(cx);
+    cx.bind_keys([
+        KeyBinding::new("cmd-f", Find, None),
+        KeyBinding::new("escape", Cancel, None),
+        KeyBinding::new("up", Previous, None),
+        KeyBinding::new("down", Next, None),
+    ]);
+}
 
 /// A window the size of the design frame, with the traffic lights drawn over the content.
 pub fn window_options(cx: &App) -> WindowOptions {
@@ -23,4 +42,26 @@ pub fn window_options(cx: &App) -> WindowOptions {
         }),
         ..Default::default()
     }
+}
+
+/// A dark pill or circle with a hairline edge: the header buttons, the composer, the tab bar,
+/// the search field. It takes the mouse, so a press on it is not a press on what is under it.
+fn chrome(id: &'static str) -> Stateful<Div> {
+    div()
+        .id(id)
+        .occlude()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(theme::alpha(theme::CHROME, 0.94))
+        .border_1()
+        .border_color(theme::color(theme::HAIRLINE))
+}
+
+fn icon(name: &'static str, size: f32, color: u32) -> impl IntoElement {
+    svg()
+        .path(format!("icons/{name}.svg"))
+        .size(px(size))
+        .flex_none()
+        .text_color(theme::color(color))
 }

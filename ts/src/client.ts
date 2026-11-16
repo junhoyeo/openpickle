@@ -9,6 +9,7 @@ import type {
   LoginSessionIssued,
   LoginSessionRefresh,
   LogNodeSummary,
+  MessageSearchScreen,
   LogStoreListings,
   LogStoreListingsRequest,
   PermissionSnapshot,
@@ -352,12 +353,21 @@ export class PickleClient {
 
   /**
    * `GET /api/screens/{kind}`: data for a server-driven screen. `handoffs` (tasks and phone calls
-   * the character ran), `extra-conversations` and `roulette-promo` were present in traffic.
+   * the character ran), `extra-conversations`, `roulette-promo` and `message-search` (see
+   * `searchMessages`) were present in traffic.
    */
   getScreen<K extends keyof KnownScreens>(kind: K): Promise<KnownScreens[K]>;
   getScreen(kind: string, query?: RequestOptions["query"]): Promise<unknown>;
   getScreen(kind: string, query?: RequestOptions["query"]): Promise<unknown> {
     return this.request("GET", `/api/screens/${encodeURIComponent(kind)}`, { query });
+  }
+
+  /**
+   * `GET /api/screens/message-search?query=`: messages containing `query`, newest first, at most
+   * 30. Each result is a snippet split into matching and non-matching runs.
+   */
+  searchMessages(query: string): Promise<MessageSearchScreen> {
+    return this.request("GET", "/api/screens/message-search", { query: { query } });
   }
 
   // ---- Device ----

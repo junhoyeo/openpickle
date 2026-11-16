@@ -1,18 +1,22 @@
 //! The chat screen: header, message list, composer and tab bar.
 
-use std::time::{Duration, Instant};
+use std::{
+    ops::Range,
+    time::{Duration, Instant},
+};
 
 use gpui::{
-    App, ClipboardItem, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    ImageSource, ListAlignment, ListState, MouseButton, MouseDownEvent, MouseUpEvent, ObjectFit,
-    Pixels, Point, SharedString, Stateful, Subscription, Window, anchored, deferred, div, img,
-    linear_color_stop, linear_gradient, list, point, prelude::*, px, svg,
+    App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
+    ImageSource, ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseUpEvent,
+    ObjectFit, Pixels, Point, SharedString, Subscription, Task, Window, anchored, deferred, div,
+    img, linear_color_stop, linear_gradient, list, point, prelude::*, px, relative,
 };
 
 use crate::{
     model::Row,
     theme,
     ui::{
+        Cancel, Find, chrome, icon,
         input::{Copy, InputEvent, SelectAll, TextInput},
         rows::{RowContext, render_row},
         select::SharedSelection,
@@ -24,6 +28,11 @@ use crate::{
 const HEADER_SOLID: Pixels = px(49.);
 const HEADER_FADE_END: Pixels = px(140.);
 
+/// How long the message a search result opened stays marked.
+const FOUND_MARK: Duration = Duration::from_millis(1600);
+/// How much of the conversation before that message shows above it.
+const FOUND_CONTEXT: Pixels = px(110.);
+
 /// How fast a drag past an edge scrolls: pixels per second for each pixel past the edge.
 const DRAG_SCROLL_RATE: f32 = 14.;
 const DRAG_SCROLL_MAX: Pixels = px(2400.);
@@ -31,6 +40,8 @@ const DRAG_SCROLL_MAX: Pixels = px(2400.);
 pub enum ChatEvent {
     /// The user sent this text.
     Send(String),
+    /// The user asked for the search screen.
+    Search,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -54,6 +65,11 @@ pub struct ChatView {
     menu: Option<ContextMenu>,
     /// When a drag past an edge last scrolled the list.
     scrolled_at: Option<Instant>,
+    /// Whether the menu on the left is open.
+    drawer: bool,
+    /// The rows of the message a search result opened, marked for a moment.
+    found: Option<Range<usize>>,
+    _found: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -101,6 +117,9 @@ impl ChatView {
             selection: SharedSelection::default(),
             menu: None,
             scrolled_at: None,
+            drawer: false,
+            found: None,
+            _found: None,
             _subscriptions: subscriptions,
         }
     }
@@ -131,6 +150,136 @@ impl ChatView {
         self.selection.borrow_mut().rows_changed(unchanged);
         self.rows = rows;
         cx.notify();
+    }
+
+    /// Scrolls to a message, given the rows it is drawn as, and marks it for a moment. The
+    /// list stays where it is put, so the conversation around the message can be read by
+    /// scrolling up and down from it.
+    pub fn reveal(&mut self, rows: Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        self.list.scroll_to(ListOffset {
+            item_ix: rows.start,
+            offset_in_item: px(0.),
+        });
+        self.at_latest = false;
+        // The message would sit right under the header. The end of what came before it is
+        // brought into view as well, which takes two frames: the list only knows the heights
+        // of the rows above once it has drawn at the new place.
+        cx.on_next_frame(window, |_, window, cx| {
+            cx.on_next_frame(window, |this, _, cx| {
+                this.scroll_by(-FOUND_CONTEXT);
+                cx.notify();
+            });
+            cx.notify();
+        });
+        self.found = Some(rows);
+        self._found = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(FOUND_MARK).await;
+            this.update(cx, |this, cx| {
+                this.found = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Escape closes what is open on top of the conversation, or else drops the selection.
+    fn cancel(&mut self, cx: &mut Context<Self>) {
+        if self.menu.take().is_none() && !std::mem::take(&mut self.drawer) {
+            self.selection.borrow_mut().clear();
+        }
+        cx.notify();
+    }
+
+    /// The menu on the left: the search button and the sections of the app. Only Chat exists.
+    fn drawer_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let section = |name: &'static str, label: &'static str, color: u32| {
+            div()
+                .h(px(50.))
+                .px(px(14.))
+                .flex()
+                .items_center()
+                .gap(px(14.))
+                .rounded(px(17.))
+                .text_color(theme::color(color))
+                .child(icon(name, 23., color))
+                .child(label)
+        };
+        let panel = div()
+            .id("drawer")
+            .occlude()
+            .h_full()
+            .w(px(300.))
+            .max_w(relative(0.84))
+            .bg(theme::color(theme::CHROME))
+            .border_r_1()
+            .border_color(theme::color(theme::HAIRLINE))
+            .pt(px(50.))
+            .px(px(14.))
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .text_size(px(17.))
+            .line_height(theme::LABEL_LINE)
+            .font_weight(FontWeight::MEDIUM)
+            .child(
+                div()
+                    .pl(px(12.))
+                    .pb(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(22.))
+                            .line_height(px(28.))
+                            .font_weight(FontWeight::BOLD)
+                            .child("Pickle"),
+                    )
+                    .child(
+                        chrome("search")
+                            .size(px(43.))
+                            .rounded_full()
+                            .cursor_pointer()
+                            .child(icon("search", 20., theme::TEXT))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.drawer = false;
+                                cx.emit(ChatEvent::Search);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                section("message-circle", "Chat", theme::TEXT)
+                    .id("section-chat")
+                    .bg(theme::color(theme::CHROME_SELECTED))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.drawer = false;
+                        cx.notify();
+                    })),
+            )
+            .child(section("users-round", "Friends", theme::TEXT))
+            .child(section("compass", "Explore", theme::TEXT))
+            .child(section("archive", "Archive", theme::TEXT))
+            .child(section("globe", "3D World", theme::PLACEHOLDER))
+            .child(section("user-round", "My Pickle", theme::TEXT));
+        // A press beside the panel closes it.
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .occlude()
+            .bg(theme::alpha(0x000000, 0.5))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.drawer = false;
+                    cx.notify();
+                }),
+            )
+            .child(panel)
     }
 
     fn send(&mut self, input: &Entity<TextInput>, cx: &mut Context<Self>) {
@@ -292,7 +441,7 @@ impl ChatView {
         cx.notify();
     }
 
-    fn header(&self) -> impl IntoElement {
+    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let avatar = div()
             .size(px(58.))
             .rounded_full()
@@ -336,6 +485,11 @@ impl ChatView {
                                 .rounded_full()
                                 .flex_col()
                                 .gap(px(3.8))
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.drawer = true;
+                                    cx.notify();
+                                }))
                                 .children((0..2).map(|_| {
                                     div()
                                         .w(px(15.5))
@@ -468,27 +622,6 @@ fn list_padding() -> (Pixels, Pixels) {
     (theme::HEADER_HEIGHT, theme::BOTTOM_BAR_HEIGHT + px(16.))
 }
 
-/// A dark pill or circle with a hairline edge: the header buttons, the composer, the tab bar.
-fn chrome(id: &'static str) -> Stateful<Div> {
-    div()
-        .id(id)
-        .occlude()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(theme::alpha(theme::CHROME, 0.94))
-        .border_1()
-        .border_color(theme::color(theme::HAIRLINE))
-}
-
-fn icon(name: &'static str, size: f32, color: u32) -> impl IntoElement {
-    svg()
-        .path(format!("icons/{name}.svg"))
-        .size(px(size))
-        .flex_none()
-        .text_color(theme::color(color))
-}
-
 fn open_link(url: &str, _: &mut Window, cx: &mut App) {
     if url.starts_with("https://") || url.starts_with("http://") {
         cx.open_url(url);
@@ -507,13 +640,13 @@ impl Render for ChatView {
         let messages = list(
             self.list.clone(),
             cx.processor(|this, index: usize, window: &mut Window, _| {
-                render_row(&RowContext::new(
-                    window,
-                    &this.rows[index],
-                    index,
-                    &this.selection,
-                    open_link,
-                ))
+                let mut row =
+                    RowContext::new(window, &this.rows[index], index, &this.selection, open_link);
+                row.marked = this
+                    .found
+                    .as_ref()
+                    .is_some_and(|found| found.contains(&index));
+                render_row(&row)
             }),
         )
         .size_full()
@@ -557,6 +690,8 @@ impl Render for ChatView {
             .line_height(theme::BODY_LINE)
             .on_action(cx.listener(|this, _: &Copy, _, cx| this.copy_selection(cx)))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_everything(cx)))
+            .on_action(cx.listener(|_, _: &Find, _, cx| cx.emit(ChatEvent::Search)))
+            .on_action(cx.listener(|this, _: &Cancel, _, cx| this.cancel(cx)))
             .child(
                 div()
                     .size_full()
@@ -585,9 +720,10 @@ impl Render for ChatView {
                     .h(HEADER_SOLID)
                     .occlude(),
             )
-            .child(self.header())
+            .child(self.header(cx))
             .when(!self.at_latest, |screen| screen.child(to_latest))
             .child(self.bottom_bar(cx))
+            .when(self.drawer, |screen| screen.child(self.drawer_panel(cx)))
             .children(self.menu.as_ref().map(|menu| self.context_menu(menu, cx)))
     }
 }
@@ -596,13 +732,15 @@ impl Render for ChatView {
 mod tests {
     use std::sync::Arc;
 
-    use gpui::{Modifiers, TestAppContext, VisualTestContext, size};
+    use gpui::{
+        Modifiers, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase, VisualTestContext,
+        size,
+    };
 
     use super::*;
     use crate::{
         content::RichText,
         model::{Part, RowKind, Side},
-        ui::input,
     };
 
     const WIDTH: Pixels = px(440.);
@@ -613,7 +751,7 @@ mod tests {
         cx: &'a mut TestAppContext,
         texts: &[String],
     ) -> (Entity<ChatView>, &'a mut VisualTestContext) {
-        cx.update(input::bind_keys);
+        cx.update(crate::ui::bind_keys);
         let (view, cx) = cx.add_window_view(|window, cx| {
             let view = ChatView::new(cx);
             window.focus(&view.focus_handle(cx));
@@ -680,6 +818,36 @@ mod tests {
         cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
         cx.simulate_keystrokes("cmd-c");
         assert_eq!(copied(cx).as_deref(), Some("before"));
+    }
+
+    #[gpui::test]
+    fn the_conversation_scrolls_both_ways_from_a_message_that_was_opened(cx: &mut TestAppContext) {
+        let texts: Vec<String> = (0..300).map(|n| format!("말 {n}")).collect();
+        let (view, cx) = open(cx, &texts);
+        let top_row = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| view.list.logical_scroll_top().item_ix)
+        };
+        let wheel = |cx: &mut VisualTestContext, up: f32| {
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(WIDTH / 2., HEIGHT / 2.),
+                delta: ScrollDelta::Pixels(point(px(0.), px(up))),
+                modifiers: Modifiers::none(),
+                touch_phase: TouchPhase::Moved,
+            });
+        };
+
+        // A search result opens a message far from the newest one.
+        view.update_in(cx, |view, window, cx| view.reveal(100..101, window, cx));
+        cx.run_until_parked();
+        assert_eq!(top_row(cx), 100);
+
+        // What came before it and what came after are one wheel turn away.
+        wheel(cx, 400.);
+        let before = top_row(cx);
+        assert!(before < 100, "scrolled up to row {before}");
+        wheel(cx, -1200.);
+        let after = top_row(cx);
+        assert!(after > 100, "scrolled down to row {after}");
     }
 
     #[gpui::test]

@@ -59,8 +59,9 @@ const routes: [method: string, path: RegExp, call: Call][] = [
   ["GET", /^\/api\/profile$/, (c, f) => c.getProfile(new URLSearchParams(f.query).get("region")!)],
   ["GET", /^\/api\/social\/snapshot$/, (c, f) =>
     c.getSocialSnapshot(new URLSearchParams(f.query).get("scopes")!.split(",") as never)],
-  ["GET", /^\/api\/screens\/([^/]+)$/, (c, f, _j, [kind]) =>
-    c.getScreen(kind!, f.query ? Object.fromEntries(new URLSearchParams(f.query)) : undefined)],
+  ["GET", /^\/api\/screens\/message-search$/, (c, f) => c.searchMessages(new URLSearchParams(f.query).get("query")!)],
+  ["GET", /^\/api\/screens\/(handoffs|extra-conversations|roulette-promo)$/, (c, _f, _j, [kind]) =>
+    c.getScreen(kind!)],
   ["PUT", /^\/api\/device\/permissions$/, (c, _f, j) => c.reportPermissions(j.snapshots)],
   ["POST", /^\/api\/device\/location\/token$/, (c) => c.requestLocationToken()],
   ["GET", /^\/api\/ui-definitions$/, (c) => c.getUiDefinitions()],

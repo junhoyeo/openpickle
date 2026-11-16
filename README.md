@@ -20,6 +20,9 @@ servers the iOS app does, with your own account.
   iOS chat screen. Korean lines break between words, and the text field supports Korean input.
 - **Live.** Your message, the character's replies and what it is doing right now ("Searching
   Web…") arrive over the server's event stream as they happen.
+- **Search.** Cmd-F, or the search button in the menu, searches your messages on Pickle's
+  server. Opening a result takes you to that message, with the conversation around it to scroll
+  through.
 - **Select and copy.** Drag across messages to select text, or right-click for Copy, Copy Message
   and Select All. Select All takes the whole conversation, not only what is on screen.
 - **Opens at once.** The app keeps the conversation on disk and draws it before it asks the
@@ -28,13 +31,26 @@ servers the iOS app does, with your own account.
   session of its own, so your phone stays signed in.
 
 <p align="center">
+  <img src="docs/screenshots/search.png" alt="Search results with the matching text in blue" height="380" />
   <img src="docs/screenshots/sign-in.png" alt="Sign-in with a phone number" height="380" />
 </p>
 
-Not built yet: the Explore, Library and Profile tabs, the menu and Invite buttons, voice calls,
-pictures and files, link previews, reactions, answering a request card, and rooms other than the
-one with your character. The [desktop README](crates/openpickle-desktop/README.md) has the full
+Not built yet: the Explore, Library and Profile tabs, the other sections of the menu, the Invite
+button, voice calls, pictures and files, link previews, reactions, answering a request card, and
+rooms other than the one with your character. The [desktop README](crates/openpickle-desktop/README.md) has the full
 list.
+
+## Searching your chat from coding agents
+
+[`skills/pickle-sessions`](skills/pickle-sessions/SKILL.md) is an agent skill that searches and
+reads the conversation the desktop app keeps on disk (the history log in
+`~/Library/Application Support/openpickle/cache/`). It finds messages by text, role and date, shows
+the messages around a hit, and says how old the cache is. It only reads, needs nothing but the
+Python standard library, and never opens the login session or the network:
+
+```sh
+python3 skills/pickle-sessions/scripts/pickle-sessions search "dinner" --since 2026-11-01
+```
 
 ## Get it
 

@@ -2,12 +2,40 @@
 
 use std::sync::Arc;
 
-use openpickle_api::{CardState, HistoryItem};
+use openpickle_api::{CardState, HistoryItem, MessageSearchItem};
 
 use crate::{
     content::{Block, parse_message, plain_text},
-    model::{Message, Part, Request, RequestOption, RequestStatus, Side},
+    model::{Message, Part, Request, RequestOption, RequestStatus, SearchResult, Side},
 };
+
+/// A search result as the search screen draws it. `room_id` is the open conversation: only a
+/// message in it can be opened. The server names that room with an empty id.
+pub fn search_result(item: MessageSearchItem, room_id: &str) -> SearchResult {
+    let here = item.kind == "chat" && (item.room_id.is_empty() || item.room_id == room_id);
+    let mut snippet = String::new();
+    let mut matches = Vec::new();
+    for segment in &item.segments {
+        let start = snippet.len();
+        // The snippet is drawn on one line.
+        snippet.extend(
+            segment
+                .text
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c }),
+        );
+        if segment.is_match {
+            matches.push(start..snippet.len());
+        }
+    }
+    SearchResult {
+        seq: u64::try_from(item.seq).ok().filter(|seq| here && *seq > 0),
+        label: item.label,
+        date: item.date_label,
+        snippet,
+        matches,
+    }
+}
 
 /// The message for a history item. `card_state` is the latest state of the item's request card,
 /// when it is one and has been answered or has expired.
@@ -112,6 +140,35 @@ mod tests {
 
     fn item(json: serde_json::Value) -> HistoryItem {
         serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn a_search_result_is_one_line_with_its_matches_and_opens_only_in_this_room() {
+        let found =
+            |json: serde_json::Value| search_result(serde_json::from_value(json).unwrap(), "room");
+        let result = found(serde_json::json!({
+            "id": "chat:42", "kind": "chat", "label": "Chat", "date_label": "Nov 16",
+            "room_id": "", "call_id": "", "seq": 42, "line_id": "",
+            "segments": [
+                {"text": "...내일\n", "match": false},
+                {"text": "비", "match": true},
+                {"text": " 온대요", "match": false},
+            ],
+        }));
+        assert_eq!(result.snippet, "...내일 비 온대요");
+        assert_eq!(&result.snippet[result.matches[0].clone()], "비");
+        assert_eq!((result.seq, result.date.as_str()), (Some(42), "Nov 16"));
+
+        // Results from another room, or of another kind, are shown but cannot be opened.
+        let elsewhere = serde_json::json!({
+            "id": "chat:7", "kind": "chat", "label": "Chat", "date_label": "Nov 2",
+            "room_id": "other", "call_id": "", "seq": 7, "line_id": "", "segments": [],
+        });
+        assert_eq!(found(elsewhere).seq, None);
+        let call = serde_json::json!({
+            "id": "call:7", "kind": "call", "label": "Call", "date_label": "Nov 2", "segments": [],
+        });
+        assert_eq!(found(call).seq, None);
     }
 
     #[test]

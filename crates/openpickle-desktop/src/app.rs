@@ -18,6 +18,7 @@ use crate::{
     ui::{
         chat::{ChatEvent, ChatView},
         login::{LoginEvent, LoginView},
+        search::{SearchEvent, SearchView},
     },
 };
 
@@ -38,6 +39,14 @@ pub struct Shell {
     /// How many messages were typed here, which numbers the ones not confirmed yet.
     sent: u64,
     activity: Option<Option<String>>,
+    /// For each message, the index of its first row in the chat's list.
+    row_starts: Vec<usize>,
+    /// The search screen. It is kept when it closes, so that opening it again shows the same
+    /// search: a result is opened to read around it, and then usually the next one.
+    search: Option<Entity<SearchView>>,
+    /// Whether the search screen is drawn, over the chat.
+    searching: bool,
+    _search_events: Option<Subscription>,
     _screen_events: Option<Subscription>,
     _activation: Subscription,
     _updates: Task<()>,
@@ -66,6 +75,10 @@ impl Shell {
             messages: Vec::new(),
             sent: 0,
             activity: None,
+            row_starts: Vec::new(),
+            search: None,
+            searching: false,
+            _search_events: None,
             _screen_events: None,
             _activation: activation,
             _updates: Task::ready(()),
@@ -90,6 +103,7 @@ impl Shell {
         match update {
             Update::SignedOut => {
                 self.messages.clear();
+                self.forget_search();
                 self.show_login(window, cx)
             }
             Update::CodeSent => {
@@ -136,7 +150,13 @@ impl Shell {
                 self.activity = activity;
                 self.refresh_rows(cx);
             }
+            Update::Found { query, results } => {
+                if let Some(search) = &self.search {
+                    search.update(cx, |search, cx| search.found(&query, results, cx));
+                }
+            }
             Update::Failed(reason) => {
+                self.forget_search();
                 self._screen_events = None;
                 self.screen = Screen::Failed(reason.into());
                 cx.notify();
@@ -163,13 +183,70 @@ impl Shell {
             return chat.clone();
         }
         let chat = cx.new(ChatView::new);
-        self._screen_events = Some(cx.subscribe(&chat, |this, _, ChatEvent::Send(text), cx| {
-            this.send(text, cx)
-        }));
+        self._screen_events = Some(
+            cx.subscribe_in(&chat, window, |this, _, event, window, cx| match event {
+                ChatEvent::Send(text) => this.send(text, cx),
+                ChatEvent::Search => this.open_search(window, cx),
+            }),
+        );
         window.focus(&chat.focus_handle(cx));
         self.screen = Screen::Chat(chat.clone());
         cx.notify();
         chat
+    }
+
+    fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let search = match &self.search {
+            Some(search) => search.clone(),
+            None => {
+                let search = cx.new(SearchView::new);
+                self._search_events = Some(cx.subscribe_in(
+                    &search,
+                    window,
+                    |this, _, event, window, cx| match event {
+                        SearchEvent::Query(query) => {
+                            this.commands.send(Command::Search(query.clone())).ok();
+                        }
+                        SearchEvent::Open(seq) => this.open_result(*seq, window, cx),
+                        SearchEvent::Close => this.close_search(window, cx),
+                    },
+                ));
+                self.search = Some(search.clone());
+                search
+            }
+        };
+        window.focus(&search.focus_handle(cx));
+        self.searching = true;
+        cx.notify();
+    }
+
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.searching = false;
+        if let Screen::Chat(chat) = &self.screen {
+            window.focus(&chat.focus_handle(cx));
+        }
+        cx.notify();
+    }
+
+    /// Drops the search screen with what it found: the conversation it searched is gone.
+    fn forget_search(&mut self) {
+        self.search = None;
+        self.searching = false;
+        self._search_events = None;
+    }
+
+    /// Leaves the search screen for the message a result names. A message that is not on
+    /// this computer (yet) cannot be shown, and the search stays open.
+    fn open_result(&mut self, seq: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.messages.iter().position(|message| message.seq == seq) else {
+            return;
+        };
+        let (Screen::Chat(chat), Some(&start)) = (&self.screen, self.row_starts.get(index)) else {
+            return;
+        };
+        let rows = start..start + self.messages[index].parts.len();
+        chat.update(cx, |chat, cx| chat.reveal(rows, window, cx));
+        self.close_search(window, cx);
     }
 
     /// Shows the message at once and hands it to the backend, which may be busy for a while:
@@ -194,11 +271,12 @@ impl Shell {
 
     fn refresh_rows(&mut self, cx: &mut Context<Self>) {
         if let Screen::Chat(chat) = &self.screen {
-            let rows = build_rows(
+            let (rows, starts) = build_rows(
                 &self.messages,
                 self.activity.as_ref().map(|label| label.as_deref()),
                 Local::now(),
             );
+            self.row_starts = starts;
             chat.update(cx, |chat, cx| chat.set_rows(rows, cx));
         }
     }
@@ -246,11 +324,13 @@ fn upsert(messages: &mut Vec<Message>, message: Message) {
 
 impl Render for Shell {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let screen = div().size_full().bg(theme::color(theme::PAGE));
+        let screen = div().size_full().relative().bg(theme::color(theme::PAGE));
         match &self.screen {
             Screen::Starting => screen,
             Screen::Login(login) => screen.child(login.clone()),
-            Screen::Chat(chat) => screen.child(chat.clone()),
+            Screen::Chat(chat) => screen
+                .child(chat.clone())
+                .children(self.search.clone().filter(|_| self.searching)),
             Screen::Failed(reason) => screen
                 .flex()
                 .flex_col()
@@ -280,7 +360,7 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Side;
+    use crate::model::{SearchResult, Side};
 
     fn message(id: &str, seq: u64) -> Message {
         Message {
@@ -294,7 +374,7 @@ mod tests {
 
     #[gpui::test]
     fn a_typed_message_shows_at_once_and_goes_to_the_backend(cx: &mut gpui::TestAppContext) {
-        cx.update(crate::ui::input::bind_keys);
+        cx.update(crate::ui::bind_keys);
         let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
         let (updates, received) = futures::channel::mpsc::unbounded();
         let conversation = Update::Conversation {
@@ -332,6 +412,65 @@ mod tests {
             let parts = &shell.messages.last().unwrap().parts;
             assert_eq!(parts.last(), Some(&Part::Task("Not sent.".into())));
         });
+    }
+
+    #[gpui::test]
+    fn a_search_result_opens_its_message_and_closes_the_search(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::ui::bind_keys);
+        let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, received) = futures::channel::mpsc::unbounded();
+        let part = Part::Task("내일 비 온대요".into());
+        let conversation = Update::Conversation {
+            name: "Pickle".into(),
+            avatar: None,
+            messages: vec![Message {
+                parts: vec![part],
+                ..message("a", 1)
+            }],
+        };
+        updates.unbounded_send(conversation).unwrap();
+        let (shell, cx) =
+            cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
+
+        cx.simulate_resize(gpui::size(gpui::px(440.), gpui::px(900.)));
+
+        cx.simulate_keystrokes("cmd-f");
+        cx.simulate_input("비");
+        cx.simulate_keystrokes("enter");
+        let asked = std::iter::from_fn(|| sent.try_recv().ok()).find_map(|command| match command {
+            Command::Search(query) => Some(query),
+            _ => None,
+        });
+        assert_eq!(asked.as_deref(), Some("비"));
+
+        let found = |seq| SearchResult {
+            seq: Some(seq),
+            label: "Chat".into(),
+            date: "Nov 16".into(),
+            snippet: "내일 비 온대요".into(),
+            matches: vec![0..6, 7..10],
+        };
+        // The first result is a message this computer does not have; the second one it has.
+        let results = Update::Found {
+            query: "비".into(),
+            results: Ok(vec![found(99), found(1)]),
+        };
+        updates.unbounded_send(results).unwrap();
+        cx.run_until_parked();
+        let first = gpui::point(gpui::px(120.), gpui::px(75.));
+        cx.simulate_click(first, gpui::Modifiers::none());
+        shell.read_with(cx, |shell, _| assert!(shell.searching));
+        cx.simulate_click(
+            first + gpui::point(gpui::px(0.), gpui::px(70.)),
+            gpui::Modifiers::none(),
+        );
+        shell.read_with(cx, |shell, _| assert!(!shell.searching));
+
+        // Escape closes the search too.
+        cx.simulate_keystrokes("cmd-f");
+        shell.read_with(cx, |shell, _| assert!(shell.searching));
+        cx.simulate_keystrokes("escape");
+        shell.read_with(cx, |shell, _| assert!(!shell.searching));
     }
 
     #[test]

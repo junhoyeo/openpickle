@@ -187,14 +187,14 @@ async fn sign_in(
                 None => "Ask for a code first.".to_owned(),
             },
             Command::Quit => break,
-            Command::Send { .. } | Command::Active(_) => continue,
+            Command::Send { .. } | Command::Search(_) | Command::Active(_) => continue,
         };
         updates.unbounded_send(Update::SignInFailed(failure)).ok();
     }
     Err(Ended::Closed)
 }
 
-/// What to tell the user when a sign-in call fails.
+/// What to tell the user when a sign-in call or a search fails.
 fn explain(error: &Error) -> String {
     match error.api() {
         Some(api) => match &api.detail {
@@ -452,6 +452,18 @@ async fn converse(
                             return Ended::SignedOut;
                         }
                     }
+                }
+                Some(Command::Search(query)) => {
+                    let results = match live.client.search_messages(&query).await {
+                        Ok(found) => Ok(found
+                            .items
+                            .into_iter()
+                            .map(|item| convert::search_result(item, &live.conversation.room_id))
+                            .collect()),
+                        Err(error) if session_is_gone(&error) => return Ended::SignedOut,
+                        Err(error) => Err(explain(&error)),
+                    };
+                    live.send(Update::Found { query, results });
                 }
                 Some(Command::Active(active)) => {
                     live.active = active;

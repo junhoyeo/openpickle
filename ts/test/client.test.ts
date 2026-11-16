@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { PickleApiError, PickleClient, decodeAccessToken } from "../src/client.ts";
+import type { MessageSearchScreen } from "../src/types.ts";
 
 function recorder(status: number, body: string) {
   const calls: { url: string; init: RequestInit }[] = [];
@@ -78,4 +79,38 @@ test("token claims are read as UTF-8", () => {
   const bytes = new TextEncoder().encode(JSON.stringify(claims));
   const payload = btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   expect(decodeAccessToken(`Bearer h.${payload}.s`)).toEqual(claims);
+});
+
+test("searchMessages percent-encodes the query and returns the snippet runs", async () => {
+  const body: MessageSearchScreen = {
+    kind: "message-search",
+    items: [
+      {
+        id: "chat:42",
+        kind: "chat",
+        segments: [
+          { text: "…내일 ", match: false },
+          { text: "점심 메뉴", match: true },
+          { text: " 정하자…", match: false },
+        ],
+        label: "Chat",
+        date_label: "Nov 3",
+        room_id: "",
+        call_id: "",
+        seq: 42,
+        line_id: "",
+      },
+    ],
+  };
+  const { calls, fetch } = recorder(200, JSON.stringify(body));
+  const pickle = new PickleClient({ accessToken: "t", fetch });
+  const result = await pickle.searchMessages("점심 메뉴");
+  await pickle.searchMessages("a&b=c,d");
+  expect(calls.map((call) => call.url.replace(pickle.baseUrl, ""))).toEqual([
+    "/api/screens/message-search?query=%EC%A0%90%EC%8B%AC%20%EB%A9%94%EB%89%B4",
+    "/api/screens/message-search?query=a%26b%3Dc,d",
+  ]);
+  expect(calls[0]!.init.method).toBe("GET");
+  expect(result).toEqual(body);
+  expect(result.items[0]!.segments.filter((s) => s.match).map((s) => s.text)).toEqual(["점심 메뉴"]);
 });

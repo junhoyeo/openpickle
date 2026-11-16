@@ -541,11 +541,40 @@ export interface RoulettePromoScreen {
   announce: boolean;
 }
 
+/** A run of a search snippet; `match` marks the runs that matched the query. */
+export interface MessageSearchSegment {
+  text: string;
+  match: boolean;
+}
+
+export interface MessageSearchItem {
+  /** `<kind>:<seq>`, e.g. `chat:42`. */
+  id: string;
+  /** `chat` in every observed result; `call_id` and `line_id` suggest call results too. */
+  kind: Open<"chat">;
+  /** The snippet around the match, cut with `…`, in matching and non-matching runs. */
+  segments: MessageSearchSegment[];
+  label: string;
+  /** e.g. `Nov 16` */
+  date_label: string;
+  /** Empty for messages in the chat with your character. */
+  room_id: string;
+  call_id: string;
+  seq: number;
+  line_id: string;
+}
+
+export interface MessageSearchScreen {
+  kind: "message-search";
+  items: MessageSearchItem[];
+}
+
 /** Screen kinds whose `/api/screens/<kind>` response was present in traffic. */
 export interface KnownScreens {
   handoffs: HandoffsScreen;
   "extra-conversations": ExtraConversationsScreen;
   "roulette-promo": RoulettePromoScreen;
+  "message-search": MessageSearchScreen;
 }
 
 // ---- Device ----

@@ -32,6 +32,8 @@ pub struct RowContext<'a> {
     pub content_width: Pixels,
     pub selection: &'a SharedSelection,
     pub on_link: fn(&str, &mut Window, &mut App),
+    /// Whether the row belongs to the message a search result has just opened.
+    pub marked: bool,
     /// How many of the row's texts have been drawn so far.
     drawn: Cell<usize>,
 }
@@ -53,6 +55,7 @@ impl<'a> RowContext<'a> {
             content_width,
             selection,
             on_link,
+            marked: false,
             drawn: Cell::new(0),
         }
     }
@@ -72,6 +75,7 @@ pub fn render_row(cx: &RowContext) -> AnyElement {
         .flex()
         .px(theme::GUTTER)
         .pt(top_gap)
+        .when(cx.marked, |line| line.bg(theme::alpha(theme::LINK, 0.13)))
         .on_mouse_down(MouseButton::Right, {
             let (selection, index) = (cx.selection.clone(), cx.index);
             move |_, _, _| selection.borrow_mut().set_context_row(index)
