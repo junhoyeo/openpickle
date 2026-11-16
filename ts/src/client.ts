@@ -381,6 +381,11 @@ export class PickleClient {
     return this.request("GET", "/api/screens/explore-sections");
   }
 
+  /** `POST /api/offers/impressions`: reports which offers were shown. Answered with `{}`. */
+  reportOfferImpressions(offerIds: string[]): Promise<Record<string, never>> {
+    return this.request("POST", "/api/offers/impressions", { body: { offer_ids: offerIds } });
+  }
+
   // ---- Device ----
 
   /** `PUT /api/device/permissions`: reports which device data sources the app may read. */

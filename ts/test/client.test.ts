@@ -145,3 +145,12 @@ test("getExploreSections reads the Explore screen", async () => {
   expect(calls[0]!.init.method).toBe("GET");
   expect(calls[0]!.init.body).toBeUndefined();
 });
+
+test("reportOfferImpressions sends the shown offer ids", async () => {
+  const { calls, fetch } = recorder(200, "{}");
+  const pickle = new PickleClient({ accessToken: "t", fetch });
+  expect(await pickle.reportOfferImpressions(["offer-1", "offer-2"])).toEqual({});
+  expect(calls[0]!.url).toBe(`${pickle.baseUrl}/api/offers/impressions`);
+  expect(calls[0]!.init.method).toBe("POST");
+  expect(calls[0]!.init.body).toBe('{"offer_ids":["offer-1","offer-2"]}');
+});

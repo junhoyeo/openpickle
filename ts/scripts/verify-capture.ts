@@ -63,6 +63,7 @@ const routes: [method: string, path: RegExp, call: Call][] = [
   ["GET", /^\/api\/screens\/explore-sections$/, (c) => c.getExploreSections()],
   ["GET", /^\/api\/screens\/(handoffs|extra-conversations|roulette-promo)$/, (c, _f, _j, [kind]) =>
     c.getScreen(kind!)],
+  ["POST", /^\/api\/offers\/impressions$/, (c, _f, j) => c.reportOfferImpressions(j.offer_ids)],
   ["PUT", /^\/api\/device\/permissions$/, (c, _f, j) => c.reportPermissions(j.snapshots)],
   ["POST", /^\/api\/device\/location\/token$/, (c) => c.requestLocationToken()],
   ["GET", /^\/api\/ui-definitions$/, (c) => c.getUiDefinitions()],
