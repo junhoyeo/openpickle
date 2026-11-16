@@ -554,5 +554,7 @@ export function decodeAccessToken(token: string): {
 } {
   const payload = token.replace(/^Bearer\s+/i, "").split(".")[1];
   if (!payload) throw new Error("not a JWT");
-  return JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/")));
+  // atob yields one character per byte; the claims are UTF-8 and must be decoded as such.
+  const bytes = Uint8Array.from(atob(payload.replace(/-/g, "+").replace(/_/g, "/")), (byte) => byte.charCodeAt(0));
+  return JSON.parse(new TextDecoder().decode(bytes));
 }

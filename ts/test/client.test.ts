@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { PickleApiError, PickleClient } from "../src/client.ts";
+import { PickleApiError, PickleClient, decodeAccessToken } from "../src/client.ts";
 
 function recorder(status: number, body: string) {
   const calls: { url: string; init: RequestInit }[] = [];
@@ -73,3 +73,9 @@ test("query options join a path that already has a query", async () => {
   ]);
 });
 
+test("token claims are read as UTF-8", () => {
+  const claims = { sub: "피클", sid: "s", iat: 1, exp: 2, sexp: 3 };
+  const bytes = new TextEncoder().encode(JSON.stringify(claims));
+  const payload = btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  expect(decodeAccessToken(`Bearer h.${payload}.s`)).toEqual(claims);
+});
