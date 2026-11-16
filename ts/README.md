@@ -1,4 +1,4 @@
-# picklemem-client
+# @openpickle/client
 
 A typed TypeScript client for the Pickle character API (`https://character-api-prod.picklemem.com`),
 the backend of the Pickle iOS app. It was built from two Proxyman captures of the iOS app
@@ -8,7 +8,7 @@ dependencies and uses `fetch`. It runs on Bun, and on Node versions that load Ty
 directly (tested on Node 26); older Node needs a bundler.
 
 ```ts
-import { PickleClient } from "picklemem-client";
+import { PickleClient } from "@openpickle/client";
 
 const pickle = new PickleClient({ accessToken: process.env.PICKLE_TOKEN! });
 
