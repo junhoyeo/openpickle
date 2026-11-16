@@ -20,6 +20,10 @@ servers the iOS app does, with your own account.
   iOS chat screen. Korean lines break between words, and the text field supports Korean input.
 - **Live.** Your message, the character's replies and what it is doing right now ("Searching
   Web…") arrive over the server's event stream as they happen.
+- **Explore.** The second tab lists what your Pickle offers to do for you, in sections and by
+  area. An offer shows how it would go about it, and Start asks for it in the chat.
+- **Friends and invites.** The menu leads to your friends, and Invite to your invite link, how
+  many invites are left and who joined with it.
 - **Search.** Cmd-F, or the search button in the menu, searches your messages on Pickle's
   server. Opening a result takes you to that message, with the conversation around it to scroll
   through.
@@ -31,14 +35,15 @@ servers the iOS app does, with your own account.
   session of its own, so your phone stays signed in.
 
 <p align="center">
+  <img src="docs/screenshots/explore.png" alt="The Explore tab: what your Pickle offers to do" height="380" />
   <img src="docs/screenshots/search.png" alt="Search results with the matching text in blue" height="380" />
   <img src="docs/screenshots/sign-in.png" alt="Sign-in with a phone number" height="380" />
 </p>
 
-Not built yet: the Explore, Library and Profile tabs, the other sections of the menu, the Invite
-button, voice calls, pictures and files, link previews, reactions, answering a request card, and
-rooms other than the one with your character. The [desktop README](crates/openpickle-desktop/README.md) has the full
-list.
+Not built yet: the Archive and Profile tabs, voice calls, pictures and files, link previews,
+reactions, answering a request card, rooms other than the one with your character, and
+everything that changes your friends: adding one, answering a request, a friend's own page.
+The [desktop README](crates/openpickle-desktop/README.md) has the full list.
 
 ## Searching your chat from coding agents
 
