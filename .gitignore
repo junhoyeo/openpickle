@@ -1,0 +1,4 @@
+node_modules/
+# Decoded captures hold bearer tokens and personal data.
+.capture/
+*.proxymanlogv2

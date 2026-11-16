@@ -1,0 +1,160 @@
+#!/usr/bin/env bun
+// Small CLI over PickleClient. Output is JSON. Credentials come from one of:
+//   PICKLE_SESSION_FILE  a JSON file holding {"login_session_token": "ls_…"}. Each run refreshes
+//                        once and writes the next token back, so never run two at once.
+//   PICKLE_TOKEN         an access token (the app's Authorization header), valid for 5 minutes.
+
+import { readFileSync } from "node:fs";
+import { mkdir, rename, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { createInterface } from "node:readline/promises";
+import { PickleClient, decodeAccessToken } from "./client.ts";
+import type { LoginSessionRefresh } from "./types.ts";
+
+const USAGE = `usage: PICKLE_SESSION_FILE=<file> pickle <command>
+       PICKLE_TOKEN=<jwt> pickle <command>
+
+  login <phone> [carrier]      sign in with a texted code and write PICKLE_SESSION_FILE;
+                               <phone> is E.164, e.g. +821012345678
+  token                        claims and remaining lifetime of PICKLE_TOKEN
+  sync                         rooms with cursors and unread counts
+  history <room> [after_seq]   room history after a sequence number (default 0)
+  send <room> <text>           send a message; <room> may be "character"
+  export <dir>                 write the full history of every room to <dir>/<room_id>.json
+  events                       stream live events, one JSON object per line
+  session | register | character | profile | social
+  screen <kind> [key=value]... server-driven screen data, e.g. "screen handoffs"
+  get <path>                   GET any path, e.g. "get /api/secure/transfers"`;
+
+const [command, ...args] = process.argv.slice(2);
+const sessionFile = process.env.PICKLE_SESSION_FILE;
+const token = process.env.PICKLE_TOKEN?.replace(/^Bearer\s+/i, "");
+if (!command || (!sessionFile && !token)) {
+  console.error(USAGE);
+  process.exit(2);
+}
+
+/** Replaces the session file in one step, so a crash cannot leave it holding a spent token. */
+async function saveSession(file: string, refresh: LoginSessionRefresh): Promise<void> {
+  const next = { login_session_token: refresh.login_session_token, expires_at: refresh.expires_at };
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(`${file}.tmp`, JSON.stringify(next), { mode: 0o600 });
+  await rename(`${file}.tmp`, file);
+}
+
+if (command === "login") {
+  const [phone, carrier] = args;
+  if (!phone || !sessionFile) throw new Error("PICKLE_SESSION_FILE=<file> pickle login <phone> [carrier]");
+  const signedOut = new PickleClient();
+  const { pending_id, expires_in } = await signedOut.requestPhoneCode(phone, { carrier });
+  const prompt = createInterface({ input: process.stdin, output: process.stderr });
+  const code = (await prompt.question(`Code texted to ${phone} (valid ${expires_in / 60} min): `)).trim();
+  prompt.close();
+  const issued = await signedOut.verifyPhoneCode(pending_id, code);
+  await saveSession(sessionFile, issued);
+  console.log(JSON.stringify({ user_id: issued.user_id, expires_at: issued.expires_at, saved_to: sessionFile }, null, 2));
+  process.exit(0);
+}
+
+const pickle = sessionFile
+  ? new PickleClient({
+      loginSession: {
+        token: JSON.parse(readFileSync(sessionFile, "utf8")).login_session_token,
+        onRotate: (refresh) => saveSession(sessionFile, refresh),
+      },
+    })
+  : new PickleClient({ accessToken: token! });
+const print = (value: unknown) => console.log(JSON.stringify(value, null, 2));
+
+async function resolveRoom(room: string): Promise<string> {
+  if (room !== "character") return room;
+  const { rooms } = await pickle.sync();
+  const own = rooms.find((r) => r.kind === "character");
+  if (!own) throw new Error("no character room in /api/sync");
+  return own.room_id;
+}
+
+switch (command) {
+  case "token": {
+    if (!token) throw new Error("token reads PICKLE_TOKEN");
+    const claims = decodeAccessToken(token);
+    print({ ...claims, expires_in_s: claims.exp - Math.floor(Date.now() / 1000) });
+    break;
+  }
+  case "sync":
+    print(await pickle.sync());
+    break;
+  case "history": {
+    const [room, afterSeq = "0"] = args;
+    if (!room || !/^\d+$/.test(afterSeq)) throw new Error("history <room> [after_seq]");
+    print(await pickle.getHistoryDelta(await resolveRoom(room), { afterSeq: Number(afterSeq) }));
+    break;
+  }
+  case "send": {
+    const [room, ...words] = args;
+    if (!room || words.length === 0) throw new Error("send <room> <text>");
+    print(await pickle.sendMessage(await resolveRoom(room), words.join(" ")));
+    break;
+  }
+  case "export": {
+    const [dir] = args;
+    if (!dir) throw new Error("export <dir>");
+    await mkdir(dir, { recursive: true });
+    const sync = await pickle.sync();
+    await writeFile(join(dir, "sync.json"), JSON.stringify(sync, null, 2));
+    for (const room of sync.rooms) {
+      const pages = [];
+      for await (const page of pickle.history(room.room_id)) pages.push(page);
+      const merged = {
+        room,
+        items: pages.flatMap((p) => p.items),
+        reactions: pages.flatMap((p) => p.reactions),
+        card_states: pages.flatMap((p) => p.card_states),
+        pages: pages.length,
+      };
+      await writeFile(join(dir, `${room.room_id}.json`), JSON.stringify(merged, null, 2));
+      const who = room.peer?.display_name ?? "(your character)";
+      console.error(`${room.kind} ${who}: ${merged.items.length} items, ${pages.length} pages, last_seq ${room.last_seq}`);
+    }
+    break;
+  }
+  case "events":
+    for await (const event of pickle.events()) console.log(JSON.stringify(event));
+    break;
+  case "session":
+    print(await pickle.startSession());
+    break;
+  case "register":
+    print(await pickle.registerAccount());
+    break;
+  case "character":
+    print(await pickle.getCharacter());
+    break;
+  case "profile":
+    print(await pickle.getProfile());
+    break;
+  case "social":
+    print(await pickle.getSocialSnapshot());
+    break;
+  case "screen": {
+    const [kind, ...pairs] = args;
+    if (!kind) throw new Error("screen <kind> [key=value]...");
+    const query = Object.fromEntries(
+      pairs.map((pair) => {
+        const at = pair.indexOf("=");
+        return at === -1 ? [pair, ""] : [pair.slice(0, at), pair.slice(at + 1)];
+      }),
+    );
+    print(await pickle.getScreen(kind, query));
+    break;
+  }
+  case "get": {
+    const [path] = args;
+    if (!path) throw new Error("get <path>");
+    print(await pickle.request("GET", path.startsWith("/") ? path : `/${path}`));
+    break;
+  }
+  default:
+    console.error(USAGE);
+    process.exit(2);
+}
