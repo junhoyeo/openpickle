@@ -59,6 +59,7 @@ const routes: [method: string, path: RegExp, call: Call][] = [
   ["POST", /^\/api\/rooms\/([^/]+)\/messages$/, (c, _f, j, [room]) =>
     c.sendMessage(room!, j.text, { clientMsgId: j.client_msg_id, inCall: j.in_call, context: j.context })],
   ["PUT", /^\/api\/rooms\/([^/]+)\/read$/, (c, _f, j, [room]) => c.markRead(room!, j.seq)],
+  ["GET", /^\/api\/attachments\/(.+)\/thumbnail$/, (c, _f, _j, [path]) => c.getAttachmentThumbnail(path!)],
   ["GET", /^\/api\/character$/, (c) => c.getCharacter()],
   ["GET", /^\/api\/profile$/, (c, f) => c.getProfile(new URLSearchParams(f.query).get("region")!)],
   ["GET", /^\/api\/social\/snapshot$/, (c, f) =>
@@ -182,7 +183,10 @@ const uncovered = new Map<string, number>();
 
 for (const flow of flows) {
   const route = routes.find(([method, path]) => method === flow.method && path.test(flow.path));
-  const label = `${flow.method} ${flow.path.replace(/\/rooms\/[^/]+/, "/rooms/{room}").replace(/\/nodes\/[^/]{43}/, "/nodes/{node}")}`;
+  const label = `${flow.method} ${flow.path
+    .replace(/\/rooms\/[^/]+/, "/rooms/{room}")
+    .replace(/\/nodes\/[^/]{43}/, "/nodes/{node}")
+    .replace(/^\/api\/attachments\/.+\/thumbnail$/, "/api/attachments/{path}/thumbnail")}`;
   if (!route) {
     uncovered.set(label, (uncovered.get(label) ?? 0) + 1);
     continue;

@@ -117,9 +117,9 @@ export interface RequestOptions {
   headers?: Record<string, string>;
   /**
    * `bearer` (default): app identity headers and the bearer token. `app`: identity headers only.
-   * `none`: neither.
+   * `token`: the bearer token only. `none`: neither.
    */
-  auth?: "bearer" | "app" | "none";
+  auth?: "bearer" | "app" | "token" | "none";
   signal?: AbortSignal;
 }
 
@@ -346,6 +346,20 @@ export class PickleClient {
     }
   }
 
+  /**
+   * `GET /api/attachments/{path}/thumbnail`: a JPEG preview of a photo or PDF a message carries.
+   * `path` is an entry of a history item's `attachments` (`attachments/<date>/<file name>`). The app
+   * sends only the bearer token here, without its identity headers.
+   */
+  async getAttachmentThumbnail(path: string): Promise<{ bytes: Uint8Array; contentType: string }> {
+    const encoded = path.split("/").map(encodeURIComponent).join("/");
+    const response = await this.send("GET", `/api/attachments/${encoded}/thumbnail`, { auth: "token" });
+    return {
+      bytes: new Uint8Array(await response.arrayBuffer()),
+      contentType: response.headers.get("content-type") ?? "",
+    };
+  }
+
   // ---- Profile, character and social ----
 
   /** `GET /api/character`: your character's look, level, energy and jelly. */
@@ -485,8 +499,8 @@ export class PickleClient {
       "Cache-Control": "no-cache",
     };
     const auth = options.auth ?? "bearer";
-    if (auth !== "none") Object.assign(headers, this.identityHeaders());
-    if (auth === "bearer") headers.Authorization = `Bearer ${await this.bearerToken()}`;
+    if (auth === "bearer" || auth === "app") Object.assign(headers, this.identityHeaders());
+    if (auth === "bearer" || auth === "token") headers.Authorization = `Bearer ${await this.bearerToken()}`;
     if (options.body !== undefined) headers["Content-Type"] = "application/json";
     // Header names are case-insensitive: `authorization` must replace `Authorization`, or fetch
     // would send both values joined by a comma.

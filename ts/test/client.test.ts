@@ -188,3 +188,20 @@ test("getHistoryPage asks for messages before a sequence number, limit first", a
   ]);
   expect(calls[0]!.init.method).toBe("GET");
 });
+
+test("getAttachmentThumbnail encodes each path segment and returns the JPEG", async () => {
+  const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
+  const calls: { url: string; init: RequestInit }[] = [];
+  const fetch = (async (url: string, init: RequestInit) => {
+    calls.push({ url, init });
+    return new Response(jpeg, { headers: { "content-type": "image/jpeg" } });
+  }) as unknown as typeof globalThis.fetch;
+  const pickle = new PickleClient({ accessToken: "t", fetch });
+  const thumbnail = await pickle.getAttachmentThumbnail("attachments/2026-01-02/여행 계획 v2.pdf");
+  expect(calls[0]!.url).toBe(
+    `${pickle.baseUrl}/api/attachments/attachments/2026-01-02/%EC%97%AC%ED%96%89%20%EA%B3%84%ED%9A%8D%20v2.pdf/thumbnail`,
+  );
+  expect(Object.keys(calls[0]!.init.headers as Record<string, string>)).not.toContain("X-Client-Version");
+  expect((calls[0]!.init.headers as Record<string, string>).Authorization).toBe("Bearer t");
+  expect(thumbnail).toEqual({ bytes: jpeg, contentType: "image/jpeg" });
+});
