@@ -5,8 +5,12 @@ actions!(openpickle, [Quit]);
 
 fn main() {
     // Started before GPUI so the cached conversation loads while the window is being created.
-    let (commands, updates) = match backend::start() {
-        Ok(ends) => ends,
+    let backend::Backend {
+        commands,
+        updates,
+        stop,
+    } = match backend::start() {
+        Ok(backend) => backend,
         Err(backend::StartError::AlreadyRunning) => {
             eprintln!("OpenPickle is already running.");
             return;
@@ -22,6 +26,12 @@ fn main() {
             ui::input::bind_keys(cx);
             cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
             cx.on_action(|_: &Quit, cx| cx.quit());
+            // Runs on every way out: the menu, the last window closing, the Dock, logging out.
+            cx.on_app_quit(move |_| {
+                stop.stop();
+                async {}
+            })
+            .detach();
             cx.set_menus(vec![Menu {
                 name: "OpenPickle".into(),
                 items: vec![MenuItem::action("Quit OpenPickle", Quit)],

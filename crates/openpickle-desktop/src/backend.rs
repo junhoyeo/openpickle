@@ -36,14 +36,36 @@ pub enum StartError {
     Store(std::io::Error),
 }
 
-/// Starts the backend thread and returns the two ends the UI holds.
-pub fn start() -> Result<
-    (
-        UnboundedSender<Command>,
-        futures::channel::mpsc::UnboundedReceiver<Update>,
-    ),
-    StartError,
-> {
+/// The ends of the backend that the app holds.
+pub struct Backend {
+    pub commands: UnboundedSender<Command>,
+    pub updates: futures::channel::mpsc::UnboundedReceiver<Update>,
+    pub stop: Stop,
+}
+
+/// Lets the app wait for the backend when it quits.
+pub struct Stop {
+    commands: UnboundedSender<Command>,
+    /// Closed when the backend thread has finished.
+    stopped: std::sync::mpsc::Receiver<()>,
+}
+
+impl Stop {
+    /// How long quitting waits for a network call in flight.
+    const WAIT: Duration = Duration::from_secs(3);
+
+    /// Tells the backend to stop and waits for it, but not for long. The backend stops
+    /// between network calls. That matters for one of them: a login session refresh spends
+    /// the stored token, so quitting before the new one is saved signs the app out.
+    pub fn stop(&self) {
+        self.commands.send(Command::Quit).ok();
+        // An error is the answer: the thread closed its end, or the wait ran out.
+        self.stopped.recv_timeout(Self::WAIT).ok();
+    }
+}
+
+/// Starts the backend thread.
+pub fn start() -> Result<Backend, StartError> {
     let store = Store::open().map_err(StartError::Store)?;
     let claim = store
         .claim()
@@ -51,6 +73,7 @@ pub fn start() -> Result<
         .ok_or(StartError::AlreadyRunning)?;
     let (commands, commands_rx) = unbounded_channel();
     let (updates, updates_rx) = futures::channel::mpsc::unbounded();
+    let (finished, stopped) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("backend".into())
         .spawn(move || {
@@ -61,9 +84,17 @@ pub fn start() -> Result<
                 .build()
                 .expect("tokio runtime");
             runtime.block_on(run(store, commands_rx, updates));
+            drop(finished);
         })
         .map_err(StartError::Store)?;
-    Ok((commands, updates_rx))
+    Ok(Backend {
+        stop: Stop {
+            commands: commands.clone(),
+            stopped,
+        },
+        commands,
+        updates: updates_rx,
+    })
 }
 
 /// Why the backend stopped doing what it was doing.
@@ -155,6 +186,7 @@ async fn sign_in(
                 },
                 None => "Ask for a code first.".to_owned(),
             },
+            Command::Quit => break,
             Command::Send { .. } | Command::Active(_) => continue,
         };
         updates.unbounded_send(Update::SignInFailed(failure)).ok();
@@ -389,7 +421,7 @@ async fn converse(
     loop {
         tokio::select! {
             command = commands.recv() => match command {
-                None => return Ended::Closed,
+                None | Some(Command::Quit) => return Ended::Closed,
                 Some(Command::Send { id, text }) => {
                     if let Err(error) = live.send_message(id.clone(), &text).await {
                         live.send(Update::SendFailed { id, reason: not_sent(&error) });
@@ -658,6 +690,22 @@ async fn download_avatar(store: &Store, url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn quit_stops_the_backend() {
+        let root =
+            std::env::temp_dir().join(format!("openpickle-test-quit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root).unwrap();
+        let (commands, commands_rx) = unbounded_channel();
+        let (updates, mut updates_rx) = futures::channel::mpsc::unbounded();
+
+        // Nobody is signed in, so the backend waits at the sign-in screen until it is told.
+        commands.send(Command::Quit).unwrap();
+        run(store, commands_rx, updates).await;
+        assert!(matches!(updates_rx.next().await, Some(Update::SignedOut)));
+        assert!(updates_rx.next().await.is_none());
+    }
 
     #[test]
     fn only_the_server_can_say_that_the_login_session_is_gone() {

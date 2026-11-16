@@ -17,6 +17,8 @@ pub enum Command {
     Send { id: String, text: String },
     /// The window came to the front (`true`) or went behind (`false`).
     Active(bool),
+    /// The app is quitting: stop after the network call in flight, if there is one.
+    Quit,
 }
 
 /// Backend to UI.
