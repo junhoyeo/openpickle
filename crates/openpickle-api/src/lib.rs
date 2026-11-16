@@ -68,6 +68,9 @@ pub enum Error {
     /// not use the access token it came with; the next request offers it to the callback again.
     #[error("storing the rotated login session token failed: {0}")]
     Rotate(std::io::Error),
+    /// The task that refreshes the login session stopped before it finished.
+    #[error("the login session refresh did not finish")]
+    RefreshAborted,
 }
 
 impl Error {

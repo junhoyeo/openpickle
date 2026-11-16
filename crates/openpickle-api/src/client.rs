@@ -902,7 +902,7 @@ impl PickleClient {
                         return Ok(header);
                     }
                 });
-                refresh.await.expect("login session refresh panicked")
+                refresh.await.unwrap_or(Err(Error::RefreshAborted))
             }
         }
     }
