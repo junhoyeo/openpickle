@@ -5,6 +5,7 @@ import type {
   EnclaveNode,
   ExploreSectionsScreen,
   HistoryDelta,
+  HistoryPage,
   HistoryWindow,
   KnownScreens,
   LoginSessionIssued,
@@ -116,9 +117,9 @@ export interface RequestOptions {
   headers?: Record<string, string>;
   /**
    * `bearer` (default): app identity headers and the bearer token. `app`: identity headers only.
-   * `none`: neither.
+   * `token`: the bearer token only. `none`: neither.
    */
-  auth?: "bearer" | "app" | "none";
+  auth?: "bearer" | "app" | "token" | "none";
   signal?: AbortSignal;
 }
 
@@ -270,6 +271,16 @@ export class PickleClient {
     });
   }
 
+  /**
+   * `GET /api/rooms/{room}/history/page`: up to `limit` messages before `beforeSeq`, with their
+   * reactions and card states. Pass `next_before` as the next `beforeSeq` while `has_more`.
+   */
+  getHistoryPage(roomId: string, options: { beforeSeq: number; limit?: number }): Promise<HistoryPage> {
+    return this.request("GET", `/api/rooms/${encodeURIComponent(roomId)}/history/page`, {
+      query: { limit: options.limit ?? 250, before_seq: options.beforeSeq },
+    });
+  }
+
   /** Pages through `getHistoryDelta` from `afterSeq` (default 0) until the server has no more. */
   async *history(roomId: string, options: { afterSeq?: number; limit?: number } = {}): AsyncGenerator<HistoryDelta> {
     let afterSeq = options.afterSeq ?? 0;
@@ -333,6 +344,20 @@ export class PickleClient {
       // Cancelling the reader propagates through the pipe and closes the connection.
       await reader.cancel().catch(() => {});
     }
+  }
+
+  /**
+   * `GET /api/attachments/{path}/thumbnail`: a JPEG preview of a photo or PDF a message carries.
+   * `path` is an entry of a history item's `attachments` (`attachments/<date>/<file name>`). The app
+   * sends only the bearer token here, without its identity headers.
+   */
+  async getAttachmentThumbnail(path: string): Promise<{ bytes: Uint8Array; contentType: string }> {
+    const encoded = path.split("/").map(encodeURIComponent).join("/");
+    const response = await this.send("GET", `/api/attachments/${encoded}/thumbnail`, { auth: "token" });
+    return {
+      bytes: new Uint8Array(await response.arrayBuffer()),
+      contentType: response.headers.get("content-type") ?? "",
+    };
   }
 
   // ---- Profile, character and social ----
@@ -474,8 +499,8 @@ export class PickleClient {
       "Cache-Control": "no-cache",
     };
     const auth = options.auth ?? "bearer";
-    if (auth !== "none") Object.assign(headers, this.identityHeaders());
-    if (auth === "bearer") headers.Authorization = `Bearer ${await this.bearerToken()}`;
+    if (auth === "bearer" || auth === "app") Object.assign(headers, this.identityHeaders());
+    if (auth === "bearer" || auth === "token") headers.Authorization = `Bearer ${await this.bearerToken()}`;
     if (options.body !== undefined) headers["Content-Type"] = "application/json";
     // Header names are case-insensitive: `authorization` must replace `Authorization`, or fetch
     // would send both values joined by a comma.

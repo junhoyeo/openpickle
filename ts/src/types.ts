@@ -436,6 +436,17 @@ export interface HistoryDelta {
   read_seq: number;
 }
 
+/** `GET /api/rooms/{room}/history/page`: messages before a sequence number, oldest first. */
+export interface HistoryPage {
+  v: 1;
+  messages: HistoryItem[];
+  reactions: Reaction[];
+  card_states: CardState[];
+  has_more: boolean;
+  /** The `before_seq` of the next older page: the oldest `seq` in this page while `has_more`. */
+  next_before: number;
+}
+
 /** What a message was sent from. Only `offer` (an Explore offer, `id` = its `offer_id`) was seen. */
 export interface MessageContext {
   id: string;
