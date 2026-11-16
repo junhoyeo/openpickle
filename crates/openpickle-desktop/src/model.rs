@@ -1,6 +1,6 @@
 //! What the chat screen draws: messages, and the rows of the virtual list built from them.
 
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 use chrono::{DateTime, Local, TimeZone};
 
@@ -11,6 +11,21 @@ pub enum Side {
     /// Your own messages: right-aligned, green.
     Mine,
     Theirs,
+}
+
+/// One result of a message search.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SearchResult {
+    /// The message's sequence number, when the result is a message of the open conversation.
+    /// Other results cannot be opened.
+    pub seq: Option<u64>,
+    /// What the result is: `Chat`.
+    pub label: String,
+    /// The day of the message: `Nov 16`.
+    pub date: String,
+    /// A piece of the message on one line, and the parts of it that match the query.
+    pub snippet: String,
+    pub matches: Vec<Range<usize>>,
 }
 
 /// Messages typed here that the server has not confirmed yet are numbered above this, which
@@ -139,12 +154,15 @@ const GROUP_WINDOW_S: f64 = 5. * 60.;
 /// A pause this long gets a timestamp before the next message.
 const TIMESTAMP_GAP_S: f64 = 60. * 60.;
 
+/// Lays the messages out as list rows. Also returns, for each message, the index of its first
+/// row, which is where the list scrolls to when a search result is opened.
 pub fn build_rows(
     messages: &[Message],
     activity: Option<Option<&str>>,
     now: DateTime<Local>,
-) -> Vec<Row> {
+) -> (Vec<Row>, Vec<usize>) {
     let mut rows: Vec<Row> = Vec::with_capacity(messages.len() * 2);
+    let mut starts: Vec<usize> = Vec::with_capacity(messages.len());
     let mut previous: Option<&Message> = None;
     for message in messages {
         let gap = previous.map_or(f64::INFINITY, |previous| message.at - previous.at);
@@ -157,6 +175,7 @@ pub fn build_rows(
                 joined_below: false,
             });
         }
+        starts.push(rows.len());
         let continues = !stamped
             && gap < GROUP_WINDOW_S
             && previous.is_some_and(|previous| previous.side == message.side);
@@ -182,7 +201,7 @@ pub fn build_rows(
             joined_below: false,
         });
     }
-    rows
+    (rows, starts)
 }
 
 /// `Today 10:08 PM`, `Yesterday 9:12 AM`, `Nov 12, 9:12 AM`.
@@ -223,7 +242,7 @@ mod tests {
     #[test]
     fn groups_by_side_and_time_and_stamps_long_pauses() {
         let now = Local.timestamp_opt(10_000, 0).unwrap();
-        let rows = build_rows(
+        let (rows, starts) = build_rows(
             &[
                 message(0., Side::Theirs, 2),
                 message(10., Side::Theirs, 1),
@@ -257,5 +276,7 @@ mod tests {
             ]
         );
         assert!(matches!(&rows[7].kind, RowKind::Activity(Some(label)) if label == "Working"));
+        // Each message starts at its first part, after its timestamp.
+        assert_eq!(starts, [1, 3, 4, 6]);
     }
 }

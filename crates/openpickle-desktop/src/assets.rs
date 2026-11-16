@@ -17,6 +17,7 @@ icons![
     "archive",
     "arrow-up",
     "chevron-down",
+    "circle-x",
     "compass",
     "globe",
     "message-circle",
@@ -24,8 +25,10 @@ icons![
     "mic",
     "phone",
     "plus",
+    "search",
     "shield-keyhole",
     "user-round",
+    "users-round",
     "x",
 ];
 

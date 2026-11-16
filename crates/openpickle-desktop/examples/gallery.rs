@@ -90,7 +90,7 @@ fn main() {
         .with_assets(Assets)
         .run(move |cx: &mut App| {
             eprintln!("app ready after {:?}", started.elapsed());
-            ui::input::bind_keys(cx);
+            ui::bind_keys(cx);
             if login {
                 cx.open_window(ui::window_options(cx), |window, cx| {
                     let view = cx.new(LoginView::new);
@@ -102,7 +102,7 @@ fn main() {
                 cx.open_window(ui::window_options(cx), |window, cx| {
                     let view = cx.new(|cx| {
                         let mut view = ChatView::new(cx);
-                        let rows = build_rows(&messages, Some(Some("Working")), Local::now());
+                        let (rows, _) = build_rows(&messages, Some(Some("Working")), Local::now());
                         eprintln!("{} messages, {} rows", messages.len(), rows.len());
                         view.set_rows(rows, cx);
                         view

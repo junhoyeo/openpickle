@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use crate::model::Message;
+use crate::model::{Message, SearchResult};
 
 /// UI to backend. Neither side of the protocol can be printed with `{:?}`: a command may hold
 /// a phone number or a sign-in code, and both hold message text.
@@ -15,6 +15,8 @@ pub enum Command {
     /// Send a message to the open conversation. The UI shows it already, under this id, which
     /// the server keeps for its copy.
     Send { id: String, text: String },
+    /// Search the messages for this text.
+    Search(String),
     /// The window came to the front (`true`) or went behind (`false`).
     Active(bool),
     /// The app is quitting: stop after the network call in flight, if there is one.
@@ -45,6 +47,11 @@ pub enum Update {
     Upsert(Vec<Message>),
     /// The message the UI sent under this id did not reach the server. The text says why.
     SendFailed { id: String, reason: String },
+    /// What a search for `query` found, or why it could not be done.
+    Found {
+        query: String,
+        results: Result<Vec<SearchResult>, String>,
+    },
     /// Whether the character is working on a reply, and on what when it says.
     Activity(Option<Option<String>>),
     /// The backend stopped over something on this computer and cannot go on. The text says
