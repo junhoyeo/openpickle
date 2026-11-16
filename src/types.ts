@@ -215,6 +215,15 @@ export interface SessionResponse extends AccountState {
   [key: string]: unknown;
 }
 
+export interface LoginSessionRefresh {
+  /** The new access token, valid for 5 minutes. */
+  login_session_jwt: string;
+  /** When the login session ends (7 days after the refresh), ISO 8601. */
+  expires_at: string;
+  /** The next refresh token. The one that was sent is spent. */
+  login_session_token: string;
+}
+
 // ---- Profile and character ----
 
 export interface Profile {

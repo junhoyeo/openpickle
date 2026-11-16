@@ -5,6 +5,7 @@ import type {
   EnclaveNode,
   HistoryDelta,
   KnownScreens,
+  LoginSessionRefresh,
   LogNodeSummary,
   LogStoreListings,
   LogStoreListingsRequest,
@@ -69,13 +70,27 @@ export const IOS_PROFILE: ClientProfile = {
   vocabulary: "6d926b057792cf46",
 };
 
-export interface PickleClientOptions {
-  /**
-   * The bearer token (an ES256 JWT from the app's `Authorization` header). Access tokens expire
-   * 5 minutes after issue, so long-lived use needs a function that returns a fresh one; it is
-   * called once per request.
-   */
-  accessToken: string | (() => string | Promise<string>);
+/**
+ * How the client gets its bearer token.
+ *
+ * - `accessToken`: a token, or a function asked for one before every request. Access tokens
+ *   expire 5 minutes after issue.
+ * - `loginSession`: a refresh token (`login_session_token`, `ls_…`). The client trades it for
+ *   access tokens through `POST /api/login-sessions/refresh` as they run out. Every refresh
+ *   spends the token and returns the next one, which `onRotate` must store; a lost token ends
+ *   the login session. The app on your phone holds its own copy of this chain, so a token taken
+ *   from its traffic stops working for whichever side refreshes second.
+ */
+export type Credentials =
+  | { accessToken: string | (() => string | Promise<string>) }
+  | {
+      loginSession: {
+        token: string;
+        onRotate: (refresh: LoginSessionRefresh) => void | Promise<void>;
+      };
+    };
+
+export type PickleClientOptions = Credentials & {
   /** The device id the app reports (iOS `identifierForVendor`). Defaults to a new random one. */
   deviceId?: string;
   /** `X-Client-Launch-Id`: one id per app launch. Defaults to a new random one. */
@@ -83,15 +98,18 @@ export interface PickleClientOptions {
   profile?: Partial<ClientProfile>;
   baseUrl?: string;
   fetch?: typeof fetch;
-}
+};
 
 export interface RequestOptions {
   query?: Record<string, string | number | undefined>;
   /** Serialized as JSON. */
   body?: unknown;
   headers?: Record<string, string>;
-  /** Send the bearer token and the app identity headers. Default `true`. */
-  auth?: boolean;
+  /**
+   * `bearer` (default): app identity headers and the bearer token. `app`: identity headers only.
+   * `none`: neither.
+   */
+  auth?: "bearer" | "app" | "none";
   signal?: AbortSignal;
 }
 
@@ -121,11 +139,16 @@ export class PickleClient {
   readonly profile: ClientProfile;
   readonly deviceId: string;
   readonly launchId: string;
-  private readonly accessToken: PickleClientOptions["accessToken"];
+  private readonly credentials: Credentials;
   private readonly fetchImpl: typeof fetch;
+  /** The access token from the last login session refresh, or the refresh in flight. */
+  private sessionAccess: Promise<{ token: string; exp: number }> | undefined;
 
   constructor(options: PickleClientOptions) {
-    this.accessToken = options.accessToken;
+    this.credentials =
+      "loginSession" in options
+        ? { loginSession: { ...options.loginSession } }
+        : { accessToken: options.accessToken };
     this.baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, "");
     this.profile = { ...IOS_PROFILE, ...options.profile };
     this.deviceId = options.deviceId ?? crypto.randomUUID().toUpperCase();
@@ -134,6 +157,24 @@ export class PickleClient {
   }
 
   // ---- Account and session ----
+
+  /**
+   * `POST /api/login-sessions/refresh`: trades a refresh token for an access token and the next
+   * refresh token. The sent token is spent. A client created with `loginSession` calls this itself.
+   */
+  refreshLoginSession(loginSessionToken: string): Promise<LoginSessionRefresh> {
+    return this.request("POST", "/api/login-sessions/refresh", {
+      auth: "app",
+      body: { login_session_token: loginSessionToken },
+      headers: {
+        "X-Pickle-Onboarding-Flow": "4",
+        "X-Pickle-Sign-In-Flow": "2",
+        "X-Pickle-Login-Session-Rotation": "1",
+        "X-Client-Timezone": this.profile.timezone,
+        "X-Client-Platform": this.profile.platform,
+      },
+    });
+  }
 
   /**
    * `POST /api/account/register`. The app calls it on every launch; for an existing account it
@@ -303,7 +344,7 @@ export class PickleClient {
   /** `GET /api/ui-definitions`: the server-driven UI bundle. Needs no token. */
   getUiDefinitions(): Promise<UiDefinitions> {
     return this.request("GET", "/api/ui-definitions", {
-      auth: false,
+      auth: "none",
       headers: { "X-Pickle-Vocabulary": this.profile.vocabulary, "X-Client-Platform": this.profile.platform },
     });
   }
@@ -366,7 +407,9 @@ export class PickleClient {
       Pragma: "no-cache",
       "Cache-Control": "no-cache",
     };
-    if (options.auth ?? true) Object.assign(headers, await this.identityHeaders());
+    const auth = options.auth ?? "bearer";
+    if (auth !== "none") Object.assign(headers, this.identityHeaders());
+    if (auth === "bearer") headers.Authorization = `Bearer ${await this.bearerToken()}`;
     if (options.body !== undefined) headers["Content-Type"] = "application/json";
     Object.assign(headers, options.headers);
 
@@ -387,10 +430,32 @@ export class PickleClient {
     return response;
   }
 
-  private async identityHeaders(): Promise<Record<string, string>> {
-    const token = typeof this.accessToken === "function" ? await this.accessToken() : this.accessToken;
+  private async bearerToken(): Promise<string> {
+    if ("accessToken" in this.credentials) {
+      const { accessToken } = this.credentials;
+      return typeof accessToken === "function" ? accessToken() : accessToken;
+    }
+    const pending = this.sessionAccess;
+    const current = await pending?.catch(() => undefined);
+    // Refresh a minute early so clock skew and slow requests do not meet an expired token.
+    if (current && current.exp - 60 > Date.now() / 1000) return current.token;
+    // One refresh at a time: two concurrent refreshes would spend the same token twice. If another
+    // caller started a refresh while this one waited, join it.
+    if (this.sessionAccess === pending) this.sessionAccess = this.refreshSession();
+    return (await this.sessionAccess!).token;
+  }
+
+  private async refreshSession(): Promise<{ token: string; exp: number }> {
+    if (!("loginSession" in this.credentials)) throw new Error("no login session");
+    const session = this.credentials.loginSession;
+    const refresh = await this.refreshLoginSession(session.token);
+    session.token = refresh.login_session_token;
+    await session.onRotate(refresh);
+    return { token: refresh.login_session_jwt, exp: decodeAccessToken(refresh.login_session_jwt).exp };
+  }
+
+  private identityHeaders(): Record<string, string> {
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${token}`,
       "X-Client-Version": this.profile.appVersion,
       "X-Client-Build": this.profile.appBuild,
       "X-Client-Launch-Id": this.launchId,

@@ -39,6 +39,7 @@ const drain = async (events: AsyncIterable<unknown>) => {
 };
 
 const routes: [method: string, path: RegExp, call: Call][] = [
+  ["POST", /^\/api\/login-sessions\/refresh$/, (c, _f, j) => c.refreshLoginSession(j.login_session_token)],
   ["POST", /^\/api\/account\/register$/, (c) => c.registerAccount()],
   ["POST", /^\/api\/session$/, (c, _f, json) => c.startSession(json)],
   ["GET", /^\/api\/sync$/, (c) => c.sync()],
