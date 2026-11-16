@@ -20,6 +20,8 @@ servers the iOS app does, with your own account.
   iOS chat screen. Korean lines break between words, and the text field supports Korean input.
 - **Live.** Your message, the character's replies and what it is doing right now ("Searching
   Web…") arrive over the server's event stream as they happen.
+- **Archive.** The third tab holds every picture and file of the conversation, grouped by day,
+  with documents listed by name, kind and size.
 - **Explore.** The second tab lists what your Pickle offers to do for you, in sections and by
   area. An offer shows how it would go about it, and Start asks for it in the chat.
 - **Friends and invites.** The menu leads to your friends, and Invite to your invite link, how
@@ -40,7 +42,8 @@ servers the iOS app does, with your own account.
   <img src="docs/screenshots/sign-in.png" alt="Sign-in with a phone number" height="380" />
 </p>
 
-Not built yet: the Archive and Profile tabs, voice calls, pictures and files, link previews,
+Not built yet: the Profile tab, voice calls, opening a picture full size, saving or sharing a
+file, link previews,
 reactions, answering a request card, rooms other than the one with your character, and
 everything that changes your friends: adding one, answering a request, a friend's own page.
 The [desktop README](crates/openpickle-desktop/README.md) has the full list.

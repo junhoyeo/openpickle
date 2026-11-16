@@ -21,6 +21,10 @@ cargo run -p openpickle-desktop --example gallery -- app   # the whole window: m
 - **Live updates** over the server's event stream: your message, the character's replies and what
   it is doing appear as they happen.
 - **Sending**: a message shows at once and is replaced by the server's copy when it arrives.
+- **Archive** (the third tab, or Cmd-4, and in the menu): every picture and file of the
+  conversation, grouped by day, newest first. Media is a grid of three; a file is a row with its
+  preview, name, kind, pages and size. Opening one goes to that message in the chat. Until the
+  whole history has been read, an empty page says it is still reading.
 - **Explore** (the second tab, or Cmd-2): the offers the server lists, as the app shows them.
   "For you" previews each section, with See all, and lists the rest under "More to explore"; an
   area's chip lists that area's offers by rank. An offer opens a sheet with its steps, and
@@ -40,9 +44,9 @@ cargo run -p openpickle-desktop --example gallery -- app   # the whole window: m
   selection is read from the conversation, not from the rows on screen, so Select All copies all
   of it.
 
-Not built: the Archive and Profile tabs, the menu's Archive, 3D World and My Pickle, the
-microphone and voice calls (all drawn, none active); pictures and files (a message only says
-how many it has); link previews; reactions; answering a request card; other rooms than the one
+Not built: the Profile tab, the menu's 3D World and My Pickle, the microphone and voice calls
+(all drawn, none active); opening a picture full size, saving or sharing a file, the + that
+makes documents; link previews; reactions; answering a request card; other rooms than the one
 with your character. No capture shows the requests for deleting an offer, adding a friend,
 answering a friend request or a friend's own page, so those are left out, as are the contacts
 list, sharing the invite through other apps and the Korean roulette promotion. The texts of the
