@@ -5,6 +5,7 @@ A native desktop app for chatting with your Pickle. It is written in Rust and dr
 
 ```sh
 cargo run --release -p openpickle-desktop            # the app
+./crates/openpickle-desktop/macos/package.sh         # OpenPickle.app and a disk image
 cargo run -p openpickle-desktop --example gallery    # the chat screen with made-up messages
 cargo run -p openpickle-desktop --example gallery -- login
 ```
@@ -24,6 +25,12 @@ Not built: the Explore, Library and Profile tabs, the menu and Invite buttons, t
 voice calls (all drawn, none active); pictures and files (a message only says how many it has);
 link previews; reactions; answering a request card; other rooms than the one with your character.
 
+## Packaging
+
+`macos/package.sh` builds `OpenPickle.app` and a disk image into `target/macos/`. It uses only
+macOS's own tools (`sips`, `iconutil`, `codesign`, `hdiutil`). The app is signed ad hoc; see the
+[root README](../../README.md#get-it) for what that means.
+
 ## Why it is fast
 
 - The backend thread starts before the window. It sends the conversation from the disk cache to
@@ -40,13 +47,13 @@ runs each; GPUI's own start-up is about 67 ms of that).
 ## Where things live
 
 Everything is under the user's application-support directory
-(`~/Library/Application Support/openpickle` on macOS):
+(`~/Library/Application Support/openpickle` on macOS), readable by you only:
 
-- `session.json`: the login session, readable by you only. Its refresh token is single-use and
+- `session.json`: the login session. Its refresh token is single-use and
   replaced on every refresh, so the file is written atomically and only one instance of the app
   may run. Deleting it signs the app out.
 - `cache/`: the room history as an append-only log, the character's picture, and a few small
-  files. Deleting it only makes the next launch fetch everything again.
+  files. Deleting it only makes the next launch fetch everything again. Signing out clears it.
 
 ## Code map
 

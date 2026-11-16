@@ -1,21 +1,89 @@
-# openpickle
+<h1 align="center">openpickle</h1>
 
-An unofficial client for [Pickle](https://pickle.com), built from the app's own network traffic.
+<p align="center">
+  An unofficial, native desktop app for <a href="https://pickle.com">Pickle</a>.<br />
+  Written in Rust, drawn on the GPU, and built from the phone app's own network traffic.
+</p>
 
-| Path | What it is |
-| --- | --- |
-| [`crates/openpickle-desktop`](crates/openpickle-desktop/README.md) | A native desktop app for chatting with your Pickle, written in Rust with GPUI. |
-| `crates/openpickle-api` | The Rust client for the Pickle character API that the desktop app uses. |
-| [`ts/`](ts/README.md) | The TypeScript client the Rust one was ported from, a small CLI, and the notes on the API: endpoints, sign-in, login sessions, events. |
+<p align="center">
+  <img src="docs/screenshots/chat.png" alt="The chat with your Pickle: a question and its answer in bubbles" height="620" />
+  <img src="docs/screenshots/sign-in.png" alt="Sign-in with a phone number" height="620" />
+</p>
 
-Both clients are checked against Proxyman captures of the iOS app: every recorded request is
-replayed through the client and compared with what the app sent.
+openpickle is not made by, or affiliated with, the company behind Pickle. It talks to the same
+servers the iOS app does, with your own account.
+
+## What it does
+
+- **Chat with your Pickle from your Mac.** Bubbles, cards, timestamps and the composer follow the
+  iOS chat screen. Korean lines break between words, and the text field supports Korean input.
+- **Live.** Your message, the character's replies and what it is doing right now arrive over the
+  server's event stream as they happen.
+- **Opens at once.** The app keeps the conversation on disk and draws it before it asks the
+  network for anything. See [the numbers](#speed).
+- **Its own sign-in.** You sign in with your phone number and a texted code. The app gets a login
+  session of its own, so your phone stays signed in.
+
+Not built yet: the Explore, Library and Profile tabs, the menu and Invite buttons, voice calls,
+pictures and files, link previews, reactions, answering a request card, and rooms other than the
+one with your character. The [desktop README](crates/openpickle-desktop/README.md) has the full
+list.
+
+## Get it
 
 ```sh
-cargo run --release -p openpickle-desktop                               # the app
+# A disk image with OpenPickle.app (Apple Silicon):
+./crates/openpickle-desktop/macos/package.sh      # writes target/macos/OpenPickle-<version>-arm64.dmg
+
+# Or run it from source:
+cargo run --release -p openpickle-desktop
+```
+
+The app is signed ad hoc, which is enough for the Mac that built it. Another Mac refuses it until
+it is signed with a Developer ID and notarized. Building needs a recent stable Rust (1.98 was
+used) and Xcode.
+
+## Speed
+
+The message list only lays out the rows near the viewport, and a message's text is parsed once,
+off the UI thread. So a long history costs almost nothing at launch:
+
+| Sample conversation | First frame after `main()` |
+| --- | --- |
+| 8 messages | about 146 ms |
+| 2,000 messages | about 153 ms |
+
+Release build on an Apple Silicon Mac, median of six runs of the `gallery` example, which draws
+the chat screen with made-up messages. GPUI's own start-up is about 67 ms of that.
+
+## How it was built
+
+The API is not documented. It was read off three [Proxyman](https://proxyman.com) captures of the
+iOS app: 30 endpoints, of which the clients cover 27. Each client is checked by replaying every
+captured request through it and comparing what it sends with what the app sent: method, path, raw
+query string, JSON body and headers.
+
+```sh
 cargo run -p openpickle-api --example verify_capture -- <capture.proxymanlogv2>
 cd ts && bun run verify:capture <capture.proxymanlogv2>
 ```
 
-Captures, exported messages and login session files hold bearer tokens and personal data. They
-belong in `.capture/`, which git ignores.
+The notes on the API (endpoints, phone sign-in, login sessions, the event stream) are in
+[`ts/README.md`](ts/README.md).
+
+## What is in the repository
+
+| Path | What it is |
+| --- | --- |
+| [`crates/openpickle-desktop`](crates/openpickle-desktop/README.md) | The desktop app: GPUI views, a backend thread for the network and the disk, the macOS packaging. |
+| `crates/openpickle-api` | The Rust client for the Pickle character API: all 27 endpoints, phone sign-in, login session refresh, the typed event stream. |
+| [`ts/`](ts/README.md) | The TypeScript client the Rust one was ported from, a small CLI, and the API notes. |
+
+## Your data
+
+- The app stores a login session and a copy of your conversation under
+  `~/Library/Application Support/openpickle`, readable by you only. Signing out removes both.
+- The login session holds a single-use refresh token that changes on every refresh. Only one
+  copy of the app may run, and the session file should not be copied to another tool.
+- Captures, exported messages and session files hold bearer tokens and personal data. In this
+  repository they belong in `.capture/`, which git ignores.
