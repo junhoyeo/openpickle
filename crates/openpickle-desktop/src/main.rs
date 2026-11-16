@@ -8,11 +8,11 @@ fn main() {
     let (commands, updates) = match backend::start() {
         Ok(ends) => ends,
         Err(backend::StartError::AlreadyRunning) => {
-            eprintln!("Pickle is already running.");
+            eprintln!("OpenPickle is already running.");
             return;
         }
         Err(backend::StartError::Store(error)) => {
-            eprintln!("Pickle cannot use its data folder: {error}");
+            eprintln!("OpenPickle cannot use its data folder: {error}");
             std::process::exit(1);
         }
     };
@@ -23,8 +23,8 @@ fn main() {
             cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.set_menus(vec![Menu {
-                name: "Pickle".into(),
-                items: vec![MenuItem::action("Quit Pickle", Quit)],
+                name: "OpenPickle".into(),
+                items: vec![MenuItem::action("Quit OpenPickle", Quit)],
             }]);
             cx.on_window_closed(|cx| {
                 if cx.windows().is_empty() {
