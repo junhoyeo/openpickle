@@ -60,3 +60,16 @@ test("a header override replaces the generated header whatever its case", async 
   expect(sent.filter(([name]) => name.toLowerCase() === "authorization")).toEqual([["authorization", "Bearer override"]]);
 });
 
+test("query options join a path that already has a query", async () => {
+  const { calls, fetch } = recorder(200, "{}");
+  const pickle = new PickleClient({ accessToken: "t", fetch });
+  await pickle.request("GET", "/api/profile?region=KR", { query: { scopes: "a,b" } });
+  await pickle.request("GET", "/api/profile", { query: { region: "KR" } });
+  await pickle.request("GET", "/api/profile", { query: {} });
+  expect(calls.map((call) => call.url.replace(pickle.baseUrl, ""))).toEqual([
+    "/api/profile?region=KR&scopes=a,b",
+    "/api/profile?region=KR",
+    "/api/profile",
+  ]);
+});
+

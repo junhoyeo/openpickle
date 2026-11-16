@@ -457,7 +457,9 @@ export class PickleClient {
       headers[name] = value;
     }
 
-    const response = await this.fetchImpl(this.baseUrl + path + queryString(options.query), {
+    const query = queryString(options.query);
+    const separator = query === "" ? "" : path.includes("?") ? "&" : "?";
+    const response = await this.fetchImpl(this.baseUrl + path + separator + query, {
       method,
       headers,
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
@@ -522,13 +524,15 @@ export class PickleClient {
   }
 }
 
-/** The app leaves commas unescaped (`scopes=a,b`); everything else is percent-encoded. */
+/**
+ * `a=1&b=2`, without the leading `?`. The app leaves commas unescaped (`scopes=a,b`); everything
+ * else is percent-encoded.
+ */
 function queryString(query: RequestOptions["query"]): string {
-  if (!query) return "";
-  const pairs = Object.entries(query)
+  return Object.entries(query ?? {})
     .filter((entry): entry is [string, string | number] => entry[1] !== undefined)
-    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value).replace(/%2C/g, ",")}`);
-  return pairs.length ? `?${pairs.join("&")}` : "";
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value).replace(/%2C/g, ",")}`)
+    .join("&");
 }
 
 /** 32 random bytes in unpadded base64url, the nonce format the app uses. */
