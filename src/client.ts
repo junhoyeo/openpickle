@@ -180,7 +180,7 @@ export class PickleClient {
 
   /**
    * `POST /api/account/register`. The app calls it on every launch; for an existing account it
-   * returns the account state (`registered: false`) and changes nothing visible.
+   * returned the account state with `registered: false` every time in the captures.
    */
   registerAccount(): Promise<RegisterResponse> {
     return this.request("POST", "/api/account/register", {

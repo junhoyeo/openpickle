@@ -12,7 +12,7 @@ export interface StatusOk {
 }
 
 export interface ApiErrorBody {
-  /** Machine-readable reason, e.g. `token_expired`, `unauthenticated`, `location_disabled`. */
+  /** Machine-readable reason, e.g. `location_disabled`, or `token_expired` (seen on a live probe). */
   detail: string;
 }
 
@@ -163,7 +163,7 @@ export interface PortraitReferenceView {
 }
 
 /**
- * `POST /api/session`. The response carries about 110 keys, most of them client
+ * `POST /api/session`. The response carries about 100 keys, most of them client
  * configuration for the 3D world; the ones a client is likely to use are typed.
  */
 export interface SessionResponse extends AccountState {
@@ -316,7 +316,7 @@ export interface Reaction {
   /** `client_msg_id` / message id the reaction is attached to. */
   target_id: string;
   part: number;
-  actor: Open<"assistant" | "user">;
+  actor: Open<"assistant">;
   emoji: string;
   /** Unix seconds */
   at: number;
@@ -414,6 +414,7 @@ export interface HistoryDelta {
 export interface SendMessageResponse {
   status: "ok";
   responder: Open<"chat">;
+  /** `null` in every observed response; a number is assumed possible. */
   seq: number | null;
 }
 
@@ -439,8 +440,8 @@ export interface InviteMember {
 
 export interface SocialScopes {
   friends: { friends: Friend[]; birthdays_this_week: unknown[]; friends_reward_granted: boolean };
-  /** `incoming` was empty in the studied traffic; it is assumed to mirror `outgoing`. */
-  requests: { incoming: FriendRequest[]; outgoing: FriendRequest[] };
+  /** `incoming` was empty in the studied traffic. */
+  requests: { incoming: unknown[]; outgoing: FriendRequest[] };
   /** Empty in the studied traffic. */
   blocked: { blocked: unknown[] };
   invite: {
@@ -489,7 +490,7 @@ export interface HandoffsScreen {
 }
 
 export interface ExtraConversation {
-  /** `<kind>:<id>`, e.g. `phone:7a7539eef672`. */
+  /** `<kind>:<id>`, e.g. `phone:<call_id>`. */
   id: string;
   kind: Open<"phone" | "clone">;
   title: string;

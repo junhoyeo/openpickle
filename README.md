@@ -59,8 +59,9 @@ phone's next refresh ends the client's chain). How the server treats a spent tok
 not tested. A separate sign-in for the client would avoid this, but the sign-in calls (phone
 code, Apple, Kakao, LINE) are not in the captures.
 
-The server rejects an old token with `401 {"detail":"token_expired"}` and a missing one with
-`401 {"detail":"unauthenticated"}`. Both raise `PickleApiError`; `error.detail` holds the reason.
+Any non-2xx response raises `PickleApiError`, with `error.detail` set when the body has a reason.
+A live probe with an expired token got `401 {"detail":"token_expired"}`, and one without a token
+got `401 {"detail":"unauthenticated"}`.
 
 ## Identity headers
 
@@ -81,7 +82,7 @@ All of these were in the captures. `scripts/verify-capture.ts` checks each one a
 | --- | --- | --- | --- |
 | POST | `/api/login-sessions/refresh` | `refreshLoginSession(token)` | Rotates the refresh token. See [Authentication](#authentication). |
 | POST | `/api/account/register` | `registerAccount()` | Called on every launch. Returns account state; `registered: false` for an existing account. |
-| POST | `/api/session` | `startSession(overrides?)` | Account, plan, credits, character, and a LiveKit room token. About 110 keys; the useful ones are typed. |
+| POST | `/api/session` | `startSession(overrides?)` | Account, plan, credits, character, and a LiveKit room token. About 100 keys; the useful ones are typed. |
 | GET | `/api/sync` | `sync()` | All rooms with `last_seq`, `read_seq`, unread counts. |
 | GET | `/api/events` | `events()` | Server-sent events. See [Events](#events). |
 | GET | `/api/rooms/{room}/history/delta?after_seq=&limit=` | `getHistoryDelta(room, { afterSeq, limit })`, `history(room)` | Messages, reactions and card states after a sequence number, up to 500 per page. `history()` pages from the start. |
@@ -136,8 +137,8 @@ error handling.
 
 `events()` opens `GET /api/events` and yields typed events until the server closes the stream.
 The server first sends its current state (usage, character status, widgets, sync revision), then
-changes as they happen. Reconnecting is up to the caller; the server suggests a delay with
-`retry:` (1–2 seconds in the capture).
+changes as they happen. Reconnecting is up to the caller. The server suggests a delay with
+`retry:` (1.25 s and 2.2 s in the captures), but `events()` does not pass that value on.
 
 | `event` | `data.kind` | Payload |
 | --- | --- | --- |

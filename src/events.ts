@@ -114,7 +114,14 @@ export type UsageEvent =
       rewards: JellyRewards;
       batch: { accepted: number; eating: boolean; rev: number };
     }
-  | { kind: "plan"; plan: Plan["id"]; plan_rank: number; expires_at: string | null; credits: CreditUsage };
+  | {
+      kind: "plan";
+      plan: Plan["id"];
+      plan_rank: number;
+      /** `null` in every observed event (free plan). */
+      expires_at: string | null;
+      credits: CreditUsage;
+    };
 
 export type WidgetEvent =
   | {
