@@ -365,7 +365,7 @@ async fn drain_events(client: &PickleClient) -> Result<(), String> {
 fn describe(error: &Error) -> String {
     match error {
         Error::Api(api) => format!("API error with status {}", api.status),
-        Error::Decode { source, .. } | Error::Event(source) => format!(
+        Error::Decode { source, .. } => format!(
             "response did not parse ({:?} error at line {} column {})",
             source.classify(),
             source.line(),

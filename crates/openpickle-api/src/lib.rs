@@ -60,8 +60,6 @@ pub enum Error {
     },
     #[error("could not encode the request body: {0}")]
     Encode(serde_json::Error),
-    #[error("event stream sent invalid JSON: {0}")]
-    Event(serde_json::Error),
     #[error("not a JWT")]
     InvalidToken,
     #[error("value is not allowed in an HTTP header")]

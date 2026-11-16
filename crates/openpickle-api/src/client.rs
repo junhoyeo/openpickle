@@ -945,10 +945,8 @@ fn event_stream(response: Response) -> impl Stream<Item = Result<PickleEvent>> +
                         .ready
                         .push_back(Ok(PickleEvent::Retry(Duration::from_millis(ms))));
                 }
-                match PickleEvent::from_frame(&frame) {
-                    Ok(Some(event)) => state.ready.push_back(Ok(event)),
-                    Ok(None) => {}
-                    Err(source) => state.ready.push_back(Err(Error::Event(source))),
+                if let Some(event) = PickleEvent::from_frame(&frame) {
+                    state.ready.push_back(Ok(event));
                 }
             }
         }

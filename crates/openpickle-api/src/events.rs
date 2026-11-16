@@ -275,9 +275,11 @@ pub enum PickleEvent {
 
 impl PickleEvent {
     /// Parses a frame's payload. Frames without data (the leading `retry:` frame) yield `None`.
-    pub fn from_frame(frame: &SseFrame) -> Result<Option<Self>, serde_json::Error> {
+    /// A payload that is not what this crate expects never fails: it comes back as `Unknown`,
+    /// as JSON when it is JSON and as a string otherwise.
+    pub fn from_frame(frame: &SseFrame) -> Option<Self> {
         if frame.data.is_empty() {
-            return Ok(None);
+            return None;
         }
         fn typed<T: serde::de::DeserializeOwned>(
             data: &[u8],
@@ -295,13 +297,13 @@ impl PickleEvent {
             "room" => typed(data, |v| Self::Room(Box::new(v))),
             _ => None,
         };
-        match event {
-            Some(event) => Ok(Some(event)),
-            None => Ok(Some(Self::Unknown {
+        Some(event.unwrap_or_else(|| {
+            Self::Unknown {
                 name: frame.event.clone(),
-                data: serde_json::from_slice(data)?,
-            })),
-        }
+                data: serde_json::from_slice(data)
+                    .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(data).into_owned())),
+            }
+        }))
     }
 }
 
@@ -359,6 +361,23 @@ mod tests {
     }
 
     #[test]
+    fn a_payload_that_is_not_json_is_kept_as_text() {
+        let frame = SseFrame {
+            event: "notice".into(),
+            data: b"plain words".to_vec(),
+            id: None,
+            retry: None,
+        };
+        match PickleEvent::from_frame(&frame) {
+            Some(PickleEvent::Unknown { name, data }) => {
+                assert_eq!(name, "notice");
+                assert_eq!(data, Value::String("plain words".into()));
+            }
+            other => panic!("expected an unknown event, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn sse_parser_is_independent_of_chunk_boundaries() {
         let whole = parse_split(STREAM.len());
         let names: Vec<&str> = whole.iter().map(|f| f.event.as_str()).collect();
@@ -376,10 +395,7 @@ mod tests {
             assert_eq!(parse_split(at), whole, "split at byte {at}");
         }
 
-        let events: Vec<PickleEvent> = whole
-            .iter()
-            .filter_map(|f| PickleEvent::from_frame(f).unwrap())
-            .collect();
+        let events: Vec<PickleEvent> = whole.iter().filter_map(PickleEvent::from_frame).collect();
         assert_eq!(events.len(), 4, "the retry-only frame yields no event");
         assert!(matches!(
             events[0],
