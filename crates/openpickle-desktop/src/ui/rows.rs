@@ -4,13 +4,14 @@ use std::{ops::Range, time::Duration};
 
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Div, FontWeight, HighlightStyle, InteractiveText,
-    SharedString, StyledText, UnderlineStyle, Window, div, prelude::*, px, relative, svg,
+    Pixels, SharedString, StyledText, UnderlineStyle, Window, div, prelude::*, px, relative, svg,
 };
 
 use crate::{
     content::{Card, CardRow, RichText, SpanKind},
     model::{Part, Request, RequestStatus, Row, RowKind, Side},
     theme,
+    ui::wrap::keep_words,
 };
 
 /// Widths from the design column (408 pt of content): bubbles hug their text up to these.
@@ -18,7 +19,15 @@ const THEIRS_MAX: f32 = 394. / 408.;
 const MINE_MAX: f32 = 304. / 408.;
 const REQUEST_WIDTH: f32 = 342.;
 
-pub fn render_row(row: &Row, index: usize, on_link: fn(&str, &mut Window, &mut App)) -> AnyElement {
+/// What drawing a row needs besides the row itself.
+pub struct RowContext<'a> {
+    pub window: &'a Window,
+    /// Width of the message column without its gutters.
+    pub content_width: Pixels,
+    pub on_link: fn(&str, &mut Window, &mut App),
+}
+
+pub fn render_row(row: &Row, index: usize, cx: &RowContext) -> AnyElement {
     let top_gap = if index == 0 {
         px(0.)
     } else if row.joined_above {
@@ -28,9 +37,10 @@ pub fn render_row(row: &Row, index: usize, on_link: fn(&str, &mut Window, &mut A
     };
     let line = div().w_full().flex().px(theme::GUTTER).pt(top_gap);
     match &row.kind {
+        // The design puts a timestamp 8 pt above the next row, not the usual 12.
         RowKind::Time(text) => line
             .justify_center()
-            .pb(px(-4.))
+            .mb(px(-4.))
             .text_size(px(13.))
             .line_height(px(18.))
             .text_color(theme::color(theme::TEXT_FAINT))
@@ -44,7 +54,7 @@ pub fn render_row(row: &Row, index: usize, on_link: fn(&str, &mut Window, &mut A
             };
             let surface = shaped(row, matches!(part, Part::Bubble(_) | Part::Task(_)));
             let content = match part {
-                Part::Bubble(text) => bubble(surface, row.side, text, index, on_link),
+                Part::Bubble(text) => bubble(surface, row.side, text, index, cx),
                 Part::Task(title) => surface
                     .px(px(14.))
                     .py(px(11.))
@@ -55,7 +65,7 @@ pub fn render_row(row: &Row, index: usize, on_link: fn(&str, &mut Window, &mut A
                 Part::Card(card) => div()
                     .py(px(2.))
                     .w(relative(THEIRS_MAX))
-                    .child(info_card(surface, card, index, on_link)),
+                    .child(info_card(surface, card, index, cx)),
                 Part::Request(request) => div().py(px(2.)).child(request_card(surface, request)),
             };
             line.child(content).into_any_element()
@@ -94,42 +104,41 @@ fn shaped(row: &Row, is_bubble: bool) -> Div {
     }
 }
 
-fn bubble(
-    surface: Div,
-    side: Side,
-    text: &RichText,
-    index: usize,
-    on_link: fn(&str, &mut Window, &mut App),
-) -> Div {
+fn bubble(surface: Div, side: Side, text: &RichText, index: usize, cx: &RowContext) -> Div {
     let max = if side == Side::Mine {
         MINE_MAX
     } else {
         THEIRS_MAX
     };
+    let padding = px(14.);
+    let wrap = cx.content_width * max - padding * 2.;
     surface
-        .px(px(14.))
+        .px(padding)
         .py(px(11.))
         .max_w(relative(max))
         .child(rich_text(
             text,
             ("bubble", index),
             side == Side::Mine,
-            on_link,
+            Some(wrap),
+            cx,
         ))
 }
 
-/// Text with its bold, link and code ranges styled; links are clickable.
+/// Text with its bold, link and code ranges styled; links are clickable. `wrap` is the width
+/// body text may fill; with it, lines break between words only.
 pub fn rich_text(
     text: &RichText,
     id: (&'static str, usize),
     on_accent: bool,
-    on_link: fn(&str, &mut Window, &mut App),
+    wrap: Option<Pixels>,
+    cx: &RowContext,
 ) -> AnyElement {
-    let link_color = if on_accent {
-        theme::color(theme::ON_MINE)
+    let link_color = theme::color(if on_accent {
+        theme::ON_MINE
     } else {
-        theme::color(theme::LINK)
-    };
+        theme::LINK
+    });
     let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::with_capacity(text.spans.len());
     let mut links: Vec<(Range<usize>, SharedString)> = Vec::new();
     for span in &text.spans {
@@ -165,12 +174,16 @@ pub fn rich_text(
         };
         highlights.push((span.range.clone(), style));
     }
-    let styled =
-        StyledText::new(SharedString::from(text.text.clone())).with_highlights(flatten(highlights));
+    let content = match wrap {
+        Some(width) => keep_words(&text.text, width, cx.window),
+        None => SharedString::from(text.text.clone()),
+    };
+    let styled = StyledText::new(content).with_highlights(flatten(highlights));
     if links.is_empty() {
         return styled.into_any_element();
     }
     let ranges = links.iter().map(|(range, _)| range.clone()).collect();
+    let on_link = cx.on_link;
     InteractiveText::new(id, styled)
         .on_click(ranges, move |link, window, cx| {
             on_link(&links[link].1, window, cx)
@@ -204,15 +217,18 @@ fn flatten(
     flat
 }
 
-fn info_card(
-    surface: Div,
-    card: &Card,
-    index: usize,
-    on_link: fn(&str, &mut Window, &mut App),
-) -> Div {
+fn info_card(surface: Div, card: &Card, index: usize, cx: &RowContext) -> Div {
+    let padding = px(18.);
+    let wrap = Some(cx.content_width * THEIRS_MAX - padding * 2.);
+    let small = || {
+        div()
+            .text_size(theme::SMALL)
+            .line_height(theme::SMALL_LINE)
+            .text_color(theme::color(theme::TEXT_MUTED))
+    };
     let mut body = surface
         .w_full()
-        .px(px(18.))
+        .px(padding)
         .pt(px(20.))
         .pb(px(18.))
         .flex()
@@ -222,23 +238,18 @@ fn info_card(
             title,
             ("card-title", index),
             false,
-            on_link,
+            None,
+            cx,
         )));
     }
     if let Some(subtitle) = &card.subtitle {
-        body = body.child(
-            div()
-                .pt(px(4.))
-                .text_size(theme::SMALL)
-                .line_height(theme::SMALL_LINE)
-                .text_color(theme::color(theme::TEXT_MUTED))
-                .child(rich_text(
-                    subtitle,
-                    ("card-subtitle", index),
-                    false,
-                    on_link,
-                )),
-        );
+        body = body.child(small().pt(px(4.)).child(rich_text(
+            subtitle,
+            ("card-subtitle", index),
+            false,
+            None,
+            cx,
+        )));
     }
     let mut rows = div().flex().flex_col().gap(px(9.));
     if card.title.is_some() || card.subtitle.is_some() {
@@ -252,36 +263,24 @@ fn info_card(
                 .flex()
                 .flex_col()
                 .gap(px(1.))
-                .child(
-                    div()
-                        .text_size(theme::SMALL)
-                        .line_height(theme::SMALL_LINE)
-                        .text_color(theme::color(theme::TEXT_MUTED))
-                        .child(rich_text(label, ("card-label", id), false, on_link)),
-                )
-                .child(rich_text(value, ("card-value", id), false, on_link)),
+                .child(small().child(rich_text(label, ("card-label", id), false, None, cx)))
+                .child(rich_text(value, ("card-value", id), false, wrap, cx)),
             CardRow::Heading(text) => div()
                 .pt(px(4.))
                 .font_weight(FontWeight::SEMIBOLD)
-                .child(rich_text(text, ("card-heading", id), false, on_link)),
-            CardRow::Text(text) => div().child(rich_text(text, ("card-text", id), false, on_link)),
+                .child(rich_text(text, ("card-heading", id), false, None, cx)),
+            CardRow::Text(text) => div().child(rich_text(text, ("card-text", id), false, wrap, cx)),
             CardRow::Table { cells, header } => {
-                let mut line = div().flex().gap(px(10.));
-                if *header {
-                    line = line
-                        .text_color(theme::color(theme::TEXT_MUTED))
-                        .text_size(theme::SMALL)
-                        .line_height(theme::SMALL_LINE);
-                }
-                for (cell_index, cell) in cells.iter().enumerate() {
-                    line = line.child(div().flex_1().min_w_0().child(rich_text(
+                let line = if *header { small() } else { div() }.flex().gap(px(10.));
+                line.children(cells.iter().enumerate().map(|(cell_index, cell)| {
+                    div().flex_1().min_w_0().child(rich_text(
                         cell,
                         ("card-cell", id * 16 + cell_index),
                         false,
-                        on_link,
-                    )));
-                }
-                line
+                        None,
+                        cx,
+                    ))
+                }))
             }
         });
     }
@@ -289,6 +288,7 @@ fn info_card(
 }
 
 fn request_card(surface: Div, request: &Request) -> Div {
+    let faint = theme::color(theme::TEXT_FAINT);
     let mut card = surface
         .w(px(REQUEST_WIDTH))
         .max_w_full()
@@ -296,54 +296,45 @@ fn request_card(surface: Div, request: &Request) -> Div {
         .pt(px(20.))
         .flex()
         .flex_col()
-        .gap(px(14.));
-    card = card.child(
-        div()
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .text_color(theme::color(theme::TEXT_FAINT))
-            .child(
-                svg()
-                    .path("icons/shield-keyhole.svg")
-                    .size(px(18.))
-                    .flex_none()
-                    .text_color(theme::color(theme::TEXT_FAINT)),
-            )
-            .child(SharedString::from(request.caption.clone())),
-    );
+        .gap(px(14.))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .text_color(faint)
+                .child(
+                    svg()
+                        .path("icons/shield-keyhole.svg")
+                        .size(px(18.))
+                        .flex_none()
+                        .text_color(faint),
+                )
+                .child(SharedString::from(request.caption.clone())),
+        );
     if let Some(question) = &request.question {
         card = card.child(SharedString::from(question.clone()));
     }
+    let settled = request.status != RequestStatus::Pending;
     for option in &request.options {
-        let label = div()
-            .flex_1()
-            .child(SharedString::from(option.label.clone()));
         card = card.child(
             inset_pill()
                 .justify_start()
                 .when(option.chosen, |pill| {
                     pill.bg(theme::color(theme::CHROME_SELECTED))
                 })
-                .when(
-                    !option.chosen && request.status != RequestStatus::Pending,
-                    |pill| pill.text_color(theme::color(theme::TEXT_FAINT)),
-                )
-                .child(label),
+                .when(settled && !option.chosen, |pill| pill.text_color(faint))
+                .child(SharedString::from(option.label.clone())),
         );
     }
     let status = match request.status {
-        RequestStatus::Pending if request.options.is_empty() => Some("Waiting for your answer"),
         RequestStatus::Expired => Some("Expired"),
+        RequestStatus::Pending if request.options.is_empty() => Some("Waiting for your answer"),
         RequestStatus::Answered if request.options.is_empty() => Some("Answered"),
         _ => None,
     };
     if let Some(status) = status {
-        card = card.child(
-            inset_pill()
-                .text_color(theme::color(theme::TEXT_FAINT))
-                .child(status),
-        );
+        card = card.child(inset_pill().text_color(faint).child(status));
     }
     card
 }

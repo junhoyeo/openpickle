@@ -244,6 +244,7 @@ impl Render for LoginView {
             .justify_center()
             .bg(theme::color(theme::PAGE))
             .text_color(theme::color(theme::TEXT))
+            .font_family(theme::FONT)
             .text_size(theme::BODY)
             .line_height(theme::BODY_LINE)
             .child(form)

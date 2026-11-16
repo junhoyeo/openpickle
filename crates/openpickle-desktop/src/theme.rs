@@ -17,6 +17,9 @@ pub const MINE: u32 = 0x9de68d;
 pub const ON_MINE: u32 = 0x000000;
 pub const DANGER: u32 = 0xff6b6b;
 
+/// The system font; Hangul falls back to the system's Korean face.
+pub const FONT: &str = ".SystemUIFont";
+
 pub fn color(hex: u32) -> Hsla {
     rgb(hex).into()
 }

@@ -11,7 +11,7 @@ use crate::{
     theme,
     ui::{
         input::{InputEvent, TextInput},
-        rows::render_row,
+        rows::{RowContext, render_row},
     },
 };
 
@@ -318,8 +318,15 @@ impl Render for ChatView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let messages = list(
             self.list.clone(),
-            cx.processor(|this, index: usize, _, _| {
-                render_row(&this.rows[index], index, open_link)
+            cx.processor(|this, index: usize, window: &mut Window, _| {
+                let content_width =
+                    window.viewport_size().width.min(theme::COLUMN_MAX) - theme::GUTTER * 2.;
+                let context = RowContext {
+                    window,
+                    content_width,
+                    on_link: open_link,
+                };
+                render_row(&this.rows[index], index, &context)
             }),
         )
         .size_full()
@@ -358,6 +365,7 @@ impl Render for ChatView {
             .relative()
             .bg(theme::color(theme::PAGE))
             .text_color(theme::color(theme::TEXT))
+            .font_family(theme::FONT)
             .text_size(theme::BODY)
             .line_height(theme::BODY_LINE)
             .child(
