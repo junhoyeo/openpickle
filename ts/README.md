@@ -1,10 +1,10 @@
 # @openpickle/client
 
 A typed TypeScript client for the Pickle character API (`https://character-api-prod.picklemem.com`),
-the backend of the Pickle iOS app. It was built from five Proxyman captures of the iOS app
-(version 1.1.19, build 202611071128) taken on 2026-11-16 and 2026-11-17, 34 endpoints in all. A
+the backend of the Pickle iOS app. It was built from six Proxyman captures of the iOS app
+(version 1.1.19, build 202611071128) taken on 2026-11-16 and 2026-11-17, 36 endpoints in all. A
 full history export and login session refreshes were run against the live API; phone sign-in has
-only been replayed against its capture. The client covers 30 endpoints. It has no runtime dependencies and
+only been replayed against its capture. The client covers 32 endpoints. It has no runtime dependencies and
 uses `fetch`. It runs on Bun, and on Node versions that load TypeScript directly (tested on
 Node 26); older Node needs a bundler.
 
@@ -104,6 +104,8 @@ All of these were in the captures. `scripts/verify-capture.ts` checks each one a
 | GET | `/api/events` | `events()` | Server-sent events. See [Events](#events). |
 | GET | `/api/rooms/{room}/history` | `getHistory(room)` | The newest messages of a room (up to 200), reactions inline. The app calls it after a fresh sign-in. |
 | GET | `/api/rooms/{room}/history/delta?after_seq=&limit=` | `getHistoryDelta(room, { afterSeq, limit })`, `history(room)` | Messages, reactions and card states after a sequence number, up to 500 per page. `history()` pages from the start. |
+| GET | `/api/rooms/{room}/history/page?limit=&before_seq=` | `getHistoryPage(room, { beforeSeq, limit })` | Up to 250 messages before a sequence number, with reactions and card states. See [History pages and attachments](#history-pages-and-attachments). |
+| GET | `/api/attachments/{path}/thumbnail` | `getAttachmentThumbnail(path)` | A JPEG preview of a photo or PDF in a message. Returns `{ bytes, contentType }`. |
 | POST | `/api/rooms/{room}/messages` | `sendMessage(room, text, { clientMsgId?, inCall?, context? })` | Returns `{ status, responder, seq: null }`. The reply arrives on `events()`. `context` marks a message sent from an [Explore](#explore) offer. |
 | PUT | `/api/rooms/{room}/read` | `markRead(room, seq)` | Moves this device's read cursor. |
 | GET | `/api/character` | `getCharacter()` | Look, level, XP, energy, jelly. |
@@ -141,9 +143,6 @@ error handling.
 ### Not in the captures
 
 - **Apple, Kakao and LINE sign-in.** Only phone sign-in was captured.
-- **Older history pages.** `getHistory()` returns the newest 200 messages; the request the app
-  uses to page further back was not captured. `history()` reads everything through
-  `history/delta` from sequence 0 instead.
 - **Other screen kinds.** The UI definitions name these data kinds: `activity`, `bubble`,
   `bubbles`, `character-voices`, `character_avatar_history`, `character_colors`,
   `character_settings`, `character_sharing`, `clone_brief`, `connection-detail`, `connections`,
@@ -279,6 +278,56 @@ What it did not show: a section id or area outside these, a `context.kind` other
 (so both are open strings), an Explore response that changed between loads, and whether the
 server needs the impressions report before an offer message is accepted.
 
+## History pages and attachments
+
+`getHistoryPage(room, { beforeSeq, limit })` calls
+`GET /api/rooms/{room}/history/page?limit=250&before_seq=<seq>`, the request the app uses to
+scroll back through a room. The parameters go in that order, `limit` first. The response:
+
+```json
+{
+  "v": 1,
+  "messages": [{ "role": "user", "id": "m-7", "text": "older", "at": 1700000000, "seq": 7 }],
+  "reactions": [{ "seq": 9, "target_id": "m-7", "part": 0, "actor": "assistant", "emoji": "👍", "at": 1700000070 }],
+  "card_states": [{ "seq": 12, "id": "req-1", "state": "answered", "option_id": "yes" }],
+  "has_more": true,
+  "next_before": 7
+}
+```
+
+`messages` are the messages before `before_seq`, oldest first, and have no inline `reactions`.
+While `has_more` is true, `next_before` is the oldest `seq` of the page: pass it as the next
+`beforeSeq`. The `attachments` CLI command starts from `getHistory()` and pages back from its
+oldest message the same way.
+
+Messages refer to photos and files by attachment path, `attachments/<date>/<file name>`:
+
+- `attachments`: the paths a message of yours carries.
+- `image_meta`: path to `{ w, h, blurhash }`, for photos of yours and images the character sent.
+- `file_meta`: path to `{ name, size, pages? }` (`size` in bytes, `pages` for PDFs), for files
+  the character sent.
+- `inline_images` and `inline_files`: a path the character wrote in its reply (such as
+  `downloads/report.pdf`) to the attachment path it was stored under.
+
+`getAttachmentThumbnail(path)` calls `GET /api/attachments/{path}/thumbnail` and returns
+`{ bytes, contentType }`, a JPEG. Each path segment is percent-encoded on its own, so
+`attachments/2026-01-02/여행 계획.pdf` becomes
+`/api/attachments/attachments/2026-01-02/%EC%97%AC%ED%96%89%20%EA%B3%84%ED%9A%8D.pdf/thumbnail`.
+The app sends this request with the bearer token and the common headers, but without its
+`X-Client-*` and `X-Pickle-*` headers, and so does the client.
+
+What the capture showed (one session): 4 history pages of the character room, back to its first
+message (44, 250, 250 and 165 messages, the last with `has_more: false`). The app started below
+the room's `last_seq`, at messages it did not hold yet, and did not call `getHistory()` first.
+On the last page `next_before` was 1, not the oldest `seq`. Card states were `answered`,
+`expired` or `superseded`. 12 thumbnails, all `200 image/jpeg`: 9 of photos and 3 of PDFs with
+Korean file names, two of them with spaces. Across the pages, 7 messages had `attachments`, 12 had `image_meta`, and one had
+`file_meta` and `inline_files` with PDF, spreadsheet and text files.
+
+What it did not show: a thumbnail of a spreadsheet or text file, a thumbnail request that failed,
+the full-size attachment, a `limit` other than 250, and paging in a room other than your
+character's.
+
 ## Events
 
 `events()` opens `GET /api/events` and yields typed events until the server closes the stream.
@@ -331,7 +380,7 @@ bun src/cli.ts token                # claims and seconds left of PICKLE_TOKEN
 bun install
 bun run typecheck
 bun test
-bun run verify:capture ~/Downloads/character-api-prod.picklemem.com_11-17-2026-01-44-56.proxymanlogv2
+bun run verify:capture ~/Downloads/character-api-prod.picklemem.com_11-17-2026-02-42-21.proxymanlogv2
 ```
 
 The client was also run against the live API. With an access token from the second capture,
