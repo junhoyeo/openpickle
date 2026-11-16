@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { PickleApiError, PickleClient, decodeAccessToken } from "../src/client.ts";
-import type { ExploreSectionsScreen, MessageSearchScreen, Offer } from "../src/types.ts";
+import type { ExploreSectionsScreen, HistoryPage, MessageSearchScreen, Offer } from "../src/types.ts";
 
 function recorder(status: number, body: string) {
   const calls: { url: string; init: RequestInit }[] = [];
@@ -164,4 +164,27 @@ test("sendMessage sends a context only when given one", async () => {
     '{"text":"hi","client_msg_id":"m1","in_call":false}',
     '{"text":"Find refunds I am owed","client_msg_id":"m2","in_call":false,"context":{"id":"offer-1","kind":"offer"}}',
   ]);
+});
+
+test("getHistoryPage asks for messages before a sequence number, limit first", async () => {
+  const body: HistoryPage = {
+    v: 1,
+    messages: [
+      { role: "user", id: "m-7", text: "older", at: 1700000000, seq: 7, attachments: ["attachments/2026-01-02/scan 1.pdf"] },
+      { role: "assistant", id: "m-8", text: "<bubble>reply</bubble>", at: 1700000060, seq: 8 },
+    ],
+    reactions: [{ seq: 9, target_id: "m-7", part: 0, actor: "assistant", emoji: "👍", at: 1700000070 }],
+    card_states: [],
+    has_more: true,
+    next_before: 7,
+  };
+  const { calls, fetch } = recorder(200, JSON.stringify(body));
+  const pickle = new PickleClient({ accessToken: "t", fetch });
+  expect(await pickle.getHistoryPage("room-1", { beforeSeq: 12, limit: 2 })).toEqual(body);
+  await pickle.getHistoryPage("room-1", { beforeSeq: 7 });
+  expect(calls.map((call) => call.url.replace(pickle.baseUrl, ""))).toEqual([
+    "/api/rooms/room-1/history/page?limit=2&before_seq=12",
+    "/api/rooms/room-1/history/page?limit=250&before_seq=7",
+  ]);
+  expect(calls[0]!.init.method).toBe("GET");
 });

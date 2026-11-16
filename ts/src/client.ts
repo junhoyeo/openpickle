@@ -5,6 +5,7 @@ import type {
   EnclaveNode,
   ExploreSectionsScreen,
   HistoryDelta,
+  HistoryPage,
   HistoryWindow,
   KnownScreens,
   LoginSessionIssued,
@@ -267,6 +268,16 @@ export class PickleClient {
   getHistoryDelta(roomId: string, options: { afterSeq: number; limit?: number }): Promise<HistoryDelta> {
     return this.request("GET", `/api/rooms/${encodeURIComponent(roomId)}/history/delta`, {
       query: { after_seq: options.afterSeq, limit: options.limit ?? 500 },
+    });
+  }
+
+  /**
+   * `GET /api/rooms/{room}/history/page`: up to `limit` messages before `beforeSeq`, with their
+   * reactions and card states. Pass `next_before` as the next `beforeSeq` while `has_more`.
+   */
+  getHistoryPage(roomId: string, options: { beforeSeq: number; limit?: number }): Promise<HistoryPage> {
+    return this.request("GET", `/api/rooms/${encodeURIComponent(roomId)}/history/page`, {
+      query: { limit: options.limit ?? 250, before_seq: options.beforeSeq },
     });
   }
 

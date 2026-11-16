@@ -52,6 +52,10 @@ const routes: [method: string, path: RegExp, call: Call][] = [
     const q = new URLSearchParams(f.query);
     return c.getHistoryDelta(room!, { afterSeq: Number(q.get("after_seq")), limit: Number(q.get("limit")) });
   }],
+  ["GET", /^\/api\/rooms\/([^/]+)\/history\/page$/, (c, f, _j, [room]) => {
+    const q = new URLSearchParams(f.query);
+    return c.getHistoryPage(room!, { beforeSeq: Number(q.get("before_seq")), limit: Number(q.get("limit")) });
+  }],
   ["POST", /^\/api\/rooms\/([^/]+)\/messages$/, (c, _f, j, [room]) =>
     c.sendMessage(room!, j.text, { clientMsgId: j.client_msg_id, inCall: j.in_call, context: j.context })],
   ["PUT", /^\/api\/rooms\/([^/]+)\/read$/, (c, _f, j, [room]) => c.markRead(room!, j.seq)],
