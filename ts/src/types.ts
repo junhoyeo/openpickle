@@ -436,6 +436,12 @@ export interface HistoryDelta {
   read_seq: number;
 }
 
+/** What a message was sent from. Only `offer` (an Explore offer, `id` = its `offer_id`) was seen. */
+export interface MessageContext {
+  id: string;
+  kind: Open<"offer">;
+}
+
 export interface SendMessageResponse {
   status: "ok";
   responder: Open<"chat">;
@@ -569,12 +575,60 @@ export interface MessageSearchScreen {
   items: MessageSearchItem[];
 }
 
+/** The life areas Explore groups offers by, in the order of `ExploreSectionsScreen.areas`. */
+export type OfferArea = Open<"money" | "shopping" | "health" | "people" | "work" | "travel" | "home" | "fun">;
+
+/** Something the character offers to do for you, shown on the Explore screen. */
+export interface Offer {
+  offer_id: string;
+  title: string;
+  detail: string;
+  /** The message the app sends to the character when the offer is tapped. */
+  cta_label: string;
+  /** URL of a PNG icon. */
+  icon_image: string;
+  /** SF Symbol name, one per area, e.g. `banknote` for `money`. */
+  icon_symbol: string;
+  area: OfferArea;
+  /** e.g. `1,234 people asked for this`; empty on a few offers. */
+  accepted_users_label: string;
+  /** What the character will do, in order; often empty. */
+  steps: string[];
+  /** Usually `[area]`. */
+  areas: OfferArea[];
+}
+
+export interface ExploreSection {
+  /** e.g. `popular`, `money_back`, `travel` */
+  section_id: string;
+  title: string;
+  /** Every offer of the section. The app shows `preview_count` of them before it is expanded. */
+  items: Offer[];
+  preview_count: number;
+  expand_count: number;
+  /** The areas of the section's offers. */
+  areas: OfferArea[];
+}
+
+export interface ExploreSectionsScreen {
+  kind: "explore-sections";
+  areas: OfferArea[];
+  /** The offers of the `popular` section. */
+  popular_ids: string[];
+  sections: ExploreSection[];
+  /** The offers past each section's preview, each once. */
+  more_items: (Offer & { section_id: string })[];
+  /** Every offer once, in the server's ranking, without `steps`. */
+  ranked_items: (Omit<Offer, "steps"> & { section_id: string })[];
+}
+
 /** Screen kinds whose `/api/screens/<kind>` response was present in traffic. */
 export interface KnownScreens {
   handoffs: HandoffsScreen;
   "extra-conversations": ExtraConversationsScreen;
   "roulette-promo": RoulettePromoScreen;
   "message-search": MessageSearchScreen;
+  "explore-sections": ExploreSectionsScreen;
 }
 
 // ---- Device ----

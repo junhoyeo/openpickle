@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { PickleApiError, PickleClient, decodeAccessToken } from "../src/client.ts";
-import type { MessageSearchScreen } from "../src/types.ts";
+import type { ExploreSectionsScreen, MessageSearchScreen, Offer } from "../src/types.ts";
 
 function recorder(status: number, body: string) {
   const calls: { url: string; init: RequestInit }[] = [];
@@ -113,4 +113,55 @@ test("searchMessages percent-encodes the query and returns the snippet runs", as
   expect(calls[0]!.init.method).toBe("GET");
   expect(result).toEqual(body);
   expect(result.items[0]!.segments.filter((s) => s.match).map((s) => s.text)).toEqual(["점심 메뉴"]);
+});
+
+const offer: Offer = {
+  offer_id: "offer-1",
+  title: "Find a refund",
+  detail: "Check recent orders for a refund you are owed.",
+  cta_label: "Find refunds I am owed",
+  icon_image: "https://example.com/icons/money.png",
+  icon_symbol: "banknote",
+  area: "money",
+  accepted_users_label: "1,234 people asked for this",
+  steps: ["Read order emails", "List refunds"],
+  areas: ["money"],
+};
+
+test("getExploreSections reads the Explore screen", async () => {
+  const { steps: _steps, ...ranked } = offer;
+  const body: ExploreSectionsScreen = {
+    kind: "explore-sections",
+    areas: ["money", "fun"],
+    popular_ids: ["offer-1"],
+    sections: [{ section_id: "popular", title: "Popular", items: [offer], preview_count: 1, expand_count: 0, areas: ["money"] }],
+    more_items: [],
+    ranked_items: [{ ...ranked, section_id: "popular" }],
+  };
+  const { calls, fetch } = recorder(200, JSON.stringify(body));
+  const pickle = new PickleClient({ accessToken: "t", fetch });
+  expect(await pickle.getExploreSections()).toEqual(body);
+  expect(calls[0]!.url).toBe(`${pickle.baseUrl}/api/screens/explore-sections`);
+  expect(calls[0]!.init.method).toBe("GET");
+  expect(calls[0]!.init.body).toBeUndefined();
+});
+
+test("reportOfferImpressions sends the shown offer ids", async () => {
+  const { calls, fetch } = recorder(200, "{}");
+  const pickle = new PickleClient({ accessToken: "t", fetch });
+  expect(await pickle.reportOfferImpressions(["offer-1", "offer-2"])).toEqual({});
+  expect(calls[0]!.url).toBe(`${pickle.baseUrl}/api/offers/impressions`);
+  expect(calls[0]!.init.method).toBe("POST");
+  expect(calls[0]!.init.body).toBe('{"offer_ids":["offer-1","offer-2"]}');
+});
+
+test("sendMessage sends a context only when given one", async () => {
+  const { calls, fetch } = recorder(200, '{"status":"ok","responder":"chat","seq":null}');
+  const pickle = new PickleClient({ accessToken: "t", fetch });
+  await pickle.sendMessage("room-1", "hi", { clientMsgId: "m1" });
+  await pickle.sendMessage("room-1", offer.cta_label, { clientMsgId: "m2", context: { id: offer.offer_id, kind: "offer" } });
+  expect(calls.map((call) => call.init.body)).toEqual([
+    '{"text":"hi","client_msg_id":"m1","in_call":false}',
+    '{"text":"Find refunds I am owed","client_msg_id":"m2","in_call":false,"context":{"id":"offer-1","kind":"offer"}}',
+  ]);
 });

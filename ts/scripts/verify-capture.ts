@@ -53,15 +53,17 @@ const routes: [method: string, path: RegExp, call: Call][] = [
     return c.getHistoryDelta(room!, { afterSeq: Number(q.get("after_seq")), limit: Number(q.get("limit")) });
   }],
   ["POST", /^\/api\/rooms\/([^/]+)\/messages$/, (c, _f, j, [room]) =>
-    c.sendMessage(room!, j.text, { clientMsgId: j.client_msg_id, inCall: j.in_call })],
+    c.sendMessage(room!, j.text, { clientMsgId: j.client_msg_id, inCall: j.in_call, context: j.context })],
   ["PUT", /^\/api\/rooms\/([^/]+)\/read$/, (c, _f, j, [room]) => c.markRead(room!, j.seq)],
   ["GET", /^\/api\/character$/, (c) => c.getCharacter()],
   ["GET", /^\/api\/profile$/, (c, f) => c.getProfile(new URLSearchParams(f.query).get("region")!)],
   ["GET", /^\/api\/social\/snapshot$/, (c, f) =>
     c.getSocialSnapshot(new URLSearchParams(f.query).get("scopes")!.split(",") as never)],
   ["GET", /^\/api\/screens\/message-search$/, (c, f) => c.searchMessages(new URLSearchParams(f.query).get("query")!)],
+  ["GET", /^\/api\/screens\/explore-sections$/, (c) => c.getExploreSections()],
   ["GET", /^\/api\/screens\/(handoffs|extra-conversations|roulette-promo)$/, (c, _f, _j, [kind]) =>
     c.getScreen(kind!)],
+  ["POST", /^\/api\/offers\/impressions$/, (c, _f, j) => c.reportOfferImpressions(j.offer_ids)],
   ["PUT", /^\/api\/device\/permissions$/, (c, _f, j) => c.reportPermissions(j.snapshots)],
   ["POST", /^\/api\/device\/location\/token$/, (c) => c.requestLocationToken()],
   ["GET", /^\/api\/ui-definitions$/, (c) => c.getUiDefinitions()],

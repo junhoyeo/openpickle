@@ -3,12 +3,14 @@ import type {
   ApiErrorBody,
   Character,
   EnclaveNode,
+  ExploreSectionsScreen,
   HistoryDelta,
   HistoryWindow,
   KnownScreens,
   LoginSessionIssued,
   LoginSessionRefresh,
   LogNodeSummary,
+  MessageContext,
   MessageSearchScreen,
   LogStoreListings,
   LogStoreListingsRequest,
@@ -281,18 +283,19 @@ export class PickleClient {
 
   /**
    * `POST /api/rooms/{room}/messages`. The reply arrives on `events()`: `chat` events carry
-   * `client_msg_id` as the message `id` and as the `target_id` of reactions to it.
+   * `client_msg_id` as the message `id` and as the `target_id` of reactions to it. The app sends
+   * `context` when the message comes from an Explore offer, with the offer's `cta_label` as text.
    */
   async sendMessage(
     roomId: string,
     text: string,
-    options: { clientMsgId?: string; inCall?: boolean } = {},
+    options: { clientMsgId?: string; inCall?: boolean; context?: MessageContext } = {},
   ): Promise<SendMessageResponse & { client_msg_id: string }> {
     const clientMsgId = options.clientMsgId ?? crypto.randomUUID();
     const response = await this.request<SendMessageResponse>(
       "POST",
       `/api/rooms/${encodeURIComponent(roomId)}/messages`,
-      { body: { text, client_msg_id: clientMsgId, in_call: options.inCall ?? false } },
+      { body: { text, client_msg_id: clientMsgId, in_call: options.inCall ?? false, context: options.context } },
     );
     return { ...response, client_msg_id: clientMsgId };
   }
@@ -353,8 +356,8 @@ export class PickleClient {
 
   /**
    * `GET /api/screens/{kind}`: data for a server-driven screen. `handoffs` (tasks and phone calls
-   * the character ran), `extra-conversations`, `roulette-promo` and `message-search` (see
-   * `searchMessages`) were present in traffic.
+   * the character ran), `extra-conversations`, `roulette-promo`, `message-search` (see
+   * `searchMessages`) and `explore-sections` (see `getExploreSections`) were present in traffic.
    */
   getScreen<K extends keyof KnownScreens>(kind: K): Promise<KnownScreens[K]>;
   getScreen(kind: string, query?: RequestOptions["query"]): Promise<unknown>;
@@ -368,6 +371,21 @@ export class PickleClient {
    */
   searchMessages(query: string): Promise<MessageSearchScreen> {
     return this.request("GET", "/api/screens/message-search", { query: { query } });
+  }
+
+  // ---- Explore ----
+
+  /**
+   * `GET /api/screens/explore-sections`: the Explore screen, things the character offers to do,
+   * in sections and as one ranked list.
+   */
+  getExploreSections(): Promise<ExploreSectionsScreen> {
+    return this.request("GET", "/api/screens/explore-sections");
+  }
+
+  /** `POST /api/offers/impressions`: reports which offers were shown. Answered with `{}`. */
+  reportOfferImpressions(offerIds: string[]): Promise<Record<string, never>> {
+    return this.request("POST", "/api/offers/impressions", { body: { offer_ids: offerIds } });
   }
 
   // ---- Device ----
