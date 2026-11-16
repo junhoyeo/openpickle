@@ -6,7 +6,7 @@ use gpui::{
     App, ClipboardItem, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
     ImageSource, ListAlignment, ListState, MouseButton, MouseDownEvent, MouseUpEvent, ObjectFit,
     Pixels, Point, SharedString, Stateful, Subscription, Window, anchored, deferred, div, img,
-    linear_color_stop, linear_gradient, list, prelude::*, px, svg,
+    linear_color_stop, linear_gradient, list, point, prelude::*, px, svg,
 };
 
 use crate::{
@@ -188,11 +188,6 @@ impl ChatView {
     /// While a selection is dragged past the top or bottom of what the conversation shows,
     /// scrolls it that way, so a drag can reach text that is off screen.
     fn follow_drag(&mut self, window: &mut Window) {
-        let mut selection = self.selection.borrow_mut();
-        if !window.is_window_active() {
-            // The release may have gone to whatever took the window's place.
-            selection.release();
-        }
         let pointer = window.mouse_position().y;
         let bottom = window.viewport_size().height - theme::BOTTOM_BAR_HEIGHT;
         let past = if pointer < HEADER_SOLID {
@@ -200,8 +195,16 @@ impl ChatView {
         } else {
             (pointer - bottom).max(px(0.))
         };
-        let scrolling = selection.is_extending() && past != px(0.);
-        selection.set_scrolling(scrolling);
+        let scrolling = {
+            let mut selection = self.selection.borrow_mut();
+            if !window.is_window_active() {
+                // The release may have gone to whatever took the window's place.
+                selection.release();
+            }
+            let scrolling = selection.is_extending() && past != px(0.);
+            selection.set_scrolling(scrolling);
+            scrolling
+        };
         if !scrolling {
             self.scrolled_at = None;
             return;
@@ -214,8 +217,20 @@ impl ChatView {
             .min(Duration::from_millis(50));
         // Deeper past the edge scrolls faster.
         let speed = (past * DRAG_SCROLL_RATE).clamp(-DRAG_SCROLL_MAX, DRAG_SCROLL_MAX);
-        self.list.scroll_by(speed * elapsed.as_secs_f32());
+        self.scroll_by(speed * elapsed.as_secs_f32());
         window.request_animation_frame();
+    }
+
+    /// Scrolls the list by a distance in pixels, down when it is positive.
+    fn scroll_by(&mut self, distance: Pixels) {
+        let (above, below) = list_padding();
+        // While the list follows the newest row it reports a place past its end, so the
+        // place is brought back to the end before the distance is added.
+        let end = self.list.max_offset_for_scrollbar().height + above + below;
+        let top = (-self.list.scroll_px_offset_for_scrollbar().y).min(end);
+        self.list
+            .set_offset_from_scrollbar(point(px(0.), (top + distance).max(px(0.))));
+        self.at_latest = self.list.logical_scroll_top().item_ix >= self.rows.len();
     }
 
     fn context_menu(&self, menu: &ContextMenu, cx: &mut Context<Self>) -> impl IntoElement {
@@ -447,6 +462,12 @@ impl ChatView {
     }
 }
 
+/// The room the list leaves above its first row and below its last, for the header and the
+/// bottom bar.
+fn list_padding() -> (Pixels, Pixels) {
+    (theme::HEADER_HEIGHT, theme::BOTTOM_BAR_HEIGHT + px(16.))
+}
+
 /// A dark pill or circle with a hairline edge: the header buttons, the composer, the tab bar.
 fn chrome(id: &'static str) -> Stateful<Div> {
     div()
@@ -496,8 +517,8 @@ impl Render for ChatView {
             }),
         )
         .size_full()
-        .pt(theme::HEADER_HEIGHT)
-        .pb(theme::BOTTOM_BAR_HEIGHT + px(16.));
+        .pt(list_padding().0)
+        .pb(list_padding().1);
 
         let to_latest = div()
             .absolute()
@@ -575,7 +596,7 @@ impl Render for ChatView {
 mod tests {
     use std::sync::Arc;
 
-    use gpui::{Modifiers, TestAppContext, VisualTestContext, point, size};
+    use gpui::{Modifiers, TestAppContext, VisualTestContext, size};
 
     use super::*;
     use crate::{
