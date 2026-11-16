@@ -6,8 +6,9 @@
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/chat.png" alt="The chat with your Pickle: a question and its answer in bubbles" height="620" />
-  <img src="docs/screenshots/sign-in.png" alt="Sign-in with a phone number" height="620" />
+  <img src="docs/screenshots/chat.png" alt="The chat with your Pickle: a question and its answer in bubbles" height="540" />
+  <img src="docs/screenshots/activity.png" alt="A reply in progress: the character says it is searching the web" height="540" />
+  <img src="docs/screenshots/select.png" alt="Text selected across paragraphs, with the Copy menu open" height="540" />
 </p>
 
 openpickle is not made by, or affiliated with, the company behind Pickle. It talks to the same
@@ -17,12 +18,18 @@ servers the iOS app does, with your own account.
 
 - **Chat with your Pickle from your Mac.** Bubbles, cards, timestamps and the composer follow the
   iOS chat screen. Korean lines break between words, and the text field supports Korean input.
-- **Live.** Your message, the character's replies and what it is doing right now arrive over the
-  server's event stream as they happen.
+- **Live.** Your message, the character's replies and what it is doing right now ("Searching
+  Web…") arrive over the server's event stream as they happen.
+- **Select and copy.** Drag across messages to select text, or right-click for Copy, Copy Message
+  and Select All. Select All takes the whole conversation, not only what is on screen.
 - **Opens at once.** The app keeps the conversation on disk and draws it before it asks the
   network for anything. See [the numbers](#speed).
 - **Its own sign-in.** You sign in with your phone number and a texted code. The app gets a login
   session of its own, so your phone stays signed in.
+
+<p align="center">
+  <img src="docs/screenshots/sign-in.png" alt="Sign-in with a phone number" height="380" />
+</p>
 
 Not built yet: the Explore, Library and Profile tabs, the menu and Invite buttons, voice calls,
 pictures and files, link previews, reactions, answering a request card, and rooms other than the

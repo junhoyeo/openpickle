@@ -20,6 +20,10 @@ cargo run -p openpickle-desktop --example gallery -- login
 - **Live updates** over the server's event stream: your message, the character's replies and what
   it is doing appear as they happen.
 - **Sending**: a message shows at once and is replaced by the server's copy when it arrives.
+- **Selecting and copying**: drag across messages, or right-click for Copy, Copy Message and
+  Select All. Cmd-C and Cmd-A work too when the composer has no selection or text of its own. A
+  selection is read from the conversation, not from the rows on screen, so Select All copies all
+  of it.
 
 Not built: the Explore, Library and Profile tabs, the menu and Invite buttons, the microphone and
 voice calls (all drawn, none active); pictures and files (a message only says how many it has);
@@ -65,5 +69,5 @@ Everything is under the user's application-support directory
 | `src/convert.rs`, `src/content.rs` | History items to messages; message Markdown to bubbles and cards. |
 | `src/model.rs` | Messages to list rows: grouping, joined corners, timestamps. |
 | `src/app.rs` | The root view: sign-in or chat, applying updates. |
-| `src/ui/` | The chat screen, the sign-in screen, the text field (with IME), row drawing, line breaking. |
+| `src/ui/` | The chat screen, the sign-in screen, the text field (with IME), row drawing, text selection, line breaking. |
 | `src/theme.rs`, `assets/icons/` | Colors and sizes read off the Figma frames; Lucide icons (ISC). |
