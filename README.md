@@ -1,9 +1,10 @@
 # picklemem-client
 
 A typed TypeScript client for the Pickle character API (`https://character-api-prod.picklemem.com`),
-the backend of the Pickle iOS app. It was built from a Proxyman capture of the iOS app
-(version 1.1.19, build 202611071128) taken on 2026-11-16: 76 decrypted requests across 25
-endpoints. The client covers 23 of them. It has no runtime dependencies and uses `fetch`.
+the backend of the Pickle iOS app. It was built from two Proxyman captures of the iOS app
+(version 1.1.19, build 202611071128) taken on 2026-11-16, 26 endpoints in all, and checked live
+by exporting a full account history. The client covers 24 endpoints. It has no runtime
+dependencies and uses `fetch`.
 
 ```ts
 import { PickleClient } from "picklemem-client";
@@ -21,31 +22,44 @@ for await (const event of pickle.events()) {
 
 ## Authentication
 
-Every call except `getUiDefinitions()` sends `Authorization: Bearer <token>`. The token is an
-ES256 JWT issued by the API itself:
+Every call except `getUiDefinitions()` and the refresh itself sends `Authorization: Bearer <token>`.
+The token is an ES256 JWT issued by the API:
 
 | claim | meaning |
 | --- | --- |
 | `sub` | user id, `user-live-<uuid>` |
-| `sid` | session id |
+| `sid` | login session id |
 | `exp` | access token expiry: **5 minutes** after `iat` |
-| `sexp` | session expiry: 7 days after `iat` |
+| `sexp` | login session expiry: 7 days after `iat` |
 
-The app gets new tokens on its own, but that call is not in the capture. The captured token was
-issued at 19:12:40 (KST), the same second the app opened a connection that Proxyman did not
-decrypt; decrypted traffic starts at 19:14:35. So this client cannot log in or refresh. Two ways
-to use it today:
+New access tokens come from `POST /api/login-sessions/refresh`. It takes a refresh token
+(`{"login_session_token": "ls_…"}`, no bearer) and returns `login_session_jwt` (the access token),
+`expires_at` (7 days out) and a new `login_session_token`. The app sends
+`X-Pickle-Login-Session-Rotation: 1`: every refresh spends the token it was given.
 
-- Copy the `Authorization` header from a fresh Proxyman capture and use it within 5 minutes.
-  `pickle token` shows how long a token has left.
-- Pass a function as `accessToken`. It is called before every request, so it can return a token
-  from wherever you get fresh ones.
+The client takes either credential:
+
+```ts
+// An access token, or a function that returns a fresh one before every request.
+new PickleClient({ accessToken: "eyJ…" });
+
+// A refresh token. The client refreshes a minute before each access token expires, one refresh
+// at a time, and hands every new refresh token to onRotate. Store it: a lost token ends the
+// login session.
+new PickleClient({
+  loginSession: { token: savedToken, onRotate: (r) => save(r.login_session_token) },
+});
+```
+
+**The refresh token in a capture belongs to the app on your phone.** Because each refresh spends
+the token, the app and this client cannot share one chain: whichever refreshes second holds a
+spent token. Using a token taken from the phone's traffic can sign the phone out (or the
+phone's next refresh ends the client's chain). How the server treats a spent token was
+not tested. A separate sign-in for the client would avoid this, but the sign-in calls (phone
+code, Apple, Kakao, LINE) are not in the captures.
 
 The server rejects an old token with `401 {"detail":"token_expired"}` and a missing one with
 `401 {"detail":"unauthenticated"}`. Both raise `PickleApiError`; `error.detail` holds the reason.
-
-To add refresh: capture an app launch with SSL proxying already on for
-`character-api-prod.picklemem.com` (and any auth host), from before the app opens.
 
 ## Identity headers
 
@@ -58,16 +72,17 @@ new random UUIDs; pass your own to keep them stable.
 
 ## Endpoints
 
-All of these were in the capture. `scripts/verify-capture.ts` checks each one against it (see
+All of these were in the captures. `scripts/verify-capture.ts` checks each one against them (see
 [Verification](#verification)).
 
 | Method | Path | Client method | Notes |
 | --- | --- | --- | --- |
+| POST | `/api/login-sessions/refresh` | `refreshLoginSession(token)` | Rotates the refresh token. See [Authentication](#authentication). |
 | POST | `/api/account/register` | `registerAccount()` | Called on every launch. Returns account state; `registered: false` for an existing account. |
 | POST | `/api/session` | `startSession(overrides?)` | Account, plan, credits, character, and a LiveKit room token. About 110 keys; the useful ones are typed. |
 | GET | `/api/sync` | `sync()` | All rooms with `last_seq`, `read_seq`, unread counts. |
 | GET | `/api/events` | `events()` | Server-sent events. See [Events](#events). |
-| GET | `/api/rooms/{room}/history/delta?after_seq=&limit=` | `getHistoryDelta(room, { afterSeq, limit })` | Items, reactions and card states after a sequence number. |
+| GET | `/api/rooms/{room}/history/delta?after_seq=&limit=` | `getHistoryDelta(room, { afterSeq, limit })`, `history(room)` | Messages, reactions and card states after a sequence number, up to 500 per page. `history()` pages from the start. |
 | POST | `/api/rooms/{room}/messages` | `sendMessage(room, text, { clientMsgId?, inCall? })` | Returns `{ status, responder, seq: null }`. The reply arrives on `events()`. |
 | PUT | `/api/rooms/{room}/read` | `markRead(room, seq)` | Moves this device's read cursor. |
 | GET | `/api/character` | `getCharacter()` | Look, level, XP, energy, jelly. |
@@ -95,12 +110,9 @@ error handling.
 - `POST /api/secure/log/verified`: the app reports the result of its own credential-log
   verification. A client that did not run that verification should not report one.
 
-### Not in the capture
+### Not in the captures
 
-- **Login and token refresh** (see [Authentication](#authentication)).
-- **Message items.** Every `history/delta` response in the capture had an empty `items` list, and
-  the only reply from the character was an emoji reaction. So `HistoryDelta.items` is typed as
-  plain records, and the `chat` event for a character's text reply is not typed yet.
+- **Sign-in.** Only the refresh of an existing login session was captured.
 - **Other screen kinds.** The UI definitions name these data kinds: `activity`, `bubble`,
   `bubbles`, `character-voices`, `character_avatar_history`, `character_colors`,
   `character_settings`, `character_sharing`, `clone_brief`, `connection-catalog`,
@@ -127,10 +139,11 @@ changes as they happen. Reconnecting is up to the caller; the server suggests a 
 
 | `event` | `data.kind` | Payload |
 | --- | --- | --- |
-| `chat` | `user` | Your message as stored: `id` (= `client_msg_id`), `text`, `seq`, `prev_seq`, `at` |
+| `chat` | `user` | Your message as stored: `id` (= `client_msg_id`), `text`, `seq`, `at` |
+| `chat` | `assistant` | A character reply; `text` wraps each chat bubble in `<bubble>…</bubble>` |
 | `chat` | `pending` | `on`: whether the character is working on a turn |
 | `chat` | `responder` | `state`: `chat_turn_started` / `chat_turn_finished` |
-| `chat` | `activity` | `state`: `thinking` / `tool` (with `label`) |
+| `chat` | `activity` | `state`: `thinking` (with `typing`) / `tool` (with `label`) |
 | `chat` | `reaction` | Emoji reaction with `target_id` = the message's `client_msg_id` |
 | `room` | `advanced` | A room's new `last_seq` and its updated summary |
 | `sync` | – | New `rev` of the room list; call `sync()` |
@@ -147,6 +160,7 @@ export PICKLE_TOKEN='eyJhbGciOiJFUzI1NiIs...'   # from the app's Authorization h
 bun src/cli.ts token                # claims and seconds left
 bun src/cli.ts sync
 bun src/cli.ts send character "안녕"
+bun src/cli.ts export ./messages    # full history of every room, one JSON file per room
 bun src/cli.ts events               # one JSON object per line
 bun src/cli.ts screen handoffs
 bun src/cli.ts get /api/secure/transfers
@@ -160,6 +174,11 @@ bun run typecheck
 bun test
 bun run verify:capture ~/Downloads/character-api-prod.picklemem.com_11-16-2026-19-15-36.proxymanlogv2
 ```
+
+The client was also run against the live API with an access token from the second capture:
+`export` read all 14 rooms (1,031 history items, 909 of them in the room with your own
+character). The refresh call
+was not made live, because it would have spent the phone's refresh token.
 
 `verify:capture` replays a Proxyman capture without touching the network. For every recorded
 request it calls the matching client method, with `fetch` replaced by one that answers with the
