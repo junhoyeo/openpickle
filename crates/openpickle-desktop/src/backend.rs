@@ -339,6 +339,27 @@ impl Conversation {
             .collect()
     }
 
+    /// Takes in a message as the event stream announces it: its text, without the attachments,
+    /// the request and the rest that `history/delta` brings. A message that is known already
+    /// keeps those, and an announcement older than what is known changes nothing. Returns the
+    /// message when it changed.
+    fn hear(&mut self, heard: HistoryItem) -> Option<Message> {
+        let id = heard.id.clone();
+        match self.items.get_mut(&id) {
+            Some(known) if heard.seq < known.seq => return None,
+            Some(known) => {
+                known.role = heard.role;
+                known.text = heard.text;
+                known.at = heard.at;
+                known.seq = heard.seq;
+            }
+            None => {
+                self.items.insert(id.clone(), heard);
+            }
+        }
+        self.items.get(&id).map(|item| self.message(item))
+    }
+
     fn head_seq(&self) -> i64 {
         self.items
             .values()
@@ -612,9 +633,9 @@ impl Live {
                 // Shown at once; the next catch-up logs it with everything the event leaves out.
                 if let Ok(item) = serde_json::from_value::<HistoryItem>(
                     serde_json::json!({ "role": role, "id": id, "text": text, "at": at, "seq": seq }),
-                ) {
-                    let changed = self.conversation.apply(vec![item], Vec::new());
-                    self.send(Update::Upsert(changed));
+                ) && let Some(message) = self.conversation.hear(item)
+                {
+                    self.send(Update::Upsert(vec![message]));
                 }
             }
             PickleEvent::Chat(ChatEvent::Pending { on }) => {
@@ -690,6 +711,54 @@ async fn download_avatar(store: &Store, url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_message_announced_again_keeps_what_the_history_said_about_it() {
+        let item = |value: serde_json::Value| serde_json::from_value::<HistoryItem>(value).unwrap();
+        let mut conversation = Conversation::default();
+        // The catch-up read the message with its attachment. The event that announced it was
+        // still waiting in the stream, and is handled afterwards.
+        conversation.apply(
+            vec![item(serde_json::json!({
+                "role": "user", "id": "m", "text": "사진 보낼게", "at": 10.0, "seq": 7,
+                "attachments": ["attachments/2026-11-16/a.png"],
+            }))],
+            Vec::new(),
+        );
+        let announced = serde_json::json!({ "role": "user", "id": "m", "text": "사진 보낼게", "at": 10.0, "seq": 7 });
+        assert!(conversation.hear(item(announced)).is_some());
+        assert_eq!(
+            conversation.items["m"]
+                .attachments
+                .as_deref()
+                .map(<[String]>::len),
+            Some(1)
+        );
+
+        // A newer announcement changes the text and keeps the rest.
+        let edited = serde_json::json!({ "role": "user", "id": "m", "text": "사진 두 장", "at": 10.0, "seq": 9 });
+        conversation.hear(item(edited));
+        assert_eq!(conversation.items["m"].text.as_deref(), Some("사진 두 장"));
+        assert_eq!(
+            conversation.items["m"]
+                .attachments
+                .as_deref()
+                .map(<[String]>::len),
+            Some(1)
+        );
+
+        // One that is older than what is known is ignored.
+        let stale = serde_json::json!({ "role": "user", "id": "m", "text": "사진 보낼게", "at": 10.0, "seq": 7 });
+        assert!(conversation.hear(item(stale)).is_none());
+        assert_eq!(conversation.items["m"].seq, 9);
+
+        // A message heard for the first time is taken as announced.
+        let new = serde_json::json!({ "role": "assistant", "id": "n", "text": "<bubble>네!</bubble>", "at": 11.0, "seq": 10 });
+        assert_eq!(
+            conversation.hear(item(new)).map(|message| message.seq),
+            Some(10)
+        );
+    }
 
     #[tokio::test]
     async fn quit_stops_the_backend() {
