@@ -8,6 +8,9 @@
   "exports": {
     ".": "./src/index.ts"
   },
+  "bin": {
+    "pickle": "./src/cli.ts"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test"
