@@ -73,6 +73,38 @@ pub fn parse_message(text: &str) -> Vec<Block> {
     blocks
 }
 
+/// Text shown as typed, for your own messages: nothing is markup, but web addresses are links.
+pub fn plain_text(text: &str) -> RichText {
+    let mut spans = Vec::new();
+    let mut from = 0;
+    while let Some(found) = text[from..].find("http") {
+        let start = from + found;
+        let rest = &text[start..];
+        if rest.starts_with("https://") || rest.starts_with("http://") {
+            let url = bare_url(rest);
+            spans.push(Span {
+                range: start..start + url.len(),
+                kind: SpanKind::Link(url.to_owned()),
+            });
+            from = start + url.len();
+        } else {
+            from = start + "http".len();
+        }
+    }
+    RichText {
+        text: text.to_owned(),
+        spans,
+    }
+}
+
+/// The web address at the start of `text`, without the punctuation that ends a sentence.
+fn bare_url(text: &str) -> &str {
+    let end = text
+        .find(|c: char| c.is_whitespace() || matches!(c, ')' | '>' | '"'))
+        .unwrap_or(text.len());
+    text[..end].trim_end_matches(['.', ',', '!', '?'])
+}
+
 /// Markdown between or inside bubbles: text becomes a bubble, each ```card fence becomes a card.
 fn push_markdown(markdown: &str, blocks: &mut Vec<Block>) {
     let mut text = String::new();
@@ -302,10 +334,7 @@ fn push_inline(markdown: &str, out: &mut RichText) {
             plain_from = i;
         } else if rest.starts_with("https://") || rest.starts_with("http://") {
             flush!();
-            let len = rest
-                .find(|c: char| c.is_whitespace() || matches!(c, ')' | '>' | '"'))
-                .unwrap_or(rest.len());
-            let url = rest[..len].trim_end_matches(['.', ',', '!', '?']);
+            let url = bare_url(rest);
             let start = out.text.len();
             out.text.push_str(url);
             out.spans.push(Span {
@@ -441,6 +470,17 @@ mod tests {
                     kind: SpanKind::Link("https://y.io/z".into())
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn plain_text_links_addresses_and_nothing_else() {
+        let text = plain_text("**그대로** http 와 https://a.io/b?c=1, 끝");
+        assert_eq!(text.text, "**그대로** http 와 https://a.io/b?c=1, 끝");
+        assert_eq!(text.spans.len(), 1);
+        assert_eq!(
+            &text.text[text.spans[0].range.clone()],
+            "https://a.io/b?c=1"
         );
     }
 
