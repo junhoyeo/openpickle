@@ -240,6 +240,7 @@ bun src/cli.ts login +821012345678  # texts a code, asks for it, writes the sess
 bun src/cli.ts sync
 bun src/cli.ts send character "안녕"
 bun src/cli.ts search 점심         # one result per line: seq, date, label, snippet with [matches]
+bun src/cli.ts explore travel       # Explore offers by section: title, call to action, how many asked
 bun src/cli.ts export ./messages    # full history of every room, one JSON file per room
 bun src/cli.ts events               # one JSON object per line
 bun src/cli.ts screen handoffs

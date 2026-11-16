@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-// Small CLI over PickleClient. Output is JSON, except `search`. Credentials come from one of:
+// Small CLI over PickleClient. Output is JSON, except `search` and `explore`. Credentials come from one of:
 //   PICKLE_SESSION_FILE  a JSON file holding {"login_session_token": "ls_…"}. Each run refreshes
 //                        once and writes the next token back, so never run two at once.
 //   PICKLE_TOKEN         an access token (the app's Authorization header), valid for 5 minutes.
@@ -22,6 +22,8 @@ const USAGE = `usage: PICKLE_SESSION_FILE=<file> pickle <command>
   send <room> <text>           send a message; <room> may be "character"
   search <query>               messages containing <query>, newest first, one per line:
                                seq, date, label and the snippet with matches in [brackets]
+  explore [area]               Explore sections and their offers: title, call to action and
+                               how many asked; [area] (e.g. money, travel) keeps that area only
   export <dir>                 write the full history of every room to <dir>/<room_id>.json
   events                       stream live events, one JSON object per line
   session | register | character | profile | social
@@ -104,6 +106,19 @@ switch (command) {
     for (const item of items) {
       const snippet = item.segments.map((s) => (s.match ? `[${s.text}]` : s.text)).join("");
       console.log(`${item.seq}\t${item.date_label}\t${item.label}\t${snippet}`);
+    }
+    break;
+  }
+  case "explore": {
+    const [area] = args;
+    const { sections } = await pickle.getExploreSections();
+    for (const section of sections) {
+      const offers = area ? section.items.filter((offer) => offer.areas.includes(area)) : section.items;
+      if (offers.length === 0) continue;
+      console.log(section.title);
+      for (const offer of offers) {
+        console.log(`  ${offer.title}\t${offer.cta_label}\t${offer.accepted_users_label}`);
+      }
     }
     break;
   }
