@@ -6,13 +6,16 @@
 
 import { readFileSync } from "node:fs";
 import { mkdir, rename, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { PickleClient, decodeAccessToken } from "./client.ts";
 import type { LoginSessionRefresh } from "./types.ts";
 
 const USAGE = `usage: PICKLE_SESSION_FILE=<file> pickle <command>
        PICKLE_TOKEN=<jwt> pickle <command>
 
+  login <phone> [carrier]      sign in with a texted code and write PICKLE_SESSION_FILE;
+                               <phone> is E.164, e.g. +821012345678
   token                        claims and remaining lifetime of PICKLE_TOKEN
   sync                         rooms with cursors and unread counts
   history <room> [after_seq]   room history after a sequence number (default 0)
@@ -34,8 +37,23 @@ if (!command || (!sessionFile && !token)) {
 /** Replaces the session file in one step, so a crash cannot leave it holding a spent token. */
 async function saveSession(file: string, refresh: LoginSessionRefresh): Promise<void> {
   const next = { login_session_token: refresh.login_session_token, expires_at: refresh.expires_at };
+  await mkdir(dirname(file), { recursive: true });
   await writeFile(`${file}.tmp`, JSON.stringify(next), { mode: 0o600 });
   await rename(`${file}.tmp`, file);
+}
+
+if (command === "login") {
+  const [phone, carrier] = args;
+  if (!phone || !sessionFile) throw new Error("PICKLE_SESSION_FILE=<file> pickle login <phone> [carrier]");
+  const signedOut = new PickleClient();
+  const { pending_id, expires_in } = await signedOut.requestPhoneCode(phone, { carrier });
+  const prompt = createInterface({ input: process.stdin, output: process.stderr });
+  const code = (await prompt.question(`Code texted to ${phone} (valid ${expires_in / 60} min): `)).trim();
+  prompt.close();
+  const issued = await signedOut.verifyPhoneCode(pending_id, code);
+  await saveSession(sessionFile, issued);
+  console.log(JSON.stringify({ user_id: issued.user_id, expires_at: issued.expires_at, saved_to: sessionFile }, null, 2));
+  process.exit(0);
 }
 
 const pickle = sessionFile
