@@ -55,9 +55,9 @@ new PickleClient({
 **The refresh token in a capture belongs to the app on your phone.** Because each refresh spends
 the token, the app and this client cannot share one chain: whichever refreshes second holds a
 spent token. Using a token taken from the phone's traffic can sign the phone out (or the
-phone's next refresh ends the client's chain). How the server treats a spent token was
-not tested. A separate sign-in for the client would avoid this, but the sign-in calls (phone
-code, Apple, Kakao, LINE) are not in the captures.
+phone's next refresh ends the client's chain). How the server treats a spent token was not
+tested. A separate sign-in for the client would avoid this, but the sign-in calls (phone code,
+Apple, Kakao, LINE) are not in the captures.
 
 Any non-2xx response raises `PickleApiError`, with `error.detail` set when the body has a reason.
 A live probe with an expired token got `401 {"detail":"token_expired"}`, and one without a token
@@ -159,14 +159,19 @@ An event name outside this list arrives as `{ event: "unknown", name, data }`.
 ## CLI
 
 ```sh
-export PICKLE_TOKEN='eyJhbGciOiJFUzI1NiIs...'   # from the app's Authorization header
-bun src/cli.ts token                # claims and seconds left
+# A login session file: {"login_session_token": "ls_…"}. Every run refreshes once and writes the
+# next token back to the file, so do not run two commands at the same time.
+export PICKLE_SESSION_FILE=~/.config/pickle/login-session.json
+# Or an access token from the app's Authorization header, valid for 5 minutes:
+# export PICKLE_TOKEN='eyJhbGciOiJFUzI1NiIs...'
+
 bun src/cli.ts sync
 bun src/cli.ts send character "안녕"
 bun src/cli.ts export ./messages    # full history of every room, one JSON file per room
 bun src/cli.ts events               # one JSON object per line
 bun src/cli.ts screen handoffs
 bun src/cli.ts get /api/secure/transfers
+bun src/cli.ts token                # claims and seconds left of PICKLE_TOKEN
 ```
 
 ## Verification
@@ -178,10 +183,12 @@ bun test
 bun run verify:capture ~/Downloads/character-api-prod.picklemem.com_11-16-2026-19-15-36.proxymanlogv2
 ```
 
-The client was also run against the live API with an access token from the second capture:
+The client was also run against the live API. With an access token from the second capture,
 `export` read all 14 rooms (1,031 history items, 909 of them in the room with your own
-character). The refresh call
-was not made live, because it would have spent the phone's refresh token.
+character). Then, with the owner's consent, the client took over the refresh token from that
+capture: three refreshes in a row each returned a working access token and the next refresh
+token, all within the same login session (`sid`), and `export` ran again through
+`PICKLE_SESSION_FILE`.
 
 `verify:capture` replays a Proxyman capture without touching the network. For every recorded
 request it calls the matching client method, with `fetch` replaced by one that answers with the
