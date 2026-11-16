@@ -188,6 +188,17 @@ export class PickleClient {
     });
   }
 
+  /** Pages through `getHistoryDelta` from `afterSeq` (default 0) until the server has no more. */
+  async *history(roomId: string, options: { afterSeq?: number; limit?: number } = {}): AsyncGenerator<HistoryDelta> {
+    let afterSeq = options.afterSeq ?? 0;
+    for (;;) {
+      const page = await this.getHistoryDelta(roomId, { afterSeq, limit: options.limit });
+      yield page;
+      if (!page.has_more || page.next_after <= afterSeq) return;
+      afterSeq = page.next_after;
+    }
+  }
+
   /**
    * `POST /api/rooms/{room}/messages`. The reply arrives on `events()`: `chat` events carry
    * `client_msg_id` as the message `id` and as the `target_id` of reactions to it.

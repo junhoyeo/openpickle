@@ -2,6 +2,8 @@
 // Small CLI over PickleClient. The token comes from PICKLE_TOKEN (the app's Authorization header,
 // with or without "Bearer "). Output is JSON.
 
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { PickleClient, decodeAccessToken } from "./client";
 
 const USAGE = `usage: PICKLE_TOKEN=<jwt> pickle <command>
@@ -10,6 +12,7 @@ const USAGE = `usage: PICKLE_TOKEN=<jwt> pickle <command>
   sync                         rooms with cursors and unread counts
   history <room> [after_seq]   room history after a sequence number (default 0)
   send <room> <text>           send a message; <room> may be "character"
+  export <dir>                 write the full history of every room to <dir>/<room_id>.json
   events                       stream live events, one JSON object per line
   session | register | character | profile | social
   screen <kind> [key=value]... server-driven screen data, e.g. "screen handoffs"
@@ -52,6 +55,28 @@ switch (command) {
     const [room, ...words] = args;
     if (!room || words.length === 0) throw new Error("send <room> <text>");
     print(await pickle.sendMessage(await resolveRoom(room), words.join(" ")));
+    break;
+  }
+  case "export": {
+    const [dir] = args;
+    if (!dir) throw new Error("export <dir>");
+    await mkdir(dir, { recursive: true });
+    const sync = await pickle.sync();
+    await writeFile(join(dir, "sync.json"), JSON.stringify(sync, null, 2));
+    for (const room of sync.rooms) {
+      const pages = [];
+      for await (const page of pickle.history(room.room_id)) pages.push(page);
+      const merged = {
+        room,
+        items: pages.flatMap((p) => p.items),
+        reactions: pages.flatMap((p) => p.reactions),
+        card_states: pages.flatMap((p) => p.card_states),
+        pages: pages.length,
+      };
+      await writeFile(join(dir, `${room.room_id}.json`), JSON.stringify(merged, null, 2));
+      const who = room.peer?.display_name ?? "(your character)";
+      console.error(`${room.kind} ${who}: ${merged.items.length} items, ${pages.length} pages, last_seq ${room.last_seq}`);
+    }
     break;
   }
   case "events":

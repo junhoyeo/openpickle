@@ -62,9 +62,8 @@ export class SseParser {
 // ---- Typed events ----
 //
 // Every payload carries `v: 1`. The event name plus `kind` select the shape. The names and kinds
-// below were present in traffic. Others exist: the character's text replies, for one, were not in
-// the studied traffic, so a `chat` payload can carry a `kind` this union does not list. An event
-// name outside this list arrives as `{ event: "unknown", name, data }`.
+// below were present in traffic. Others may exist, so a payload can carry a `kind` this union does
+// not list. An event name outside this list arrives as `{ event: "unknown", name, data }`.
 
 export type ChatEvent =
   | {
@@ -77,11 +76,23 @@ export type ChatEvent =
       at: number;
       seq: number;
       channel: string;
+      prev_seq?: number;
+    }
+  | {
+      /** A character reply. `text` wraps each chat bubble in `<bubble>…</bubble>`. */
+      kind: "assistant";
+      role: string;
+      id: string;
+      text: string;
+      at: number;
+      seq: number;
+      channel: string;
+      parts: number[];
       prev_seq: number;
     }
   | { kind: "pending"; on: boolean }
   | { kind: "responder"; state: "chat_turn_started" | "chat_turn_finished" | (string & {}) }
-  | { kind: "activity"; state: "thinking" | "tool" | (string & {}); label?: string }
+  | { kind: "activity"; state: "thinking" | "tool" | (string & {}); label?: string; typing?: boolean }
   | {
       kind: "reaction";
       id: string;

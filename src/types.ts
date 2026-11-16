@@ -1,6 +1,7 @@
 // Wire types of the Pickle character API (https://character-api-prod.picklemem.com).
 //
-// Every type here was read off real traffic of the iOS app (build 202611071128, version 1.1.19).
+// Every type here was read off real traffic of the iOS app (build 202611071128, version 1.1.19)
+// and, for room history, off live responses.
 // Field names stay in the server's snake_case so that a response can be passed through untouched.
 // A string union that ends in `(string & {})` lists the values seen in traffic; other values exist.
 
@@ -312,12 +313,87 @@ export interface Reaction {
   at: number;
 }
 
+export interface ProfileCard {
+  user_id: string;
+  handle: string;
+  display_name: string;
+  character_name: string;
+  avatar_url: string;
+  character_avatar_url: string;
+}
+
+/** A stored room message. Optional fields appear only on some messages. */
+export interface HistoryItem {
+  role: Open<"user" | "assistant" | "agent_request" | "subagent">;
+  /** Your messages use the `client_msg_id` they were sent with. */
+  id: string;
+  /** Character replies wrap each chat bubble in `<bubble>…</bubble>`; the text may use Markdown. */
+  text?: string;
+  /** Unix seconds */
+  at: number;
+  seq: number;
+  channel?: Open<"chat" | "voice">;
+  /** Offsets of the message parts. Reactions and replies point at a part with `part`. */
+  parts?: number[];
+  /** In rooms between characters: whether your character wrote it. */
+  mine?: boolean;
+  /** A question the character asks you (`agent_request`), answered through a card. */
+  request?: {
+    kind: Open<"choice" | "card" | "otp">;
+    question?: string;
+    options?: { id: string; label: string }[];
+    images?: string[];
+    recommended?: number;
+    service?: string;
+  };
+  state?: Open<"pending">;
+  context?: { kind: Open<"offer" | "button">; id: string; quote?: string; button_index?: number };
+  reply_to?: { target_id: string; part: number; text: string; role: string; kind?: string; path?: string } | null;
+  path?: string;
+  title?: string;
+  /** Attachment paths (`attachments/<date>/<file>`). */
+  attachments?: string[];
+  /** Image path to URL. */
+  inline_images?: Record<string, string>;
+  image_meta?: Record<string, { w: number; h: number; blurhash: string }>;
+  /** File path to URL. */
+  inline_files?: Record<string, string>;
+  file_meta?: Record<string, { name: string; size: number; pages?: number }>;
+  /** `pickle://` link to its label. */
+  app_references?: Record<string, string>;
+  app_reference_cards?: Record<
+    string,
+    {
+      kind: string;
+      user_id?: string;
+      profile?: ProfileCard;
+      room_kind?: string;
+      members?: (ProfileCard & { kind: string })[];
+    }
+  >;
+  notice?: {
+    event: string;
+    catalog_id: string;
+    ticket_fraction_pct: number;
+    tickets_remaining: number;
+    label: string;
+    period: string;
+  };
+}
+
+export interface CardState {
+  seq: number;
+  /** The `agent_request` message the state belongs to. */
+  id: string;
+  state: string;
+  option_id?: string;
+}
+
 export interface HistoryDelta {
   v: 1;
-  /** Message items after `after_seq`. Their shape was not present in the studied traffic. */
-  items: Record<string, unknown>[];
+  items: HistoryItem[];
   reactions: Reaction[];
-  card_states: Record<string, unknown>[];
+  card_states: CardState[];
   next_after: number;
   has_more: boolean;
   head_seq: number;
