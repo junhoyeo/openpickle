@@ -67,6 +67,8 @@ pub struct Shell {
     messages: Vec<Message>,
     /// How many messages were typed here, which numbers the ones not confirmed yet.
     sent: u64,
+    /// The offers that messages on their way ask for, by the message's id.
+    offers_asked: std::collections::HashMap<String, String>,
     activity: Option<Option<String>>,
     /// For each message, the index of its first row in the chat's list.
     row_starts: Vec<usize>,
@@ -105,6 +107,7 @@ impl Shell {
             social: None,
             messages: Vec::new(),
             sent: 0,
+            offers_asked: std::collections::HashMap::new(),
             activity: None,
             row_starts: Vec::new(),
             _screen_events: None,
@@ -169,6 +172,10 @@ impl Shell {
             }
             Update::SendFailed { id, reason } => {
                 mark_not_sent(&mut self.messages, &id, &reason);
+                if let (Some(offer), Some(explore)) = (self.offers_asked.remove(&id), &self.explore)
+                {
+                    explore.update(cx, |explore, cx| explore.ask_failed(&offer, cx));
+                }
                 self.refresh_rows(cx);
             }
             Update::Activity(activity) => {
@@ -471,6 +478,9 @@ impl Shell {
             .map_or(0., |elapsed| elapsed.as_secs_f64());
         let message = convert::outgoing(id.clone(), text, UNCONFIRMED_SEQ + self.sent, now);
         upsert(&mut self.messages, message);
+        if let Some(offer) = &offer {
+            self.offers_asked.insert(id.clone(), offer.clone());
+        }
         let command = Command::Send {
             id: id.clone(),
             text: text.to_owned(),
@@ -674,6 +684,53 @@ mod tests {
         assert_eq!(reading(cx, "cmd-2"), Some(false));
         assert_eq!(reading(cx, "cmd-3"), Some(false));
         assert_eq!(reading(cx, "cmd-1"), Some(true));
+    }
+
+    #[gpui::test]
+    fn an_offer_whose_message_failed_is_released_in_explore(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::ui::bind_keys);
+        let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, received) = futures::channel::mpsc::unbounded();
+        let conversation = Update::Conversation {
+            name: "Pickle".into(),
+            avatar: None,
+            messages: vec![message("a", 1)],
+        };
+        updates.unbounded_send(conversation).unwrap();
+        let (shell, cx) =
+            cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
+        cx.simulate_keystrokes("cmd-2");
+        let explore = shell.read_with(cx, |shell, _| shell.explore.clone().unwrap());
+        let offer = std::sync::Arc::new(crate::model::Offer {
+            id: "offer-1".into(),
+            section: "money_back".into(),
+            title: String::new(),
+            detail: String::new(),
+            ask: "환급금 찾아줘".into(),
+            picture: String::new(),
+            symbol: String::new(),
+            asked_by: String::new(),
+            steps: Vec::new(),
+            areas: Vec::new(),
+        });
+        explore.update(cx, |explore, cx| explore.start(offer, cx));
+        cx.run_until_parked();
+        let id = std::iter::from_fn(|| sent.try_recv().ok())
+            .find_map(|command| match command {
+                Command::Send { id, .. } => Some(id),
+                _ => None,
+            })
+            .unwrap();
+        explore.read_with(cx, |explore, _| assert!(explore.has_asked("offer-1")));
+        updates
+            .unbounded_send(Update::SendFailed {
+                id,
+                reason: "Not sent.".into(),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        explore.read_with(cx, |explore, _| assert!(!explore.has_asked("offer-1")));
+        shell.read_with(cx, |shell, _| assert!(shell.offers_asked.is_empty()));
     }
 
     #[gpui::test]

@@ -80,7 +80,8 @@ pub struct ExploreView {
     list: ListState,
     /// The offer whose sheet is open.
     detail: Option<Arc<Offer>>,
-    /// Offers that were asked for, which are drawn dimmed.
+    /// Offers that were asked for, which are drawn dimmed. One whose message did not reach
+    /// the server is taken out again, so it can be asked for again.
     asked: HashSet<String>,
     /// Offers the server was told about.
     seen: HashSet<String>,
@@ -183,16 +184,36 @@ impl ExploreView {
     }
 
     /// Asks for an offer and closes its sheet. The window goes to the chat, where the
-    /// message shows.
+    /// message shows. Closing the sheet is what keeps one press from asking twice.
     fn ask(&mut self, offer: &Offer, cx: &mut Context<Self>) {
-        self.detail = None;
-        if self.asked.insert(offer.id.clone()) {
-            cx.emit(ExploreEvent::Ask {
-                offer: offer.id.clone(),
-                text: offer.ask.clone(),
-            });
+        if self.detail.take().is_none() {
+            return;
         }
+        self.asked.insert(offer.id.clone());
+        cx.emit(ExploreEvent::Ask {
+            offer: offer.id.clone(),
+            text: offer.ask.clone(),
+        });
         cx.notify();
+    }
+
+    /// Whether the offer was asked for and its message has not failed.
+    pub fn has_asked(&self, offer: &str) -> bool {
+        self.asked.contains(offer)
+    }
+
+    /// Opens the offer's sheet and presses Start.
+    #[cfg(test)]
+    pub fn start(&mut self, offer: Arc<Offer>, cx: &mut Context<Self>) {
+        self.detail = Some(offer.clone());
+        self.ask(&offer, cx);
+    }
+
+    /// The message that asked for this offer did not reach the server.
+    pub fn ask_failed(&mut self, offer: &str, cx: &mut Context<Self>) {
+        if self.asked.remove(offer) {
+            cx.notify();
+        }
     }
 
     /// Waits until the list holds still, then tells the server which offers were on screen.
@@ -803,6 +824,40 @@ mod tests {
         assert_eq!(last_row(cx), "retry");
         view.update(cx, |view, cx| view.set_explore(Ok(Explore::default()), cx));
         assert_eq!(last_row(cx), "note");
+    }
+
+    #[gpui::test]
+    fn an_offer_whose_message_failed_can_be_asked_for_again(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let pictures = cx.new(|_| Pictures::default());
+            ExploreView::new(Identity::default(), pictures, cx)
+        });
+        let asks = std::rc::Rc::new(std::cell::Cell::new(0));
+        cx.update(|_, cx| {
+            let asks = asks.clone();
+            cx.subscribe(&view, move |_, event, _| {
+                if matches!(event, ExploreEvent::Ask { .. }) {
+                    asks.set(asks.get() + 1);
+                }
+            })
+            .detach();
+        });
+        let offer = offer("a", "money", "money");
+        let ask = |cx: &mut gpui::VisualTestContext| {
+            view.update(cx, |view, cx| {
+                view.detail = Some(offer.clone());
+                view.ask(&offer, cx);
+                // A second press on a sheet that is already closed asks nothing.
+                view.ask(&offer, cx);
+            })
+        };
+        ask(cx);
+        assert_eq!(asks.get(), 1);
+        view.read_with(cx, |view, _| assert!(view.asked.contains("a")));
+        view.update(cx, |view, cx| view.ask_failed("a", cx));
+        view.read_with(cx, |view, _| assert!(!view.asked.contains("a")));
+        ask(cx);
+        assert_eq!(asks.get(), 2);
     }
 
     fn offer(id: &str, section: &str, area: &str) -> Arc<Offer> {
