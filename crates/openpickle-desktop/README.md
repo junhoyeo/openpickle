@@ -8,6 +8,7 @@ cargo run --release -p openpickle-desktop            # the app
 ./crates/openpickle-desktop/macos/package.sh         # OpenPickle.app and a disk image
 cargo run -p openpickle-desktop --example gallery    # the chat screen with made-up messages
 cargo run -p openpickle-desktop --example gallery -- login
+cargo run -p openpickle-desktop --example gallery -- app   # the whole window: menu, search
 ```
 
 ## What it does
@@ -20,13 +21,18 @@ cargo run -p openpickle-desktop --example gallery -- login
 - **Live updates** over the server's event stream: your message, the character's replies and what
   it is doing appear as they happen.
 - **Sending**: a message shows at once and is replaced by the server's copy when it arrives.
+- **Searching**: Cmd-F, or the menu button and then the search button. The server searches;
+  the results show one line of each message with the match marked. The arrow keys and Enter, or
+  a click, open a result: the conversation scrolls to that message and stays there, so what was
+  said before and after is a scroll away. The search keeps its text and results for the next
+  time it is opened.
 - **Selecting and copying**: drag across messages, or right-click for Copy, Copy Message and
   Select All. Cmd-C and Cmd-A work too when the composer has no selection or text of its own. A
   selection is read from the conversation, not from the rows on screen, so Select All copies all
   of it.
 
-Not built: the Explore, Library and Profile tabs, the menu and Invite buttons, the microphone and
-voice calls (all drawn, none active); pictures and files (a message only says how many it has);
+Not built: the Explore, Library and Profile tabs, the sections of the menu other than Chat, the
+Invite button, the microphone and voice calls (all drawn, none active); pictures and files (a message only says how many it has);
 link previews; reactions; answering a request card; other rooms than the one with your character.
 
 ## Packaging
@@ -72,5 +78,5 @@ Everything is under the user's application-support directory
 | `src/convert.rs`, `src/content.rs` | History items to messages; message Markdown to bubbles and cards. |
 | `src/model.rs` | Messages to list rows: grouping, joined corners, timestamps. |
 | `src/app.rs` | The root view: sign-in or chat, applying updates. |
-| `src/ui/` | The chat screen, the sign-in screen, the text field (with IME), row drawing, text selection, line breaking. |
+| `src/ui/` | The chat screen with its menu, the search screen, the sign-in screen, the text field (with IME), row drawing, text selection, line breaking. |
 | `src/theme.rs`, `assets/icons/` | Colors and sizes read off the Figma frames; Lucide icons (ISC). |
