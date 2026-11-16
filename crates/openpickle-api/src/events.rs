@@ -29,6 +29,8 @@ pub struct SseParser {
     has_data: bool,
     id: Option<String>,
     retry: Option<u64>,
+    /// The last chunk ended in `\r`; a `\n` that opens the next one is the rest of that `\r\n`.
+    after_carriage_return: bool,
 }
 
 impl SseParser {
@@ -37,7 +39,16 @@ impl SseParser {
     }
 
     /// Feeds a chunk and appends every completed frame to `frames`.
-    pub fn push(&mut self, chunk: &[u8], frames: &mut Vec<SseFrame>) {
+    pub fn push(&mut self, mut chunk: &[u8], frames: &mut Vec<SseFrame>) {
+        // A `\r` ends its line without waiting for what follows, because nothing may follow: a
+        // stream that uses bare carriage returns would otherwise lose its last event.
+        if self.after_carriage_return && chunk.first() == Some(&b'\n') {
+            chunk = &chunk[1..];
+            self.after_carriage_return = false;
+        }
+        if let Some(&last) = chunk.last() {
+            self.after_carriage_return = last == b'\r';
+        }
         let mut buffer = std::mem::take(&mut self.buffer);
         buffer.extend_from_slice(chunk);
         let mut start = 0;
@@ -46,11 +57,10 @@ impl SseParser {
             .position(|&b| b == b'\n' || b == b'\r')
         {
             let end = start + offset;
-            let width = match buffer.get(end..end + 2) {
-                Some(b"\r\n") => 2,
-                // A trailing "\r" may be the first half of "\r\n"; wait for more input.
-                None if buffer[end] == b'\r' => break,
-                _ => 1,
+            let width = if buffer[end..].starts_with(b"\r\n") {
+                2
+            } else {
+                1
             };
             if let Some(frame) = self.line(&buffer[start..end]) {
                 frames.push(frame);
@@ -324,6 +334,28 @@ mod tests {
         parser.push(&bytes[..at], &mut frames);
         parser.push(&bytes[at..], &mut frames);
         frames
+    }
+
+    #[test]
+    fn a_bare_carriage_return_stream_keeps_its_last_event() {
+        let stream = b"event: sync\rdata: {\"v\":1,\"rev\":1}\r\r";
+        for at in 0..=stream.len() {
+            let mut parser = SseParser::new();
+            let mut frames = Vec::new();
+            parser.push(&stream[..at], &mut frames);
+            parser.push(&stream[at..], &mut frames);
+            assert_eq!(frames.len(), 1, "split at byte {at}");
+            assert_eq!(frames[0].event, "sync");
+        }
+
+        // `\r`, then `\n` in the next chunk, is one line ending; a second `\n` is a blank line.
+        let mut parser = SseParser::new();
+        let mut frames = Vec::new();
+        parser.push(b"data: a\r", &mut frames);
+        parser.push(b"\n", &mut frames);
+        assert!(frames.is_empty());
+        parser.push(b"\n", &mut frames);
+        assert_eq!(frames.len(), 1);
     }
 
     #[test]
