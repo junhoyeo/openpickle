@@ -2,7 +2,7 @@
 //! to compare the two side by side: `cargo run -p openpickle-desktop --example gallery`.
 //! Pass `login` to see the sign-in screen instead.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use chrono::Local;
 use gpui::{App, AppContext, Application, Focusable};
@@ -17,8 +17,8 @@ fn message(seq: u64, minutes_ago: f64, side: Side, text: &str) -> Message {
     let parts = parse_message(text)
         .into_iter()
         .map(|block| match block {
-            Block::Bubble(text) => Part::Bubble(Rc::new(text)),
-            Block::Card(card) => Part::Card(Rc::new(card)),
+            Block::Bubble(text) => Part::Bubble(Arc::new(text)),
+            Block::Card(card) => Part::Card(Arc::new(card)),
         })
         .collect();
     Message {
@@ -56,7 +56,7 @@ fn main() {
         seq: 4,
         at: messages[2].at + 1.,
         side: Side::Theirs,
-        parts: vec![Part::Request(Rc::new(Request {
+        parts: vec![Part::Request(Arc::new(Request {
             caption: "샘플 verification code".into(),
             question: None,
             options: vec![],

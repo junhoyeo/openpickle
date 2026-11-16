@@ -1,6 +1,6 @@
 //! What the chat screen draws: messages, and the rows of the virtual list built from them.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use chrono::{DateTime, Local, TimeZone};
 
@@ -26,11 +26,11 @@ pub struct Message {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Part {
-    Bubble(Rc<RichText>),
-    Card(Rc<Card>),
-    Request(Rc<Request>),
+    Bubble(Arc<RichText>),
+    Card(Arc<Card>),
+    Request(Arc<Request>),
     /// A task the character started (a phone call, a purchase).
-    Task(Rc<str>),
+    Task(Arc<str>),
 }
 
 /// A question from the character that is answered through a card.
@@ -72,10 +72,10 @@ impl Row {
     pub fn same_as(&self, other: &Row) -> bool {
         let same_kind = match (&self.kind, &other.kind) {
             (RowKind::Part(a), RowKind::Part(b)) => match (a, b) {
-                (Part::Bubble(a), Part::Bubble(b)) => Rc::ptr_eq(a, b),
-                (Part::Card(a), Part::Card(b)) => Rc::ptr_eq(a, b),
-                (Part::Request(a), Part::Request(b)) => Rc::ptr_eq(a, b),
-                (Part::Task(a), Part::Task(b)) => Rc::ptr_eq(a, b),
+                (Part::Bubble(a), Part::Bubble(b)) => Arc::ptr_eq(a, b),
+                (Part::Card(a), Part::Card(b)) => Arc::ptr_eq(a, b),
+                (Part::Request(a), Part::Request(b)) => Arc::ptr_eq(a, b),
+                (Part::Task(a), Part::Task(b)) => Arc::ptr_eq(a, b),
                 _ => false,
             },
             (a, b) => a == b,
@@ -168,7 +168,7 @@ mod tests {
     use super::*;
 
     fn message(at: f64, side: Side, parts: usize) -> Message {
-        let part = Part::Bubble(Rc::new(RichText {
+        let part = Part::Bubble(Arc::new(RichText {
             text: "hi".into(),
             spans: vec![],
         }));
