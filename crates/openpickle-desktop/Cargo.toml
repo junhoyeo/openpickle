@@ -1,0 +1,15 @@
+[package]
+name = "openpickle-desktop"
+description = "Desktop app for Pickle"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "openpickle"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+gpui = "0.2.2"
+unicode-segmentation = "1"
