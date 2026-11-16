@@ -410,6 +410,19 @@ export interface CardState {
   option_id?: string;
 }
 
+/** `GET /api/rooms/{room}/history`: the newest messages, each with its reactions inline. */
+export interface HistoryWindow {
+  v: 1;
+  messages: (HistoryItem & { reactions?: Omit<Reaction, "seq" | "target_id">[] })[];
+  reactions: Reaction[];
+  card_states: CardState[];
+  window_max_seq: number;
+  head_seq: number;
+  log_epoch: string;
+  projection_version: number;
+  read_seq: number;
+}
+
 export interface HistoryDelta {
   v: 1;
   items: HistoryItem[];

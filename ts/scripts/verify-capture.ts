@@ -47,6 +47,7 @@ const routes: [method: string, path: RegExp, call: Call][] = [
   ["POST", /^\/api\/session$/, (c, _f, json) => c.startSession(json)],
   ["GET", /^\/api\/sync$/, (c) => c.sync()],
   ["GET", /^\/api\/events$/, (c) => drain(c.events())],
+  ["GET", /^\/api\/rooms\/([^/]+)\/history$/, (c, _f, _j, [room]) => c.getHistory(room!)],
   ["GET", /^\/api\/rooms\/([^/]+)\/history\/delta$/, (c, f, _j, [room]) => {
     const q = new URLSearchParams(f.query);
     return c.getHistoryDelta(room!, { afterSeq: Number(q.get("after_seq")), limit: Number(q.get("limit")) });

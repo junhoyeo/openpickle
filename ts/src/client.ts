@@ -4,6 +4,7 @@ import type {
   Character,
   EnclaveNode,
   HistoryDelta,
+  HistoryWindow,
   KnownScreens,
   LoginSessionIssued,
   LoginSessionRefresh,
@@ -252,6 +253,11 @@ export class PickleClient {
   /** `GET /api/sync`: every room with its cursors and unread counts. */
   sync(): Promise<SyncResponse> {
     return this.request("GET", "/api/sync");
+  }
+
+  /** `GET /api/rooms/{room}/history`: the latest messages of a room (up to 200), for a first load. */
+  getHistory(roomId: string): Promise<HistoryWindow> {
+    return this.request("GET", `/api/rooms/${encodeURIComponent(roomId)}/history`);
   }
 
   /** `GET /api/rooms/{room}/history/delta`: what happened in a room after `afterSeq`. */
