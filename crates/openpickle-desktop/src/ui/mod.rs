@@ -1,5 +1,6 @@
 pub mod chat;
 pub mod input;
+pub mod login;
 pub mod rows;
 
 use gpui::{App, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size};
