@@ -73,10 +73,23 @@ fn main() {
     messages.push(message(7, 9., Side::Theirs, "<bubble>지금 자리 남아있는지 바로 확인해 볼게요!</bubble>\n<bubble>공식 웹사이트 (프로그램 상세)\nhttps://example.com/\n\n직접 둘러보셔도 되고, 폼 입력 귀찮으시면 언제든 말씀해 주세요.</bubble>"));
     messages.push(message(8, 1., Side::Mine, "링크 부탁해"));
 
+    // `many` repeats the conversation to check that a long history costs nothing at launch.
+    if std::env::args().any(|arg| arg == "many") {
+        let sample = messages.clone();
+        for round in 1..250u64 {
+            messages.extend(sample.iter().cloned().map(|mut message| {
+                message.seq += round * 100;
+                message.id = message.seq.to_string();
+                message
+            }));
+        }
+    }
     let login = std::env::args().any(|arg| arg == "login");
+    let started = std::time::Instant::now();
     Application::new()
         .with_assets(Assets)
         .run(move |cx: &mut App| {
+            eprintln!("app ready after {:?}", started.elapsed());
             ui::input::bind_keys(cx);
             if login {
                 cx.open_window(ui::window_options(cx), |window, cx| {
@@ -89,16 +102,24 @@ fn main() {
                 cx.open_window(ui::window_options(cx), |window, cx| {
                     let view = cx.new(|cx| {
                         let mut view = ChatView::new(cx);
-                        view.set_rows(
-                            build_rows(&messages, Some(Some("Working")), Local::now()),
-                            cx,
-                        );
+                        let rows = build_rows(&messages, Some(Some("Working")), Local::now());
+                        eprintln!("{} messages, {} rows", messages.len(), rows.len());
+                        view.set_rows(rows, cx);
                         view
                     });
                     window.focus(&view.focus_handle(cx));
+                    // GPUI draws the first frame while opening the window; this runs when the
+                    // display asks for the next one.
+                    window.on_next_frame(move |_, _| {
+                        eprintln!("second frame requested after {:?}", started.elapsed())
+                    });
                     view
                 })
                 .unwrap();
+                eprintln!(
+                    "window open and first frame drawn after {:?}",
+                    started.elapsed()
+                );
             }
             cx.activate(true);
         });
