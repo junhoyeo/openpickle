@@ -93,15 +93,18 @@ impl Store {
         write_atomically(&self.cache_path(name), &serde_json::to_vec(value)?)
     }
 
-    /// Every record of an append-only log, oldest first. A line cut short by a crash is skipped.
+    /// Every record of an append-only log, oldest first. A line that is not a record is
+    /// skipped: one cut short by a crash, or one whose bytes are not text.
     pub fn log<T: DeserializeOwned>(&self, name: &str) -> Vec<T> {
         let Ok(file) = File::open(self.cache_path(name)) else {
             return Vec::new();
         };
+        // Lines are split as bytes. Reading them as text would stop at the first line that
+        // is not UTF-8 and lose every record after it.
         BufReader::new(file)
-            .lines()
+            .split(b'\n')
             .map_while(Result::ok)
-            .filter_map(|line| serde_json::from_str(&line).ok())
+            .filter_map(|line| serde_json::from_slice(&line).ok())
             .collect()
     }
 
@@ -215,6 +218,20 @@ mod tests {
         ] {
             assert_eq!(mode(&file), 0o600, "{}", file.display());
         }
+    }
+
+    #[test]
+    fn a_line_that_is_not_text_does_not_hide_the_records_after_it() {
+        let store = store("log-bytes");
+        store.append_log("room.jsonl", &[1, 2]).unwrap();
+        // A crash in the middle of a character, or a damaged block, leaves bytes that are
+        // not UTF-8.
+        let path = store.cache_path("room.jsonl");
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"\xff\xfe{\"cut\n");
+        fs::write(&path, bytes).unwrap();
+        store.append_log("room.jsonl", &[3]).unwrap();
+        assert_eq!(store.log::<i32>("room.jsonl"), [1, 2, 3]);
     }
 
     #[test]
