@@ -1,0 +1,623 @@
+//! The backend thread: signs in, keeps the conversation in step with the server, and tells the
+//! UI what changed. It is the only code that touches the network or the disk.
+//!
+//! Launch order is what makes the app feel instant: the cached conversation goes to the UI
+//! first, and only then does the network get asked for what is new.
+
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    pin::Pin,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use futures::{Stream, StreamExt, channel::mpsc::UnboundedSender as Updates};
+use openpickle_api::{
+    CardState, ClientOptions, Credentials, Error, HistoryItem, LoginSession, LoginSessionRefresh,
+    PickleClient, PickleEvent, SendMessageOptions,
+    events::{ChatEvent, RoomEvent},
+};
+use serde::{Deserialize, Serialize};
+use tokio::{
+    sync::mpsc::{UnboundedReceiver as Commands, UnboundedSender, unbounded_channel},
+    time::Instant,
+};
+
+use crate::{
+    convert,
+    model::{Message, Part},
+    protocol::{Command, Update},
+    store::{Session, Store},
+};
+
+type EventStream = Pin<Box<dyn Stream<Item = openpickle_api::Result<PickleEvent>> + Send>>;
+
+/// Starts the backend thread and returns the two ends the UI holds.
+pub fn start() -> (
+    UnboundedSender<Command>,
+    futures::channel::mpsc::UnboundedReceiver<Update>,
+) {
+    let (commands, commands_rx) = unbounded_channel();
+    let (updates, updates_rx) = futures::channel::mpsc::unbounded();
+    std::thread::Builder::new()
+        .name("backend".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            runtime.block_on(run(commands_rx, updates));
+        })
+        .expect("backend thread");
+    (commands, updates_rx)
+}
+
+/// Why a signed-in stretch ended.
+enum Ended {
+    /// The server no longer knows the login session.
+    SignedOut,
+    /// The UI is gone.
+    Closed,
+}
+
+async fn run(mut commands: Commands<Command>, updates: Updates<Update>) {
+    let store = match Store::open() {
+        Ok(store) => store,
+        Err(error) => {
+            updates.unbounded_send(Update::SignedOut).ok();
+            updates
+                .unbounded_send(Update::SignInFailed(format!(
+                    "Cannot open the app's data folder: {error}"
+                )))
+                .ok();
+            return;
+        }
+    };
+    let mut signed_in = store.session().map(|session| (session, None));
+    loop {
+        let (session, access_token) = match signed_in.take() {
+            Some(signed_in) => signed_in,
+            None => {
+                updates.unbounded_send(Update::SignedOut).ok();
+                match sign_in(&store, &mut commands, &updates).await {
+                    Some((session, access_token)) => (session, Some(access_token)),
+                    None => return,
+                }
+            }
+        };
+        match converse(&store, session, access_token, &mut commands, &updates).await {
+            Ended::SignedOut => store.clear_session(),
+            Ended::Closed => return,
+        }
+    }
+}
+
+/// Runs the sign-in screen until a login session exists. Returns it with its first access token.
+async fn sign_in(
+    store: &Store,
+    commands: &mut Commands<Command>,
+    updates: &Updates<Update>,
+) -> Option<(Session, String)> {
+    let client = PickleClient::new(ClientOptions::default()).ok()?;
+    let mut pending_id = None;
+    while let Some(command) = commands.recv().await {
+        let failure = match command {
+            Command::RequestCode(phone) => {
+                match client.request_phone_code(&phone, None, None).await {
+                    Ok(requested) => {
+                        pending_id = Some(requested.pending_id);
+                        updates.unbounded_send(Update::CodeSent).ok();
+                        continue;
+                    }
+                    Err(error) => explain(&error),
+                }
+            }
+            Command::VerifyCode(code) => match &pending_id {
+                Some(pending_id) => match client.verify_phone_code(pending_id, &code).await {
+                    Ok(issued) => {
+                        let session = Session {
+                            login_session_token: issued.login_session_token,
+                            // iOS reports an upper-case UUID as its device id.
+                            device_id: uuid::Uuid::new_v4().to_string().to_uppercase(),
+                        };
+                        match store.save_session(&session) {
+                            Ok(()) => return Some((session, issued.login_session_jwt)),
+                            Err(error) => {
+                                format!("Signed in, but the session could not be saved: {error}")
+                            }
+                        }
+                    }
+                    Err(error) => explain(&error),
+                },
+                None => "Ask for a code first.".to_owned(),
+            },
+            Command::Send(_) | Command::Active(_) => continue,
+        };
+        updates.unbounded_send(Update::SignInFailed(failure)).ok();
+    }
+    None
+}
+
+/// What to tell the user when a sign-in call fails.
+fn explain(error: &Error) -> String {
+    match error.api() {
+        Some(api) => match &api.detail {
+            Some(detail) => format!("Pickle answered: {detail}"),
+            None => format!("Pickle answered with status {}", api.status),
+        },
+        None => "Could not reach Pickle. Check your connection and try again.".to_owned(),
+    }
+}
+
+fn session_is_gone(error: &Error) -> bool {
+    error
+        .api()
+        .is_some_and(|api| api.status == 401 && api.detail.as_deref() == Some("session_not_found"))
+}
+
+/// One line of a room's history log.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "t", content = "v")]
+enum Record {
+    #[serde(rename = "item")]
+    Item(Box<HistoryItem>),
+    #[serde(rename = "card")]
+    Card(CardState),
+    /// How far the log follows the server: the `next_after` of the last page written.
+    #[serde(rename = "synced")]
+    Synced(i64),
+}
+
+/// The name and picture last seen for the character.
+#[derive(Default, Serialize, Deserialize)]
+struct Identity {
+    name: String,
+    /// The picture's address without its signature.
+    avatar: String,
+    /// File name of the downloaded picture in the cache.
+    avatar_file: Option<String>,
+}
+
+/// The open room as the server described it.
+#[derive(Default)]
+struct Conversation {
+    room_id: String,
+    items: HashMap<String, HistoryItem>,
+    card_states: HashMap<String, CardState>,
+    /// Sequence number up to which `history/delta` has been read and logged.
+    synced: i64,
+}
+
+impl Conversation {
+    fn log_name(room_id: &str) -> String {
+        format!("room-{room_id}.jsonl")
+    }
+
+    fn load(store: &Store, room_id: &str) -> Self {
+        let mut conversation = Self {
+            room_id: room_id.to_owned(),
+            ..Default::default()
+        };
+        for record in store.log::<Record>(&Self::log_name(room_id)) {
+            match record {
+                Record::Item(item) => {
+                    conversation.items.insert(item.id.clone(), *item);
+                }
+                Record::Card(state) => {
+                    conversation.card_states.insert(state.id.clone(), state);
+                }
+                Record::Synced(seq) => conversation.synced = seq,
+            }
+        }
+        conversation
+    }
+
+    fn message(&self, item: &HistoryItem) -> Message {
+        convert::message(item, self.card_states.get(&item.id))
+    }
+
+    /// Every message, oldest first.
+    fn messages(&self) -> Vec<Message> {
+        let mut messages: Vec<Message> =
+            self.items.values().map(|item| self.message(item)).collect();
+        messages.sort_by_key(|message| message.seq);
+        messages
+    }
+
+    /// Takes in items and card states and returns the messages they changed.
+    fn apply(&mut self, items: Vec<HistoryItem>, card_states: Vec<CardState>) -> Vec<Message> {
+        let mut changed: Vec<String> = Vec::with_capacity(items.len() + card_states.len());
+        for state in card_states {
+            changed.push(state.id.clone());
+            self.card_states.insert(state.id.clone(), state);
+        }
+        for item in items {
+            changed.push(item.id.clone());
+            self.items.insert(item.id.clone(), item);
+        }
+        changed.sort();
+        changed.dedup();
+        changed
+            .iter()
+            .filter_map(|id| self.items.get(id))
+            .map(|item| self.message(item))
+            .collect()
+    }
+
+    fn head_seq(&self) -> i64 {
+        self.items
+            .values()
+            .map(|item| item.seq)
+            .max()
+            .unwrap_or(0)
+            .max(self.synced)
+    }
+}
+
+struct Live {
+    client: PickleClient,
+    store: Store,
+    updates: Updates<Update>,
+    conversation: Conversation,
+    identity: Identity,
+    /// Messages typed here that the server has not confirmed yet, counted to keep their order.
+    sent: u64,
+    /// Whether the window is in front; only then does reading count as "seen".
+    active: bool,
+    marked_read: i64,
+}
+
+async fn converse(
+    store: &Store,
+    session: Session,
+    access_token: Option<String>,
+    commands: &mut Commands<Command>,
+    updates: &Updates<Update>,
+) -> Ended {
+    let device_id = session.device_id.clone();
+    let rotate_store = store.clone();
+    let rotate_device = device_id.clone();
+    let mut login = LoginSession::new(
+        session.login_session_token,
+        move |refresh: &LoginSessionRefresh| {
+            rotate_store.save_session(&Session {
+                login_session_token: refresh.login_session_token.clone(),
+                device_id: rotate_device.clone(),
+            })
+        },
+    );
+    if let Some(access_token) = access_token {
+        login = login.with_access_token(access_token);
+    }
+    let options = ClientOptions {
+        credentials: Credentials::LoginSession(login),
+        device_id: Some(device_id),
+        ..Default::default()
+    };
+    let Ok(client) = PickleClient::new(options) else {
+        return Ended::SignedOut;
+    };
+
+    // First paint comes from the disk; the network is asked afterwards.
+    let room_id: Option<String> = store.cached("room.json");
+    let conversation = room_id
+        .as_deref()
+        .map(|room_id| Conversation::load(store, room_id))
+        .unwrap_or_default();
+    let identity: Identity = store.cached("identity.json").unwrap_or_default();
+    let mut live = Live {
+        client,
+        store: store.clone(),
+        updates: updates.clone(),
+        conversation,
+        identity,
+        sent: 0,
+        active: true,
+        marked_read: 0,
+    };
+    live.send(Update::Conversation {
+        name: live.display_name(),
+        avatar: live.avatar_path(),
+        messages: live.conversation.messages(),
+    });
+
+    let mut events: Option<EventStream> = None;
+    let mut connect_at = Instant::now();
+    let mut backoff = Duration::from_secs(2);
+    loop {
+        tokio::select! {
+            command = commands.recv() => match command {
+                None => return Ended::Closed,
+                Some(Command::Send(text)) => {
+                    if let Err(error) = live.send_message(&text).await
+                        && session_is_gone(&error)
+                    {
+                        return Ended::SignedOut;
+                    }
+                }
+                Some(Command::Active(active)) => {
+                    live.active = active;
+                    live.mark_read().await;
+                }
+                Some(Command::RequestCode(_) | Command::VerifyCode(_)) => {}
+            },
+            event = next_event(&mut events), if events.is_some() => match event {
+                Some(Ok(PickleEvent::Retry(delay))) => backoff = delay,
+                Some(Ok(event)) => {
+                    if let Err(error) = live.handle(event).await
+                        && session_is_gone(&error)
+                    {
+                        return Ended::SignedOut;
+                    }
+                }
+                // The stream ended or broke: catch up and reopen it after the server's delay.
+                Some(Err(_)) | None => {
+                    events = None;
+                    connect_at = Instant::now() + backoff;
+                }
+            },
+            _ = tokio::time::sleep_until(connect_at), if events.is_none() => match live.connect().await {
+                Ok(stream) => {
+                    events = Some(stream);
+                    backoff = Duration::from_secs(2);
+                }
+                Err(error) if session_is_gone(&error) => return Ended::SignedOut,
+                Err(_) => {
+                    connect_at = Instant::now() + backoff;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
+            },
+        }
+    }
+}
+
+async fn next_event(
+    events: &mut Option<EventStream>,
+) -> Option<openpickle_api::Result<PickleEvent>> {
+    match events {
+        Some(events) => events.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+impl Live {
+    fn send(&self, update: Update) {
+        self.updates.unbounded_send(update).ok();
+    }
+
+    fn display_name(&self) -> String {
+        if self.identity.name.is_empty() {
+            "Pickle".to_owned()
+        } else {
+            self.identity.name.clone()
+        }
+    }
+
+    fn avatar_path(&self) -> Option<PathBuf> {
+        let path = self.store.cache_path(self.identity.avatar_file.as_deref()?);
+        path.exists().then_some(path)
+    }
+
+    /// Finds the room, reads what is new, and opens the event stream.
+    async fn connect(&mut self) -> openpickle_api::Result<EventStream> {
+        // Open the stream first so nothing that happens during the catch-up is missed.
+        let events: EventStream = Box::pin(self.client.events().await?);
+        let rooms = self.client.sync().await?;
+        let room_id = rooms
+            .rooms
+            .iter()
+            .find(|room| room.kind == "character")
+            .map(|room| room.room_id.clone());
+        if let Some(room_id) = room_id
+            && room_id != self.conversation.room_id
+        {
+            self.store.cache("room.json", &room_id).ok();
+            self.conversation = Conversation::load(&self.store, &room_id);
+            self.send(Update::Conversation {
+                name: self.display_name(),
+                avatar: self.avatar_path(),
+                messages: self.conversation.messages(),
+            });
+        }
+        self.catch_up().await?;
+        self.refresh_identity().await;
+        Ok(events)
+    }
+
+    /// Reads `history/delta` from where the log ends, page by page.
+    async fn catch_up(&mut self) -> openpickle_api::Result<()> {
+        if self.conversation.room_id.is_empty() {
+            return Ok(());
+        }
+        loop {
+            let delta = self
+                .client
+                .get_history_delta(&self.conversation.room_id, self.conversation.synced, None)
+                .await?;
+            // A page that brings nothing new leaves the log as it is.
+            if delta.next_after > self.conversation.synced {
+                let mut records: Vec<Record> = delta
+                    .items
+                    .iter()
+                    .cloned()
+                    .map(|item| Record::Item(Box::new(item)))
+                    .collect();
+                records.extend(delta.card_states.iter().cloned().map(Record::Card));
+                records.push(Record::Synced(delta.next_after));
+                self.store
+                    .append_log(
+                        &Conversation::log_name(&self.conversation.room_id),
+                        &records,
+                    )
+                    .ok();
+            }
+
+            let advanced = delta.next_after > self.conversation.synced;
+            self.conversation.synced = delta.next_after.max(self.conversation.synced);
+            let changed = self.conversation.apply(delta.items, delta.card_states);
+            if !changed.is_empty() {
+                self.send(Update::Upsert(changed));
+            }
+            if !delta.has_more || !advanced {
+                break;
+            }
+        }
+        self.mark_read().await;
+        Ok(())
+    }
+
+    /// Fetches the character's name and picture and tells the UI when either changed.
+    async fn refresh_identity(&mut self) {
+        let Ok(character) = self.client.get_character().await else {
+            return;
+        };
+        // The address is signed and changes on every call; the path names the picture.
+        let picture = character
+            .avatar_url
+            .split('?')
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        let renamed = character.name != self.identity.name;
+        let repainted = picture != self.identity.avatar || self.avatar_path().is_none();
+        self.identity.name = character.name;
+        if repainted
+            && !picture.is_empty()
+            && let Some(file) = download_avatar(&self.store, &character.avatar_url).await
+        {
+            self.identity.avatar_file = Some(file);
+            self.identity.avatar = picture;
+        }
+        if renamed || repainted {
+            self.store.cache("identity.json", &self.identity).ok();
+            self.send(Update::Identity {
+                name: self.display_name(),
+                avatar: self.avatar_path(),
+            });
+        }
+    }
+
+    async fn handle(&mut self, event: PickleEvent) -> openpickle_api::Result<()> {
+        match event {
+            PickleEvent::Chat(ChatEvent::User {
+                role,
+                id,
+                text,
+                at,
+                seq,
+                ..
+            })
+            | PickleEvent::Chat(ChatEvent::Assistant {
+                role,
+                id,
+                text,
+                at,
+                seq,
+                ..
+            }) => {
+                // Shown at once; the next catch-up logs it with everything the event leaves out.
+                if let Ok(item) = serde_json::from_value::<HistoryItem>(
+                    serde_json::json!({ "role": role, "id": id, "text": text, "at": at, "seq": seq }),
+                ) {
+                    let changed = self.conversation.apply(vec![item], Vec::new());
+                    self.send(Update::Upsert(changed));
+                }
+            }
+            PickleEvent::Chat(ChatEvent::Pending { on }) => {
+                self.send(Update::Activity(on.then_some(None)))
+            }
+            PickleEvent::Chat(ChatEvent::Activity { state, label, .. }) => {
+                self.send(Update::Activity(Some(label.filter(|_| state == "tool"))));
+            }
+            PickleEvent::Room(room) => {
+                let RoomEvent::Advanced {
+                    room_id, last_seq, ..
+                } = *room;
+                if room_id == self.conversation.room_id && last_seq > self.conversation.synced {
+                    self.catch_up().await?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Shows the message at once, then sends it. The server's copy replaces it when it arrives.
+    async fn send_message(&mut self, text: &str) -> openpickle_api::Result<()> {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.sent += 1;
+        // Above every real sequence number, so unconfirmed messages stay last, in typing order.
+        let seq = u64::MAX - 1_000_000 + self.sent;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0., |elapsed| elapsed.as_secs_f64());
+        let mut message = convert::outgoing(id.clone(), text, seq, now);
+        self.send(Update::Upsert(vec![message.clone()]));
+
+        let options = SendMessageOptions {
+            client_msg_id: Some(id),
+            in_call: false,
+        };
+        let result = match self.conversation.room_id.is_empty() {
+            true => self.connect_before_sending().await,
+            false => Ok(()),
+        };
+        let result = match result {
+            Ok(()) => self
+                .client
+                .send_message(&self.conversation.room_id, text, options)
+                .await
+                .map(drop),
+            Err(error) => Err(error),
+        };
+        if result.is_err() {
+            message.parts.push(Part::Task(
+                "Not sent. Check your connection and send it again.".into(),
+            ));
+            self.send(Update::Upsert(vec![message]));
+        }
+        result
+    }
+
+    /// A first message typed before the room is known: look the room up.
+    async fn connect_before_sending(&mut self) -> openpickle_api::Result<()> {
+        let rooms = self.client.sync().await?;
+        if let Some(room) = rooms.rooms.iter().find(|room| room.kind == "character") {
+            self.conversation.room_id = room.room_id.clone();
+        }
+        Ok(())
+    }
+
+    /// Tells the server how far the user has read, while the window is in front.
+    async fn mark_read(&mut self) {
+        let head = self.conversation.head_seq();
+        if self.active
+            && head > self.marked_read
+            && !self.conversation.room_id.is_empty()
+            && self
+                .client
+                .mark_read(&self.conversation.room_id, head)
+                .await
+                .is_ok()
+        {
+            self.marked_read = head;
+        }
+    }
+}
+
+/// Saves the picture at `url` in the cache and returns its file name.
+async fn download_avatar(store: &Store, url: &str) -> Option<String> {
+    let response = reqwest::get(url).await.ok()?.error_for_status().ok()?;
+    let bytes = response.bytes().await.ok()?;
+    // The extension tells GPUI how to decode the file.
+    let extension = url
+        .split('?')
+        .next()?
+        .rsplit('.')
+        .next()
+        .filter(|extension| extension.len() <= 4)
+        .unwrap_or("png");
+    let file = format!("avatar.{extension}");
+    std::fs::write(store.cache_path(&file), &bytes).ok()?;
+    Some(file)
+}

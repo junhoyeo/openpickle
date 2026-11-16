@@ -3879,10 +3879,12 @@ dependencies = [
  "futures",
  "gpui",
  "openpickle-api",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
  "unicode-segmentation",
+ "uuid",
 ]
 
 [[package]]

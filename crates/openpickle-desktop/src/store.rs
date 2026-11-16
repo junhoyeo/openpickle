@@ -47,6 +47,11 @@ impl Store {
         write_atomically(&path, &serde_json::to_vec(session)?, true)
     }
 
+    /// Forgets the login session, after the server stopped accepting it.
+    pub fn clear_session(&self) {
+        fs::remove_file(self.root.join("session.json")).ok();
+    }
+
     /// A cached value, or `None` when it is missing or unreadable.
     pub fn cached<T: DeserializeOwned>(&self, name: &str) -> Option<T> {
         self.read_json(&self.cache_path(name))

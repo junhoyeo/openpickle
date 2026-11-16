@@ -14,6 +14,8 @@ pub enum Command {
     VerifyCode(String),
     /// Send a message to the open conversation.
     Send(String),
+    /// The window came to the front (`true`) or went behind (`false`).
+    Active(bool),
 }
 
 /// Backend to UI.
