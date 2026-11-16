@@ -199,6 +199,36 @@ async fn a_rotation_that_could_not_be_stored_is_stored_before_anything_else() {
 }
 
 #[tokio::test]
+async fn a_token_the_server_calls_expired_is_refreshed_once_and_the_request_repeated() {
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    // The seeded token looks valid to this clock, but the server rejects it.
+    let seeded = jwt(300);
+    let rejected = format!("Bearer {seeded}");
+    let server = refreshing_server(refreshes.clone(), move |authorization| {
+        if authorization == rejected {
+            Reply::json(401, r#"{"detail":"token_expired"}"#)
+        } else {
+            Reply::json(200, SYNC)
+        }
+    })
+    .await;
+    let session = LoginSession::new("ls_first", |_| Ok(())).with_access_token(seeded);
+    let pickle = client(&server, Credentials::LoginSession(session));
+
+    assert_eq!(pickle.sync().await.unwrap().rev, 4);
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    let paths: Vec<String> = server
+        .take()
+        .into_iter()
+        .map(|request| request.path)
+        .collect();
+    assert_eq!(
+        paths,
+        ["/api/sync", "/api/login-sessions/refresh", "/api/sync"]
+    );
+}
+
+#[tokio::test]
 async fn api_errors_carry_status_detail_and_body() {
     let server = MockServer::start(|request| match request.path.as_str() {
         "/api/device/location/token" => Reply::json(409, r#"{"detail":"location_disabled"}"#),

@@ -823,11 +823,26 @@ impl PickleClient {
         options: RequestOptions,
         timeout: Option<Duration>,
     ) -> Result<Response> {
-        let bearer = match options.auth {
-            Auth::Bearer => Some(self.bearer_header().await?),
-            Auth::App | Auth::None => None,
-        };
-        self.execute(method, path, options, bearer, timeout).await
+        if options.auth != Auth::Bearer {
+            return self.execute(method, path, options, None, timeout).await;
+        }
+        let bearer = self.bearer_header().await?;
+        // Only a login session can get a new token, so only then is the request kept for a retry.
+        let retry = matches!(self.inner.bearer, Bearer::Session { .. }).then(|| options.clone());
+        let result = self
+            .execute(method.clone(), path, options, Some(bearer.clone()), timeout)
+            .await;
+        match (result, retry) {
+            // The server says the token expired although this clock says it has not: a clock
+            // that runs behind would otherwise fail every request and never refresh.
+            (Err(error), Some(options)) if is_token_expired(&error) => {
+                self.forget_access_token(&bearer).await;
+                let bearer = self.bearer_header().await?;
+                self.execute(method, path, options, Some(bearer), timeout)
+                    .await
+            }
+            (result, _) => result,
+        }
     }
 
     async fn execute(
@@ -880,6 +895,20 @@ impl PickleClient {
             detail,
             body,
         })))
+    }
+
+    /// Drops the cached access token if it is still `rejected`, so the next request refreshes.
+    async fn forget_access_token(&self, rejected: &HeaderValue) {
+        if let Bearer::Session { state, .. } = &self.inner.bearer {
+            let mut state = state.lock().await;
+            if state
+                .access
+                .as_ref()
+                .is_some_and(|access| access.header == *rejected)
+            {
+                state.access = None;
+            }
+        }
     }
 
     fn sign_in_options(&self) -> Result<RequestOptions> {
@@ -944,6 +973,13 @@ impl PickleClient {
             }
         }
     }
+}
+
+/// `401 {"detail": "token_expired"}`.
+fn is_token_expired(error: &Error) -> bool {
+    error
+        .api()
+        .is_some_and(|api| api.status == 401 && api.detail.as_deref() == Some("token_expired"))
 }
 
 async fn parse_response<T: DeserializeOwned + Send + 'static>(
