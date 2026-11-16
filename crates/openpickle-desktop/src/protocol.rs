@@ -12,8 +12,9 @@ pub enum Command {
     RequestCode(String),
     /// Sign in with the texted code.
     VerifyCode(String),
-    /// Send a message to the open conversation.
-    Send(String),
+    /// Send a message to the open conversation. The UI shows it already, under this id, which
+    /// the server keeps for its copy.
+    Send { id: String, text: String },
     /// The window came to the front (`true`) or went behind (`false`).
     Active(bool),
 }
@@ -41,6 +42,8 @@ pub enum Update {
     },
     /// New or changed messages, matched to known ones by id.
     Upsert(Vec<Message>),
+    /// The message the UI sent under this id did not reach the server. The text says why.
+    SendFailed { id: String, reason: String },
     /// Whether the character is working on a reply, and on what when it says.
     Activity(Option<Option<String>>),
     /// The backend stopped over something on this computer and cannot go on. The text says

@@ -1,5 +1,7 @@
 //! The root view: shows sign-in or the chat, and applies what the backend reports.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use chrono::Local;
 use futures::{StreamExt, channel::mpsc::UnboundedReceiver};
 use gpui::{
@@ -9,7 +11,8 @@ use gpui::{
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
-    model::{Message, build_rows},
+    convert,
+    model::{Message, Part, UNCONFIRMED_SEQ, build_rows},
     protocol::{Command, Update},
     theme,
     ui::{
@@ -32,6 +35,8 @@ pub struct Shell {
     screen: Screen,
     /// The open conversation, oldest first.
     messages: Vec<Message>,
+    /// How many messages were typed here, which numbers the ones not confirmed yet.
+    sent: u64,
     activity: Option<Option<String>>,
     _screen_events: Option<Subscription>,
     _activation: Subscription,
@@ -54,6 +59,7 @@ impl Shell {
             commands,
             screen: Screen::Starting,
             messages: Vec::new(),
+            sent: 0,
             activity: None,
             _screen_events: None,
             _activation: activation,
@@ -77,7 +83,10 @@ impl Shell {
 
     fn apply(&mut self, update: Update, window: &mut Window, cx: &mut Context<Self>) {
         match update {
-            Update::SignedOut => self.show_login(window, cx),
+            Update::SignedOut => {
+                self.messages.clear();
+                self.show_login(window, cx)
+            }
             Update::CodeSent => {
                 if let Screen::Login(login) = &self.screen {
                     login.update(cx, |login, cx| login.code_requested(window, cx));
@@ -93,7 +102,7 @@ impl Shell {
                 avatar,
                 messages,
             } => {
-                self.messages = messages;
+                open_conversation(&mut self.messages, messages);
                 self.activity = None;
                 let chat = self.show_chat(window, cx);
                 chat.update(cx, |chat, cx| {
@@ -112,6 +121,10 @@ impl Shell {
                 for message in messages {
                     upsert(&mut self.messages, message);
                 }
+                self.refresh_rows(cx);
+            }
+            Update::SendFailed { id, reason } => {
+                mark_not_sent(&mut self.messages, &id, &reason);
                 self.refresh_rows(cx);
             }
             Update::Activity(activity) => {
@@ -145,13 +158,33 @@ impl Shell {
             return chat.clone();
         }
         let chat = cx.new(ChatView::new);
-        self._screen_events = Some(cx.subscribe(&chat, |this, _, ChatEvent::Send(text), _| {
-            this.commands.send(Command::Send(text.clone())).ok();
+        self._screen_events = Some(cx.subscribe(&chat, |this, _, ChatEvent::Send(text), cx| {
+            this.send(text, cx)
         }));
         window.focus(&chat.focus_handle(cx));
         self.screen = Screen::Chat(chat.clone());
         cx.notify();
         chat
+    }
+
+    /// Shows the message at once and hands it to the backend, which may be busy for a while:
+    /// connecting, or catching up after a long sleep.
+    fn send(&mut self, text: &str, cx: &mut Context<Self>) {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.sent += 1;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0., |elapsed| elapsed.as_secs_f64());
+        let message = convert::outgoing(id.clone(), text, UNCONFIRMED_SEQ + self.sent, now);
+        upsert(&mut self.messages, message);
+        let command = Command::Send {
+            id: id.clone(),
+            text: text.to_owned(),
+        };
+        if self.commands.send(command).is_err() {
+            mark_not_sent(&mut self.messages, &id, "Not sent. OpenPickle has stopped.");
+        }
+        self.refresh_rows(cx);
     }
 
     fn refresh_rows(&mut self, cx: &mut Context<Self>) {
@@ -163,6 +196,32 @@ impl Shell {
             );
             chat.update(cx, |chat, cx| chat.set_rows(rows, cx));
         }
+    }
+}
+
+/// Shows another conversation, or the same one read again. Messages that are still on their
+/// way to the server belong to neither yet, so they stay.
+fn open_conversation(messages: &mut Vec<Message>, conversation: Vec<Message>) {
+    let unconfirmed: Vec<Message> = messages
+        .drain(..)
+        .filter(|message| message.seq > UNCONFIRMED_SEQ)
+        .collect();
+    *messages = conversation;
+    for message in unconfirmed {
+        if !messages.iter().any(|known| known.id == message.id) {
+            upsert(messages, message);
+        }
+    }
+}
+
+/// Says under a message that it did not reach the server. A message the server has confirmed
+/// in the meantime did reach it, and stays as it is.
+fn mark_not_sent(messages: &mut [Message], id: &str, reason: &str) {
+    if let Some(message) = messages
+        .iter_mut()
+        .rfind(|message| message.id == id && message.seq > UNCONFIRMED_SEQ)
+    {
+        message.parts.push(Part::Task(reason.into()));
     }
 }
 
@@ -226,6 +285,38 @@ mod tests {
             side: Side::Mine,
             parts: vec![],
         }
+    }
+
+    #[test]
+    fn a_message_on_its_way_survives_the_conversation_arriving_and_is_then_confirmed() {
+        // Typed while the backend was still connecting.
+        let mut messages = vec![message("typed", UNCONFIRMED_SEQ + 1)];
+        open_conversation(&mut messages, vec![message("a", 1), message("b", 2)]);
+        assert_eq!(
+            messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "typed"]
+        );
+
+        // The server's copy takes its place. A failure reported after that is stale.
+        upsert(&mut messages, message("typed", 3));
+        mark_not_sent(&mut messages, "typed", "Not sent.");
+        assert_eq!(messages.last(), Some(&message("typed", 3)));
+
+        // Reading the conversation again does not bring a confirmed message back as pending.
+        let mut messages = vec![message("typed", UNCONFIRMED_SEQ + 1)];
+        open_conversation(&mut messages, vec![message("a", 1), message("typed", 2)]);
+        assert_eq!(messages, [message("a", 1), message("typed", 2)]);
+    }
+
+    #[test]
+    fn a_message_that_was_not_sent_says_so() {
+        let mut messages = vec![message("a", 1), message("typed", UNCONFIRMED_SEQ + 1)];
+        mark_not_sent(&mut messages, "typed", "Not sent. Check your connection.");
+        assert_eq!(
+            messages[1].parts,
+            [Part::Task("Not sent. Check your connection.".into())]
+        );
+        assert!(messages[0].parts.is_empty());
     }
 
     #[test]

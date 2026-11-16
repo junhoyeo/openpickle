@@ -4,12 +4,7 @@
 //! Launch order is what makes the app feel instant: the cached conversation goes to the UI
 //! first, and only then does the network get asked for what is new.
 
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    pin::Pin,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashMap, path::PathBuf, pin::Pin, time::Duration};
 
 use futures::{Stream, StreamExt, channel::mpsc::UnboundedSender as Updates};
 use openpickle_api::{
@@ -25,7 +20,7 @@ use tokio::{
 
 use crate::{
     convert,
-    model::{Message, Part},
+    model::Message,
     protocol::{Command, Update},
     store::{Session, Store},
 };
@@ -160,7 +155,7 @@ async fn sign_in(
                 },
                 None => "Ask for a code first.".to_owned(),
             },
-            Command::Send(_) | Command::Active(_) => continue,
+            Command::Send { .. } | Command::Active(_) => continue,
         };
         updates.unbounded_send(Update::SignInFailed(failure)).ok();
     }
@@ -175,6 +170,20 @@ fn explain(error: &Error) -> String {
             None => format!("Pickle answered with status {}", api.status),
         },
         None => "Could not reach Pickle. Check your connection and try again.".to_owned(),
+    }
+}
+
+/// What to show under a message that could not be sent.
+fn not_sent(error: &Error) -> String {
+    match error {
+        Error::Rotate(error) => {
+            format!("Not sent. The login session could not be saved on this computer: {error}")
+        }
+        Error::Api(api) => match &api.detail {
+            Some(detail) => format!("Not sent. Pickle answered: {detail}"),
+            None => format!("Not sent. Pickle answered with status {}", api.status),
+        },
+        _ => "Not sent. Check your connection and send it again.".to_owned(),
     }
 }
 
@@ -314,8 +323,6 @@ struct Live {
     updates: Updates<Update>,
     conversation: Conversation,
     identity: Identity,
-    /// Messages typed here that the server has not confirmed yet, counted to keep their order.
-    sent: u64,
     /// Whether the window is in front; only then does reading count as "seen".
     active: bool,
     marked_read: i64,
@@ -367,7 +374,6 @@ async fn converse(
         updates: updates.clone(),
         conversation,
         identity,
-        sent: 0,
         active: true,
         marked_read: 0,
     };
@@ -384,11 +390,12 @@ async fn converse(
         tokio::select! {
             command = commands.recv() => match command {
                 None => return Ended::Closed,
-                Some(Command::Send(text)) => {
-                    if let Err(error) = live.send_message(&text).await
-                        && session_is_gone(&error)
-                    {
-                        return Ended::SignedOut;
+                Some(Command::Send { id, text }) => {
+                    if let Err(error) = live.send_message(id.clone(), &text).await {
+                        live.send(Update::SendFailed { id, reason: not_sent(&error) });
+                        if session_is_gone(&error) {
+                            return Ended::SignedOut;
+                        }
                     }
                 }
                 Some(Command::Active(active)) => {
@@ -597,44 +604,21 @@ impl Live {
         Ok(())
     }
 
-    /// Shows the message at once, then sends it. The server's copy replaces it when it arrives.
-    async fn send_message(&mut self, text: &str) -> openpickle_api::Result<()> {
-        // Right after a first sign-in the room may not be known yet. Opening it replaces the
-        // conversation on screen, so it has to happen before the message is shown.
-        let room_known = match self.conversation.room_id.is_empty() {
-            true => self.find_room().await,
-            false => Ok(()),
-        };
-
-        let id = uuid::Uuid::new_v4().to_string();
-        self.sent += 1;
-        // Above every real sequence number, so unconfirmed messages stay last, in typing order.
-        let seq = u64::MAX - 1_000_000 + self.sent;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0., |elapsed| elapsed.as_secs_f64());
-        let mut message = convert::outgoing(id.clone(), text, seq, now);
-        self.send(Update::Upsert(vec![message.clone()]));
-
+    /// Sends a message the UI already shows. The server's copy, which carries the same id,
+    /// replaces it when it arrives.
+    async fn send_message(&mut self, id: String, text: &str) -> openpickle_api::Result<()> {
+        // Right after a first sign-in the room may not be known yet.
+        if self.conversation.room_id.is_empty() {
+            self.find_room().await?;
+        }
         let options = SendMessageOptions {
             client_msg_id: Some(id),
             in_call: false,
         };
-        let result = match room_known {
-            Ok(()) => self
-                .client
-                .send_message(&self.conversation.room_id, text, options)
-                .await
-                .map(drop),
-            Err(error) => Err(error),
-        };
-        if result.is_err() {
-            message.parts.push(Part::Task(
-                "Not sent. Check your connection and send it again.".into(),
-            ));
-            self.send(Update::Upsert(vec![message]));
-        }
-        result
+        self.client
+            .send_message(&self.conversation.room_id, text, options)
+            .await
+            .map(drop)
     }
 
     /// Tells the server how far the user has read, while the window is in front.

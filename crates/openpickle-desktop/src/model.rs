@@ -13,6 +13,10 @@ pub enum Side {
     Theirs,
 }
 
+/// Messages typed here that the server has not confirmed yet are numbered above this, which
+/// is above every real sequence number. They stay last, in typing order.
+pub const UNCONFIRMED_SEQ: u64 = u64::MAX - 1_000_000;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Message {
     /// The `client_msg_id` for messages you sent, the server's id otherwise.
