@@ -1,12 +1,17 @@
 #!/usr/bin/env bun
-// Small CLI over PickleClient. The token comes from PICKLE_TOKEN (the app's Authorization header,
-// with or without "Bearer "). Output is JSON.
+// Small CLI over PickleClient. Output is JSON. Credentials come from one of:
+//   PICKLE_SESSION_FILE  a JSON file holding {"login_session_token": "ls_…"}. Each run refreshes
+//                        once and writes the next token back, so never run two at once.
+//   PICKLE_TOKEN         an access token (the app's Authorization header), valid for 5 minutes.
 
-import { mkdir, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { PickleClient, decodeAccessToken } from "./client.ts";
+import type { LoginSessionRefresh } from "./types.ts";
 
-const USAGE = `usage: PICKLE_TOKEN=<jwt> pickle <command>
+const USAGE = `usage: PICKLE_SESSION_FILE=<file> pickle <command>
+       PICKLE_TOKEN=<jwt> pickle <command>
 
   token                        claims and remaining lifetime of PICKLE_TOKEN
   sync                         rooms with cursors and unread counts
@@ -19,13 +24,28 @@ const USAGE = `usage: PICKLE_TOKEN=<jwt> pickle <command>
   get <path>                   GET any path, e.g. "get /api/secure/transfers"`;
 
 const [command, ...args] = process.argv.slice(2);
+const sessionFile = process.env.PICKLE_SESSION_FILE;
 const token = process.env.PICKLE_TOKEN?.replace(/^Bearer\s+/i, "");
-if (!command || !token) {
+if (!command || (!sessionFile && !token)) {
   console.error(USAGE);
   process.exit(2);
 }
 
-const pickle = new PickleClient({ accessToken: token });
+/** Replaces the session file in one step, so a crash cannot leave it holding a spent token. */
+async function saveSession(file: string, refresh: LoginSessionRefresh): Promise<void> {
+  const next = { login_session_token: refresh.login_session_token, expires_at: refresh.expires_at };
+  await writeFile(`${file}.tmp`, JSON.stringify(next), { mode: 0o600 });
+  await rename(`${file}.tmp`, file);
+}
+
+const pickle = sessionFile
+  ? new PickleClient({
+      loginSession: {
+        token: JSON.parse(readFileSync(sessionFile, "utf8")).login_session_token,
+        onRotate: (refresh) => saveSession(sessionFile, refresh),
+      },
+    })
+  : new PickleClient({ accessToken: token! });
 const print = (value: unknown) => console.log(JSON.stringify(value, null, 2));
 
 async function resolveRoom(room: string): Promise<string> {
@@ -38,6 +58,7 @@ async function resolveRoom(room: string): Promise<string> {
 
 switch (command) {
   case "token": {
+    if (!token) throw new Error("token reads PICKLE_TOKEN");
     const claims = decodeAccessToken(token);
     print({ ...claims, expires_in_s: claims.exp - Math.floor(Date.now() / 1000) });
     break;
