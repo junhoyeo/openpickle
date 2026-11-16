@@ -292,6 +292,48 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    fn a_typed_message_shows_at_once_and_goes_to_the_backend(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::ui::input::bind_keys);
+        let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, received) = futures::channel::mpsc::unbounded();
+        let conversation = Update::Conversation {
+            name: "Pickle".into(),
+            avatar: None,
+            messages: vec![message("a", 1)],
+        };
+        updates.unbounded_send(conversation).unwrap();
+        let (shell, cx) =
+            cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
+
+        cx.simulate_input("안녕");
+        cx.simulate_keystrokes("enter");
+        // Nothing answers the command, as when the backend is busy. The message shows anyway.
+        let (id, text) = std::iter::from_fn(|| sent.try_recv().ok())
+            .find_map(|command| match command {
+                Command::Send { id, text } => Some((id, text)),
+                _ => None,
+            })
+            .expect("the message goes to the backend");
+        assert_eq!(text, "안녕");
+        shell.read_with(cx, |shell, _| {
+            let shown = shell.messages.last().unwrap();
+            assert_eq!((&shown.id, shown.seq > UNCONFIRMED_SEQ), (&id, true));
+            assert_eq!(shown.parts.len(), 1);
+        });
+
+        let failed = Update::SendFailed {
+            id,
+            reason: "Not sent.".into(),
+        };
+        updates.unbounded_send(failed).unwrap();
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            let parts = &shell.messages.last().unwrap().parts;
+            assert_eq!(parts.last(), Some(&Part::Task("Not sent.".into())));
+        });
+    }
+
     #[test]
     fn a_message_on_its_way_survives_the_conversation_arriving_and_is_then_confirmed() {
         // Typed while the backend was still connecting.
