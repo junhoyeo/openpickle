@@ -442,26 +442,28 @@ impl Live {
     async fn connect(&mut self) -> openpickle_api::Result<EventStream> {
         // Open the stream first so nothing that happens during the catch-up is missed.
         let events: EventStream = Box::pin(self.client.events().await?);
+        self.find_room().await?;
+        self.catch_up().await?;
+        self.refresh_identity().await;
+        Ok(events)
+    }
+
+    /// Asks the server which room is the one with the character. When it is not the open one
+    /// (the first launch, or another account), opens it with what the disk has for it.
+    async fn find_room(&mut self) -> openpickle_api::Result<()> {
         let rooms = self.client.sync().await?;
-        let room_id = rooms
-            .rooms
-            .iter()
-            .find(|room| room.kind == "character")
-            .map(|room| room.room_id.clone());
-        if let Some(room_id) = room_id
-            && room_id != self.conversation.room_id
+        if let Some(room) = rooms.rooms.iter().find(|room| room.kind == "character")
+            && room.room_id != self.conversation.room_id
         {
-            self.store.cache("room.json", &room_id).ok();
-            self.conversation = Conversation::load(&self.store, &room_id);
+            self.store.cache("room.json", &room.room_id).ok();
+            self.conversation = Conversation::load(&self.store, &room.room_id);
             self.send(Update::Conversation {
                 name: self.display_name(),
                 avatar: self.avatar_path(),
                 messages: self.conversation.messages(),
             });
         }
-        self.catch_up().await?;
-        self.refresh_identity().await;
-        Ok(events)
+        Ok(())
     }
 
     /// Reads `history/delta` from where the log ends, page by page.
@@ -581,6 +583,13 @@ impl Live {
 
     /// Shows the message at once, then sends it. The server's copy replaces it when it arrives.
     async fn send_message(&mut self, text: &str) -> openpickle_api::Result<()> {
+        // Right after a first sign-in the room may not be known yet. Opening it replaces the
+        // conversation on screen, so it has to happen before the message is shown.
+        let room_known = match self.conversation.room_id.is_empty() {
+            true => self.find_room().await,
+            false => Ok(()),
+        };
+
         let id = uuid::Uuid::new_v4().to_string();
         self.sent += 1;
         // Above every real sequence number, so unconfirmed messages stay last, in typing order.
@@ -595,11 +604,7 @@ impl Live {
             client_msg_id: Some(id),
             in_call: false,
         };
-        let result = match self.conversation.room_id.is_empty() {
-            true => self.connect_before_sending().await,
-            false => Ok(()),
-        };
-        let result = match result {
+        let result = match room_known {
             Ok(()) => self
                 .client
                 .send_message(&self.conversation.room_id, text, options)
@@ -614,15 +619,6 @@ impl Live {
             self.send(Update::Upsert(vec![message]));
         }
         result
-    }
-
-    /// A first message typed before the room is known: look the room up.
-    async fn connect_before_sending(&mut self) -> openpickle_api::Result<()> {
-        let rooms = self.client.sync().await?;
-        if let Some(room) = rooms.rooms.iter().find(|room| room.kind == "character") {
-            self.conversation.room_id = room.room_id.clone();
-        }
-        Ok(())
     }
 
     /// Tells the server how far the user has read, while the window is in front.
