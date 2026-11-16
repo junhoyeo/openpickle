@@ -255,16 +255,7 @@ impl TextInput {
     }
 
     fn offset_from_utf16(&self, offset: usize) -> usize {
-        let mut utf8_offset = 0;
-        let mut utf16_count = 0;
-        for ch in self.content.chars() {
-            if utf16_count >= offset {
-                break;
-            }
-            utf16_count += ch.len_utf16();
-            utf8_offset += ch.len_utf8();
-        }
-        utf8_offset
+        utf8_offset(&self.content, offset)
     }
 
     fn offset_to_utf16(&self, offset: usize) -> usize {
@@ -301,6 +292,37 @@ impl TextInput {
             .grapheme_indices(true)
             .find_map(|(idx, _)| (idx > offset).then_some(idx))
             .unwrap_or(self.content.len())
+    }
+}
+
+/// The byte offset in `text` of an offset counted in UTF-16 units. The result is always on a
+/// character boundary and never past the end.
+fn utf8_offset(text: &str, utf16_offset: usize) -> usize {
+    let mut utf8_offset = 0;
+    let mut utf16_count = 0;
+    for ch in text.chars() {
+        if utf16_count >= utf16_offset {
+            break;
+        }
+        utf16_count += ch.len_utf16();
+        utf8_offset += ch.len_utf8();
+    }
+    utf8_offset
+}
+
+/// Where the selection is after composition put `new_text` at byte `start`. The input method
+/// gives the selection in UTF-16 units counted from the start of `new_text`, not of the field.
+fn marked_selection(
+    start: usize,
+    new_text: &str,
+    selected_utf16: Option<&Range<usize>>,
+) -> Range<usize> {
+    match selected_utf16 {
+        Some(selected) => {
+            start + utf8_offset(new_text, selected.start)
+                ..start + utf8_offset(new_text, selected.end)
+        }
+        None => start + new_text.len()..start + new_text.len(),
     }
 }
 
@@ -378,11 +400,8 @@ impl EntityInputHandler for TextInput {
                 .into();
         self.marked_range =
             (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
-        self.selected_range = new_selected_range_utf16
-            .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .map(|new_range| new_range.start + range.start..new_range.end + range.end)
-            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        self.selected_range =
+            marked_selection(range.start, new_text, new_selected_range_utf16.as_ref());
         cx.emit(InputEvent::Changed);
         cx.notify();
     }
@@ -642,5 +661,41 @@ impl Render for TextInput {
 impl Focusable for TextInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The selection of each case must be usable to slice the field's text.
+    fn selection(
+        prefix: &str,
+        new_text: &str,
+        selected_utf16: Option<Range<usize>>,
+    ) -> Range<usize> {
+        let content = format!("{prefix}{new_text}");
+        let selection = marked_selection(prefix.len(), new_text, selected_utf16.as_ref());
+        assert!(
+            content.is_char_boundary(selection.start) && content.is_char_boundary(selection.end)
+        );
+        assert!(selection.start <= selection.end && selection.end <= content.len());
+        selection
+    }
+
+    #[test]
+    fn composition_selection_is_relative_to_the_composed_text() {
+        // A syllable being composed at the start of the field: the cursor sits after it.
+        assert_eq!(selection("", "가", Some(1..1)), 3..3);
+        // After an ASCII prefix and after a Korean one.
+        assert_eq!(selection("hi ", "가", Some(1..1)), 6..6);
+        assert_eq!(selection("안녕 ", "하세", Some(2..2)), 13..13);
+        // A selection inside the composed text, and an emoji that takes two UTF-16 units.
+        assert_eq!(selection("a", "한글", Some(0..1)), 1..4);
+        assert_eq!(selection("", "👍가", Some(2..3)), 4..7);
+        // No selection given: the cursor goes to the end of the composed text.
+        assert_eq!(selection("안녕", "ㅎ", None), 9..9);
+        // An offset past the end is clamped.
+        assert_eq!(selection("", "가", Some(5..9)), 3..3);
     }
 }
