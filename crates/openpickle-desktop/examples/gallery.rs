@@ -1,17 +1,72 @@
 //! Opens the chat screen with made-up messages that have the same structure as the Figma frames,
 //! to compare the two side by side: `cargo run -p openpickle-desktop --example gallery`.
-//! Pass `login` to see the sign-in screen instead.
+//! Pass `login` to see the sign-in screen instead, or `app` to run the whole window on these
+//! messages: the menu, and a search that looks through them (Cmd-F).
+//!
+//! After `app`, further arguments are played into the window as keys, so a flow can be looked
+//! at without the real keyboard: `key:<keystroke>`, `type:<text>` and `wait:<ms>`. `float`
+//! keeps the window above the others and leaves the keyboard focus where it is. For example:
+//!
+//!     gallery app float key:cmd-f type:취소표 wait:600 key:down key:enter
 
 use std::sync::Arc;
 
 use chrono::Local;
-use gpui::{App, AppContext, Application, Focusable};
+use gpui::{
+    AnyWindowHandle, App, AppContext, Application, AsyncApp, Bounds, Focusable, Keystroke,
+    Modifiers, Window, WindowBounds, WindowKind, WindowOptions, point, px, size,
+};
 use openpickle_desktop::{
+    app::Shell,
     assets::Assets,
     content::{Block, parse_message},
-    model::{Message, Part, Request, RequestStatus, Side, build_rows},
+    model::{Message, Part, Request, RequestStatus, SearchResult, Side, build_rows},
+    protocol::{Command, Update},
     ui::{self, chat::ChatView, login::LoginView},
 };
+
+/// Plays one step of input into the window.
+fn play(step: &str, window: &mut Window, cx: &mut App) {
+    let (name, value) = step.split_once(':').unwrap_or((step, ""));
+    match name {
+        "key" => {
+            window.dispatch_keystroke(Keystroke::parse(value).expect("a keystroke"), cx);
+        }
+        "type" => {
+            for typed in value.chars().map(String::from) {
+                let keystroke = Keystroke {
+                    modifiers: Modifiers::none(),
+                    key: typed.clone(),
+                    key_char: Some(typed),
+                };
+                window.dispatch_keystroke(keystroke, cx);
+            }
+        }
+        _ => panic!("unknown step {step}"),
+    }
+    window.refresh();
+}
+
+/// Stands in for the server's search: the bubbles that contain the text, newest first.
+fn search(messages: &[Message], query: &str) -> Vec<SearchResult> {
+    let mut results = Vec::new();
+    for message in messages.iter().rev() {
+        for part in &message.parts {
+            let Part::Bubble(bubble) = part else { continue };
+            let line = bubble.text.replace('\n', " ");
+            if let Some(at) = line.find(query) {
+                results.push(SearchResult {
+                    seq: Some(message.seq),
+                    label: "Chat".into(),
+                    date: "Nov 16".into(),
+                    matches: vec![at..at + query.len(), line.len()..line.len()],
+                    snippet: line,
+                });
+            }
+        }
+    }
+    results
+}
 
 fn message(seq: u64, minutes_ago: f64, side: Side, text: &str) -> Message {
     let parts = parse_message(text)
@@ -85,6 +140,9 @@ fn main() {
         }
     }
     let login = std::env::args().any(|arg| arg == "login");
+    let whole_app = std::env::args().any(|arg| arg == "app");
+    let float = std::env::args().any(|arg| arg == "float");
+    let steps: Vec<String> = std::env::args().filter(|arg| arg.contains(':')).collect();
     let started = std::time::Instant::now();
     Application::new()
         .with_assets(Assets)
@@ -98,6 +156,62 @@ fn main() {
                     view
                 })
                 .unwrap();
+            } else if whole_app {
+                let (commands, mut asked) = tokio::sync::mpsc::unbounded_channel();
+                let (updates, received) = futures::channel::mpsc::unbounded();
+                let conversation = Update::Conversation {
+                    name: "Pickle".into(),
+                    avatar: None,
+                    messages: messages.clone(),
+                };
+                updates.unbounded_send(conversation).unwrap();
+                let messages = messages.clone();
+                std::thread::spawn(move || {
+                    while let Some(command) = asked.blocking_recv() {
+                        if let Command::Search(query) = command {
+                            let results = Ok(search(&messages, &query));
+                            updates
+                                .unbounded_send(Update::Found { query, results })
+                                .ok();
+                        }
+                    }
+                });
+                let options = match float {
+                    false => ui::window_options(cx),
+                    true => WindowOptions {
+                        kind: WindowKind::PopUp,
+                        focus: false,
+                        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                            point(px(1280.), px(140.)),
+                            size(px(440.), px(900.)),
+                        ))),
+                        ..Default::default()
+                    },
+                };
+                // The untyped handle: the typed one would hold the root view while a key is
+                // played, and the keys make the root view do things.
+                let window: AnyWindowHandle = cx
+                    .open_window(options, |window, cx| {
+                        cx.new(|cx| Shell::new(commands, received, window, cx))
+                    })
+                    .unwrap()
+                    .into();
+                cx.spawn(async move |cx: &mut AsyncApp| {
+                    for step in steps {
+                        let pause = step
+                            .strip_prefix("wait:")
+                            .map_or(300, |ms| ms.parse().unwrap());
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(pause))
+                            .await;
+                        if !step.starts_with("wait:") {
+                            window
+                                .update(cx, |_, window, cx| play(&step, window, cx))
+                                .ok();
+                        }
+                    }
+                })
+                .detach();
             } else {
                 cx.open_window(ui::window_options(cx), |window, cx| {
                     let view = cx.new(|cx| {
@@ -121,6 +235,8 @@ fn main() {
                     started.elapsed()
                 );
             }
-            cx.activate(true);
+            if !float {
+                cx.activate(true);
+            }
         });
 }
