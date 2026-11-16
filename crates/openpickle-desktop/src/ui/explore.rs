@@ -130,7 +130,12 @@ impl ExploreView {
     /// Takes in the offers, or why they could not be read. A failure keeps what is shown.
     pub fn set_explore(&mut self, explore: Result<Explore, String>, cx: &mut Context<Self>) {
         match explore {
-            Ok(explore) if explore == self.explore => self.failed = None,
+            Ok(explore) if explore == self.explore => {
+                // The error row goes, even when there is nothing else to show.
+                if self.failed.take().is_some() {
+                    self.rebuild(false);
+                }
+            }
             Ok(explore) => {
                 self.explore = explore;
                 self.failed = None;
@@ -780,8 +785,25 @@ impl Focusable for ExploreView {
 
 #[cfg(test)]
 mod tests {
+    use gpui::TestAppContext;
+
     use super::*;
     use crate::model::OfferSection;
+
+    #[gpui::test]
+    fn an_answer_with_nothing_in_it_takes_the_error_away(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let pictures = cx.new(|_| Pictures::default());
+            ExploreView::new(Identity::default(), pictures, cx)
+        });
+        let last_row = |cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |view, _| outline(&view.rows).pop().unwrap())
+        };
+        view.update(cx, |view, cx| view.set_explore(Err("offline".into()), cx));
+        assert_eq!(last_row(cx), "retry");
+        view.update(cx, |view, cx| view.set_explore(Ok(Explore::default()), cx));
+        assert_eq!(last_row(cx), "note");
+    }
 
     fn offer(id: &str, section: &str, area: &str) -> Arc<Offer> {
         Arc::new(Offer {
