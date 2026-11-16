@@ -47,7 +47,7 @@ switch (command) {
     break;
   case "history": {
     const [room, afterSeq = "0"] = args;
-    if (!room) throw new Error("history <room> [after_seq]");
+    if (!room || !/^\d+$/.test(afterSeq)) throw new Error("history <room> [after_seq]");
     print(await pickle.getHistoryDelta(await resolveRoom(room), { afterSeq: Number(afterSeq) }));
     break;
   }
@@ -100,14 +100,19 @@ switch (command) {
   case "screen": {
     const [kind, ...pairs] = args;
     if (!kind) throw new Error("screen <kind> [key=value]...");
-    const query = Object.fromEntries(pairs.map((pair) => pair.split("=", 2) as [string, string]));
+    const query = Object.fromEntries(
+      pairs.map((pair) => {
+        const at = pair.indexOf("=");
+        return at === -1 ? [pair, ""] : [pair.slice(0, at), pair.slice(at + 1)];
+      }),
+    );
     print(await pickle.getScreen(kind, query));
     break;
   }
   case "get": {
     const [path] = args;
     if (!path) throw new Error("get <path>");
-    print(await pickle.request("GET", path));
+    print(await pickle.request("GET", path.startsWith("/") ? path : `/${path}`));
     break;
   }
   default:
