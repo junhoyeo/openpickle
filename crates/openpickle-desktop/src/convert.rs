@@ -4,17 +4,85 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use openpickle_api::{
-    CardState, ExploreSectionsScreen, FriendRequest, HistoryItem, InviteMember, MessageSearchItem,
-    SocialSnapshot, UserSummary,
+    CardState, ExploreSectionsScreen, FileMeta, FriendRequest, HistoryItem, InviteMember,
+    MessageSearchItem, SocialSnapshot, UserSummary,
 };
 
 use crate::{
     content::{Block, parse_message, plain_text},
     model::{
-        Explore, Invite, Message, Offer, OfferSection, Part, Person, Request, RequestOption,
-        RequestStatus, SearchResult, Side, Social,
+        Attachment, AttachmentKind, Explore, Invite, Message, Offer, OfferSection, Part, Person,
+        Request, RequestOption, RequestStatus, SearchResult, Side, Social,
     },
 };
+
+/// The pictures and files a history item carries: what you sent (`attachments`), and what the
+/// character put in its reply (`inline_images`, `inline_files`, whose values are attachment
+/// paths). The item's `image_meta` and `file_meta` say which is which.
+pub fn attachments(item: &HistoryItem) -> Vec<Attachment> {
+    let sent = item.attachments.iter().flatten();
+    let images = item.inline_images.iter().flat_map(|images| images.values());
+    let files = item.inline_files.iter().flat_map(|files| files.values());
+    let mut paths: Vec<&String> = sent.chain(images).chain(files).collect();
+    paths.dedup();
+    paths
+        .into_iter()
+        .map(|path| {
+            let file = item.file_meta.as_ref().and_then(|meta| meta.get(path));
+            let picture = item
+                .image_meta
+                .as_ref()
+                .is_some_and(|meta| meta.contains_key(path));
+            let name = match file {
+                Some(file) if !file.name.is_empty() => file.name.clone(),
+                _ => path.rsplit('/').next().unwrap_or(path).to_owned(),
+            };
+            let picture = picture || (file.is_none() && is_picture_name(&name));
+            Attachment {
+                path: path.clone(),
+                seq: item.seq.max(0) as u64,
+                at: item.at,
+                detail: file.map(file_detail).unwrap_or_default(),
+                name,
+                kind: if picture {
+                    AttachmentKind::Picture
+                } else {
+                    AttachmentKind::File
+                },
+            }
+        })
+        .collect()
+}
+
+fn is_picture_name(name: &str) -> bool {
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase());
+    matches!(
+        extension.as_deref(),
+        Some("jpg" | "jpeg" | "png" | "gif" | "heic" | "webp")
+    )
+}
+
+/// `PDF · 12 pages · 1.2 MB`.
+fn file_detail(file: &FileMeta) -> String {
+    let mut detail = Vec::new();
+    if let Some((_, extension)) = file.name.rsplit_once('.') {
+        detail.push(extension.to_ascii_uppercase());
+    }
+    match file.pages {
+        Some(1) => detail.push("1 page".to_owned()),
+        Some(pages) if pages > 1 => detail.push(format!("{pages} pages")),
+        _ => {}
+    }
+    let size = file.size.max(0) as f64;
+    detail.push(match size {
+        _ if size < 1024. => format!("{size} B"),
+        _ if size < 1024. * 1024. => format!("{:.0} KB", size / 1024.),
+        _ => format!("{:.1} MB", size / (1024. * 1024.)),
+    });
+    detail.join(" · ")
+}
 
 /// The name of a picture in the cache: its address without the signature, which changes with
 /// every answer of the server.
@@ -317,6 +385,44 @@ mod tests {
 
     fn item(json: serde_json::Value) -> HistoryItem {
         serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn a_message_lists_what_it_carries_as_pictures_and_files() {
+        let sent = item(serde_json::json!({
+            "role": "user", "id": "u", "at": 1.0, "seq": 7,
+            "attachments": ["attachments/2026-11-05/IMG_0001.jpg", "attachments/2026-11-05/scan.HEIC"],
+            "image_meta": {"attachments/2026-11-05/IMG_0001.jpg": {"w": 10, "h": 10, "blurhash": ""}},
+        }));
+        let listed = attachments(&sent);
+        assert_eq!(
+            listed.iter().map(|a| a.kind).collect::<Vec<_>>(),
+            [AttachmentKind::Picture; 2]
+        );
+        assert_eq!(
+            (listed[0].name.as_str(), listed[0].seq),
+            ("IMG_0001.jpg", 7)
+        );
+
+        let reply = item(serde_json::json!({
+            "role": "assistant", "id": "a", "at": 2.0, "seq": 8, "text": "<bubble>여기요</bubble>",
+            "inline_files": {
+                "downloads/보고서.pdf": "attachments/2026-11-05/보고서.pdf",
+                "downloads/표.xlsx": "attachments/2026-11-05/표.xlsx",
+            },
+            "file_meta": {
+                "attachments/2026-11-05/보고서.pdf": {"name": "보고서.pdf", "size": 1_572_864, "pages": 12},
+                "attachments/2026-11-05/표.xlsx": {"name": "표.xlsx", "size": 20_480},
+            },
+        }));
+        let listed = attachments(&reply);
+        let files: Vec<(&str, &str)> = listed
+            .iter()
+            .map(|a| (a.name.as_str(), a.detail.as_str()))
+            .collect();
+        assert!(files.contains(&("보고서.pdf", "PDF · 12 pages · 1.5 MB")));
+        assert!(files.contains(&("표.xlsx", "XLSX · 20 KB")));
+        assert!(listed.iter().all(|a| a.kind == AttachmentKind::File));
     }
 
     #[test]

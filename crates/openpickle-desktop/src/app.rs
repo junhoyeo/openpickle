@@ -205,6 +205,8 @@ impl Shell {
                     view.update(cx, |view, cx| view.set_explore(explore, cx));
                 }
             }
+            // Nothing shows it yet.
+            Update::Archive { .. } => {}
             Update::Pictures(pictures) => self.pictures.update(cx, |known, cx| {
                 known.add(pictures);
                 cx.notify();

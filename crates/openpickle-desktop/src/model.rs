@@ -108,6 +108,28 @@ pub struct Explore {
     pub ranked: Vec<Arc<Offer>>,
 }
 
+/// A picture or a file that a message of the conversation carries, as the Archive tab lists
+/// it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Attachment {
+    /// The server's path of the attachment: `attachments/<day>/<file name>`.
+    pub path: String,
+    /// The sequence number of the message that carries it.
+    pub seq: u64,
+    /// Unix seconds of that message.
+    pub at: f64,
+    pub name: String,
+    /// `PDF · 12 pages · 1.2 MB`, for a file; empty for a picture.
+    pub detail: String,
+    pub kind: AttachmentKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentKind {
+    Picture,
+    File,
+}
+
 /// Messages typed here that the server has not confirmed yet are numbered above this, which
 /// is above every real sequence number. They stay last, in typing order.
 pub const UNCONFIRMED_SEQ: u64 = u64::MAX - 1_000_000;

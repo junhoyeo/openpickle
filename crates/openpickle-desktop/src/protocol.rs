@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use crate::model::{Explore, Message, SearchResult, Social};
+use crate::model::{Attachment, Explore, Message, SearchResult, Social};
 
 /// UI to backend. Neither side of the protocol can be printed with `{:?}`: a command may hold
 /// a phone number or a sign-in code, and both hold message text.
@@ -25,6 +25,10 @@ pub enum Command {
     LoadExplore,
     /// These offers were on screen.
     OffersShown(Vec<String>),
+    /// List the pictures and files of the conversation, reading back to its first message.
+    LoadArchive,
+    /// Load these pictures of the Archive: the attachments themselves, by their paths.
+    LoadAttachments(Vec<String>),
     /// Search the messages for this text.
     Search(String),
     /// Whether the chat can be read now: the window is in front and shows the chat. Only
@@ -69,6 +73,12 @@ pub enum Update {
     Explore(Result<Explore, String>),
     /// Pictures that are on disk now, by their key.
     Pictures(Vec<(String, PathBuf)>),
+    /// The pictures and files of the conversation, newest first. `complete` says whether the
+    /// whole history was read; a list that is not complete grows as older pages arrive.
+    Archive {
+        attachments: Vec<Attachment>,
+        complete: bool,
+    },
     /// Whether the character is working on a reply, and on what when it says.
     Activity(Option<Option<String>>),
     /// The backend stopped over something on this computer and cannot go on. The text says
