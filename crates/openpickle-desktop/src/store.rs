@@ -5,7 +5,7 @@
 //!   answers. Deleting it loses nothing.
 
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
 };
@@ -36,6 +36,22 @@ impl Store {
     pub fn at(root: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(root.join("cache"))?;
         Ok(Self { root })
+    }
+
+    /// Claims the store for this process; `None` means another instance holds it. Two
+    /// instances would spend the same single-use refresh token, and the slower one would be
+    /// signed out. The claim lasts as long as the returned file is kept.
+    pub fn claim(&self) -> io::Result<Option<File>> {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(self.root.join("lock"))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(file)),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) => Err(error),
+        }
     }
 
     pub fn session(&self) -> Option<Session> {
@@ -146,6 +162,16 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn only_one_claim_at_a_time() {
+        let store = store("claim");
+        let first = store.claim().unwrap();
+        assert!(first.is_some());
+        assert!(store.claim().unwrap().is_none());
+        drop(first);
+        assert!(store.claim().unwrap().is_some());
     }
 
     #[test]

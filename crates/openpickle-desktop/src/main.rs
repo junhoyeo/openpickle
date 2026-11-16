@@ -5,7 +5,17 @@ actions!(openpickle, [Quit]);
 
 fn main() {
     // Started before GPUI so the cached conversation loads while the window is being created.
-    let (commands, updates) = backend::start();
+    let (commands, updates) = match backend::start() {
+        Ok(ends) => ends,
+        Err(backend::StartError::AlreadyRunning) => {
+            eprintln!("Pickle is already running.");
+            return;
+        }
+        Err(backend::StartError::Store(error)) => {
+            eprintln!("Pickle cannot use its data folder: {error}");
+            std::process::exit(1);
+        }
+    };
     Application::new()
         .with_assets(Assets)
         .run(move |cx: &mut App| {

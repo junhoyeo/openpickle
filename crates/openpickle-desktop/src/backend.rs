@@ -32,24 +32,43 @@ use crate::{
 
 type EventStream = Pin<Box<dyn Stream<Item = openpickle_api::Result<PickleEvent>> + Send>>;
 
+/// Why the backend could not start.
+#[derive(Debug)]
+pub enum StartError {
+    /// Another instance of the app is running on this account.
+    AlreadyRunning,
+    /// The app's data folder cannot be used.
+    Store(std::io::Error),
+}
+
 /// Starts the backend thread and returns the two ends the UI holds.
-pub fn start() -> (
-    UnboundedSender<Command>,
-    futures::channel::mpsc::UnboundedReceiver<Update>,
-) {
+pub fn start() -> Result<
+    (
+        UnboundedSender<Command>,
+        futures::channel::mpsc::UnboundedReceiver<Update>,
+    ),
+    StartError,
+> {
+    let store = Store::open().map_err(StartError::Store)?;
+    let claim = store
+        .claim()
+        .map_err(StartError::Store)?
+        .ok_or(StartError::AlreadyRunning)?;
     let (commands, commands_rx) = unbounded_channel();
     let (updates, updates_rx) = futures::channel::mpsc::unbounded();
     std::thread::Builder::new()
         .name("backend".into())
         .spawn(move || {
+            // Held until the process ends.
+            let _claim = claim;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("tokio runtime");
-            runtime.block_on(run(commands_rx, updates));
+            runtime.block_on(run(store, commands_rx, updates));
         })
-        .expect("backend thread");
-    (commands, updates_rx)
+        .map_err(StartError::Store)?;
+    Ok((commands, updates_rx))
 }
 
 /// Why a signed-in stretch ended.
@@ -60,19 +79,7 @@ enum Ended {
     Closed,
 }
 
-async fn run(mut commands: Commands<Command>, updates: Updates<Update>) {
-    let store = match Store::open() {
-        Ok(store) => store,
-        Err(error) => {
-            updates.unbounded_send(Update::SignedOut).ok();
-            updates
-                .unbounded_send(Update::SignInFailed(format!(
-                    "Cannot open the app's data folder: {error}"
-                )))
-                .ok();
-            return;
-        }
-    };
+async fn run(store: Store, mut commands: Commands<Command>, updates: Updates<Update>) {
     let mut signed_in = store.session().map(|session| (session, None));
     loop {
         let (session, access_token) = match signed_in.take() {
