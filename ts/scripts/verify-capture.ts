@@ -39,6 +39,9 @@ const drain = async (events: AsyncIterable<unknown>) => {
 };
 
 const routes: [method: string, path: RegExp, call: Call][] = [
+  ["POST", /^\/api\/login-sessions\/phone-code$/, (c, _f, j) =>
+    c.requestPhoneCode(j.phone, { region: j.region, carrier: j.carrier })],
+  ["POST", /^\/api\/login-sessions$/, (c, _f, j) => c.verifyPhoneCode(j.pending_id, j.code)],
   ["POST", /^\/api\/login-sessions\/refresh$/, (c, _f, j) => c.refreshLoginSession(j.login_session_token)],
   ["POST", /^\/api\/account\/register$/, (c) => c.registerAccount()],
   ["POST", /^\/api\/session$/, (c, _f, json) => c.startSession(json)],

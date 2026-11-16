@@ -5,11 +5,13 @@ import type {
   EnclaveNode,
   HistoryDelta,
   KnownScreens,
+  LoginSessionIssued,
   LoginSessionRefresh,
   LogNodeSummary,
   LogStoreListings,
   LogStoreListingsRequest,
   PermissionSnapshot,
+  PhoneCodeRequested,
   Profile,
   RegisterResponse,
   SecureAccount,
@@ -75,20 +77,23 @@ export const IOS_PROFILE: ClientProfile = {
  *
  * - `accessToken`: a token, or a function asked for one before every request. Access tokens
  *   expire 5 minutes after issue.
- * - `loginSession`: a refresh token (`login_session_token`, `ls_…`). The client trades it for
- *   access tokens through `POST /api/login-sessions/refresh` as they run out. Every refresh
- *   spends the token and returns the next one, which `onRotate` must store; a lost token ends
- *   the login session. The app on your phone holds its own copy of this chain, so a token taken
- *   from its traffic stops working for whichever side refreshes second.
+ * - `loginSession`: a refresh token (`login_session_token`, `ls_…`), from `verifyPhoneCode()` or
+ *   a stored earlier one. The client trades it for access tokens through
+ *   `POST /api/login-sessions/refresh` as they run out. Every refresh spends the token and
+ *   returns the next one, which `onRotate` must store; a lost token ends the login session.
+ * - neither: a signed-out client. It can only request and verify a phone code and read the UI
+ *   definitions.
  */
 export type Credentials =
-  | { accessToken: string | (() => string | Promise<string>) }
+  | { accessToken: string | (() => string | Promise<string>); loginSession?: never }
   | {
       loginSession: {
         token: string;
         onRotate: (refresh: LoginSessionRefresh) => void | Promise<void>;
       };
-    };
+      accessToken?: never;
+    }
+  | { accessToken?: never; loginSession?: never };
 
 export type PickleClientOptions = Credentials & {
   /** The device id the app reports (iOS `identifierForVendor`). Defaults to a new random one. */
@@ -145,11 +150,12 @@ export class PickleClient {
   /** The access token from the last login session refresh, or the refresh in flight. */
   private sessionAccess: Promise<{ token: string; exp: number }> | undefined;
 
-  constructor(options: PickleClientOptions) {
-    this.credentials =
-      "loginSession" in options
-        ? { loginSession: { ...options.loginSession } }
-        : { accessToken: options.accessToken };
+  constructor(options: PickleClientOptions = {}) {
+    this.credentials = options.loginSession
+      ? { loginSession: { ...options.loginSession } }
+      : options.accessToken !== undefined
+        ? { accessToken: options.accessToken }
+        : {};
     this.baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, "");
     this.profile = { ...IOS_PROFILE, ...options.profile };
     this.deviceId = options.deviceId ?? crypto.randomUUID().toUpperCase();
@@ -161,20 +167,44 @@ export class PickleClient {
   // ---- Account and session ----
 
   /**
+   * `POST /api/login-sessions/phone-code`: texts a 6-digit sign-in code to `phone` (E.164, e.g.
+   * `+821012345678`). The code is valid for `expires_in` seconds (600). The app also sends the
+   * SIM's carrier (`lgu` was seen); pass `carrier` to do the same.
+   */
+  requestPhoneCode(
+    phone: string,
+    options: { region?: string; carrier?: string } = {},
+  ): Promise<PhoneCodeRequested> {
+    return this.request("POST", "/api/login-sessions/phone-code", {
+      auth: "app",
+      body: { phone, region: options.region ?? this.profile.deviceRegion, carrier: options.carrier },
+      headers: this.signInHeaders(),
+    });
+  }
+
+  /**
+   * `POST /api/login-sessions`: trades the texted code for a new login session. Pass its
+   * `login_session_token` to a client as `loginSession.token`. Other login sessions of the
+   * account, such as the phone's, keep working.
+   */
+  verifyPhoneCode(pendingId: string, code: string): Promise<LoginSessionIssued> {
+    return this.request("POST", "/api/login-sessions", {
+      auth: "app",
+      body: { pending_id: pendingId, code, kind: "phone_code" },
+      headers: this.signInHeaders(),
+    });
+  }
+
+  /**
    * `POST /api/login-sessions/refresh`: trades a refresh token for an access token and the next
-   * refresh token. The sent token is spent. A client created with `loginSession` calls this itself.
+   * refresh token. The sent token is spent; sending it again fails with 401 `session_not_found`.
+   * A client created with `loginSession` calls this itself.
    */
   refreshLoginSession(loginSessionToken: string): Promise<LoginSessionRefresh> {
     return this.request("POST", "/api/login-sessions/refresh", {
       auth: "app",
       body: { login_session_token: loginSessionToken },
-      headers: {
-        "X-Pickle-Onboarding-Flow": "4",
-        "X-Pickle-Sign-In-Flow": "2",
-        "X-Pickle-Login-Session-Rotation": "1",
-        "X-Client-Timezone": this.profile.timezone,
-        "X-Client-Platform": this.profile.platform,
-      },
+      headers: { ...this.signInHeaders(), "X-Pickle-Login-Session-Rotation": "1" },
     });
   }
 
@@ -432,11 +462,19 @@ export class PickleClient {
     return response;
   }
 
+  private signInHeaders(): Record<string, string> {
+    return {
+      "X-Pickle-Onboarding-Flow": "4",
+      "X-Pickle-Sign-In-Flow": "2",
+      "X-Client-Timezone": this.profile.timezone,
+      "X-Client-Platform": this.profile.platform,
+    };
+  }
+
   private async bearerToken(): Promise<string> {
-    if ("accessToken" in this.credentials) {
-      const { accessToken } = this.credentials;
-      return typeof accessToken === "function" ? accessToken() : accessToken;
-    }
+    const { accessToken } = this.credentials;
+    if (accessToken !== undefined) return typeof accessToken === "function" ? accessToken() : accessToken;
+    if (!this.credentials.loginSession) throw new Error("this client is signed out; give it credentials first");
     const pending = this.sessionAccess;
     const current = await pending?.catch(() => undefined);
     // Refresh a minute early so clock skew and slow requests do not meet an expired token.
@@ -448,8 +486,7 @@ export class PickleClient {
   }
 
   private async refreshSession(): Promise<{ token: string; exp: number }> {
-    if (!("loginSession" in this.credentials)) throw new Error("no login session");
-    const session = this.credentials.loginSession;
+    const session = this.credentials.loginSession!;
     const refresh = await this.refreshLoginSession(session.token);
     session.token = refresh.login_session_token;
     await session.onRotate(refresh);

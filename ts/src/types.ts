@@ -215,6 +215,13 @@ export interface SessionResponse extends AccountState {
   [key: string]: unknown;
 }
 
+export interface PhoneCodeRequested {
+  /** Names the texted code in `POST /api/login-sessions`. */
+  pending_id: string;
+  /** Seconds the code stays valid. */
+  expires_in: number;
+}
+
 export interface LoginSessionRefresh {
   /** The new access token, valid for 5 minutes. */
   login_session_jwt: string;
@@ -222,6 +229,11 @@ export interface LoginSessionRefresh {
   expires_at: string;
   /** The next refresh token. The one that was sent is spent. */
   login_session_token: string;
+}
+
+export interface LoginSessionIssued extends LoginSessionRefresh {
+  status: Open<"issued">;
+  user_id: string;
 }
 
 // ---- Profile and character ----
