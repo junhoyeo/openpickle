@@ -5,6 +5,7 @@
 //!   answers. Deleting it loses nothing.
 
 use std::{
+    fmt,
     fs::{self, File, OpenOptions, TryLockError},
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -12,12 +13,21 @@ use std::{
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     /// The current refresh token. Every refresh replaces it.
     pub login_session_token: String,
     /// The id this installation reports as its device.
     pub device_id: String,
+}
+
+/// Leaves the token out, so a log line or a failed assertion cannot carry it.
+impl fmt::Debug for Session {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Session")
+            .field("device_id", &self.device_id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -194,7 +204,8 @@ mod tests {
             device_id: "device".into(),
         };
         store.save_session(&session).unwrap();
-        assert_eq!(store.session(), Some(session));
+        assert_eq!(store.session(), Some(session.clone()));
+        assert!(!format!("{session:?}").contains("ls_test"));
     }
 
     #[cfg(unix)]

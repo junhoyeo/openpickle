@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use crate::model::Message;
 
-/// UI to backend.
-#[derive(Debug)]
+/// UI to backend. Neither side of the protocol can be printed with `{:?}`: a command may hold
+/// a phone number or a sign-in code, and both hold message text.
 pub enum Command {
     /// Text a sign-in code to this number (E.164).
     RequestCode(String),
@@ -22,7 +22,6 @@ pub enum Command {
 }
 
 /// Backend to UI.
-#[derive(Debug)]
 pub enum Update {
     /// There is no login session; show the sign-in screen.
     SignedOut,
