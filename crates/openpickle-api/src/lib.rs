@@ -65,7 +65,7 @@ pub enum Error {
     #[error("value is not allowed in an HTTP header")]
     InvalidHeader,
     /// The rotation callback failed. The new refresh token was not stored, so the client does
-    /// not use the access token it came with.
+    /// not use the access token it came with; the next request offers it to the callback again.
     #[error("storing the rotated login session token failed: {0}")]
     Rotate(std::io::Error),
 }

@@ -136,6 +136,68 @@ async fn seeded_access_token_skips_the_first_refresh_and_expired_one_rotates() {
     assert_eq!(server.take().len(), 1, "the sync was not sent");
 }
 
+/// A server that answers every refresh with a fresh access token and counts them.
+async fn refreshing_server(
+    refreshes: Arc<AtomicUsize>,
+    sync: impl Fn(&str) -> Reply + Send + Sync + 'static,
+) -> MockServer {
+    MockServer::start(move |request| {
+        if request.path == "/api/login-sessions/refresh" {
+            let n = refreshes.fetch_add(1, Ordering::SeqCst) + 1;
+            // Each refresh issues a different token: the expiry differs by a second.
+            let access = jwt(300 + n as i64);
+            Reply::json(
+                200,
+                format!(
+                    r#"{{"login_session_jwt":"{access}","expires_at":"2026-11-23T00:00:00Z","login_session_token":"ls_next_{n}"}}"#
+                ),
+            )
+        } else {
+            sync(request.header("authorization").unwrap_or_default())
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_rotation_that_could_not_be_stored_is_stored_before_anything_else() {
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let server = refreshing_server(refreshes.clone(), |_| Reply::json(200, SYNC)).await;
+    let stored = Arc::new(Mutex::new(Vec::new()));
+    let disk_full = Arc::new(AtomicUsize::new(1));
+    let session = LoginSession::new("ls_first", {
+        let (stored, disk_full) = (stored.clone(), disk_full.clone());
+        move |refresh| {
+            if disk_full.load(Ordering::SeqCst) == 1 {
+                return Err(std::io::Error::other("disk full"));
+            }
+            stored
+                .lock()
+                .unwrap()
+                .push(refresh.login_session_token.clone());
+            Ok(())
+        }
+    });
+    let pickle = client(&server, Credentials::LoginSession(session));
+
+    // The server spent `ls_first`, but the new token did not reach the disk: the call fails and
+    // the access token that came with it is not used.
+    assert!(matches!(pickle.sync().await, Err(Error::Rotate(_))));
+    assert!(matches!(pickle.sync().await, Err(Error::Rotate(_))));
+    assert!(
+        server
+            .take()
+            .iter()
+            .all(|request| request.path == "/api/login-sessions/refresh")
+    );
+
+    // Once the disk works, the same refresh is stored. No second token was spent meanwhile.
+    disk_full.store(0, Ordering::SeqCst);
+    assert_eq!(pickle.sync().await.unwrap().rev, 4);
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    assert_eq!(*stored.lock().unwrap(), ["ls_next_1"]);
+}
+
 #[tokio::test]
 async fn api_errors_carry_status_detail_and_body() {
     let server = MockServer::start(|request| match request.path.as_str() {

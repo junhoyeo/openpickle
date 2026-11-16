@@ -285,6 +285,9 @@ enum Bearer {
 struct SessionState {
     refresh_token: String,
     access: Option<SessionAccess>,
+    /// A refresh whose new token the rotation callback could not store. It is offered to the
+    /// callback again before anything else, and its access token is not used until then.
+    unsaved: Option<LoginSessionRefresh>,
 }
 
 struct SessionAccess {
@@ -363,6 +366,7 @@ impl PickleClient {
                     state: Arc::new(tokio::sync::Mutex::new(SessionState {
                         refresh_token: session.token,
                         access,
+                        unsaved: None,
                     })),
                     on_rotate: session.on_rotate,
                 }
@@ -870,16 +874,33 @@ impl PickleClient {
                 let on_rotate = on_rotate.clone();
                 let refresh = tokio::spawn(async move {
                     state.access = None;
-                    let refresh = client.refresh_login_session(&state.refresh_token).await?;
-                    state.refresh_token.clone_from(&refresh.login_session_token);
-                    on_rotate(&refresh).map_err(Error::Rotate)?;
-                    let access = SessionAccess {
-                        exp: decode_access_token(&refresh.login_session_jwt)?.exp,
-                        header: bearer_value(&refresh.login_session_jwt)?,
-                    };
-                    let header = access.header.clone();
-                    state.access = Some(access);
-                    Ok(header)
+                    loop {
+                        let (refresh, fresh) = match state.unsaved.take() {
+                            Some(refresh) => (refresh, false),
+                            None => {
+                                let refresh =
+                                    client.refresh_login_session(&state.refresh_token).await?;
+                                state.refresh_token.clone_from(&refresh.login_session_token);
+                                (refresh, true)
+                            }
+                        };
+                        if let Err(error) = on_rotate(&refresh) {
+                            state.unsaved = Some(refresh);
+                            return Err(Error::Rotate(error));
+                        }
+                        let exp = decode_access_token(&refresh.login_session_jwt)?.exp;
+                        // A refresh that waited to be stored may have aged out meanwhile.
+                        if !fresh && exp - 60 <= now_secs() {
+                            continue;
+                        }
+                        let access = SessionAccess {
+                            exp,
+                            header: bearer_value(&refresh.login_session_jwt)?,
+                        };
+                        let header = access.header.clone();
+                        state.access = Some(access);
+                        return Ok(header);
+                    }
                 });
                 refresh.await.expect("login session refresh panicked")
             }
