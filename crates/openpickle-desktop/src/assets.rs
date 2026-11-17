@@ -46,6 +46,7 @@ icons![
     "mic",
     "paintbrush",
     "phone",
+    "phone-filled",
     "phone-off",
     "plane",
     "plug",

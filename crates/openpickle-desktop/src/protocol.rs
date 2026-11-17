@@ -33,6 +33,9 @@ pub enum Command {
     LoadPhoneCalls,
     /// Resolve a captured subagent handoff path through the fresh authorized handoff list.
     ResolvePhoneTask(String),
+    /// Read the call of a phone task for its card in the chat. A live one is read again
+    /// until it ends.
+    LoadPhoneCard(String),
     /// Open/refresh one transcript, or stop watching when None. Closing never hangs up.
     WatchPhoneCall(Option<String>),
     /// Explicitly confirmed request to end the currently watched live call.
@@ -106,6 +109,11 @@ pub enum Update {
     PhoneTask {
         path: String,
         result: Result<String, String>,
+    },
+    /// The call of the phone task at this handoff path, for its card in the chat.
+    PhoneCard {
+        path: String,
+        call: PhoneCallTranscript,
     },
     /// A snapshot or failure of the requested call, never an unscoped update.
     PhoneCall {

@@ -24,8 +24,9 @@ servers the iOS app does, with your own account.
   with documents listed by name, kind and size.
 - **Explore.** The second tab lists what your Pickle offers to do for you, in sections and by
   area. An offer shows how it would go about it, and Start asks for it in the chat.
-- **Phone calls.** Browse calls placed by Pickle, read their live transcripts and request an
-  end only after confirmation. Opening the call list does not dial a number.
+- **Phone calls.** A call Pickle placed shows in the chat as a card with the end of its
+  transcript. Open it to read the whole call as it goes, and request an end only after
+  confirmation. Opening a call or the call list does not dial a number.
 - **My Pickle.** The fourth tab shows account, usage, reset-ticket holdings and connected-service
   information. The usage card opens the detailed, read-only Usage screen.
 - **Friends and invites.** The menu leads to your friends, and Invite to your invite link, how

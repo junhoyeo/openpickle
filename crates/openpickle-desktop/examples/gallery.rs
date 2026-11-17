@@ -1,6 +1,7 @@
 //! `phone-demo float` shows a synthetic live transcript and confirmation controls. It has no
 //! backend or action subscriber and cannot place or end a real call. `ended` shows the call
-//! after it ended and `call=<file>` the transcript in that JSON file.
+//! after it ended, `call=<file>` the transcript in that JSON file, and `app phone` the card of
+//! the call in the chat.
 //!
 //! Opens the chat screen with made-up messages that have the same structure as the Figma frames,
 //! to compare the two side by side: `cargo run -p openpickle-desktop --example gallery`.
@@ -437,6 +438,26 @@ fn main() {
         ));
     }
 
+    // `phone` adds a call Pickle placed, as the chat shows it: a card over its transcript.
+    if std::env::args().any(|arg| arg == "phone") {
+        messages.push(message(
+            9,
+            0.9,
+            Side::Theirs,
+            "<bubble>도서관에 바로 전화해서 운영 시간 확인해 볼게요!</bubble>",
+        ));
+        let task = serde_json::json!({
+            "id": "sample-task", "role": "subagent", "seq": 10,
+            "at": Local::now().timestamp() as f64 - 0.8 * 60.,
+            "title": "📞 도서관 자동 응답 안내", "path": "handoffs/sample-call",
+        });
+        messages.push(openpickle_desktop::convert::message(
+            &serde_json::from_value(task).unwrap(),
+            None,
+        ));
+        messages.push(message(11, 0.5, Side::Mine, "주말에도 여는지 알려줘"));
+    }
+
     // `many` repeats the conversation to check that a long history costs nothing at launch.
     if std::env::args().any(|arg| arg == "many") {
         let sample = messages.clone();
@@ -536,6 +557,10 @@ fn main() {
                                     at: "Today".into(),
                                 },
                             ])),
+                            Command::LoadPhoneCard(path) => Update::PhoneCard {
+                                path,
+                                call: sample_phone_call("sample-call", live_call),
+                            },
                             Command::WatchPhoneCall(Some(call_id)) => Update::PhoneCall {
                                 result: Ok(sample_phone_call(&call_id, live_call)),
                                 call_id,

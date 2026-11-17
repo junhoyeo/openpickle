@@ -30,8 +30,11 @@ cargo run -p openpickle-desktop --example gallery -- app   # the whole window: m
   area's chip lists that area's offers by rank. An offer opens a sheet with its steps, and
   Start sends the offer's text to the chat with the offer's id. Offers that stay on screen are
   reported to the server, as the app does.
-- **Phone calls**: live/completed calls placed by Pickle, with transcript, status, copy and
-  explicit end-call confirmation. Open from the composer phone button, menu, or Cmd-Shift-P.
+- **Phone calls**: live/completed calls placed by Pickle, drawn as the phone app draws them. In
+  the chat a call is a card with its name, the other side's number, how long it lasted and the
+  end of its transcript; a live call's card is read again every four seconds. A click opens the
+  transcript, where Cmd-C copies it and a live call can be ended after a confirmation. The
+  calls are also listed behind the composer's phone button, in the menu, and with Cmd-Shift-P.
 - **My Pickle** (the fourth tab, Cmd-5): account name, daily usage, reset time, full/half reset
   ticket holdings and server-reported connection count. The Usage card opens a scrollable
   detail page. Credits/plan events update the displayed snapshot as they arrive.

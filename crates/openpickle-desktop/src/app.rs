@@ -355,7 +355,16 @@ impl Shell {
                     phone.update(cx, |phone, cx| phone.set_calls(result, cx));
                 }
             }
+            Update::PhoneCard { path, call } => {
+                if let Screen::Chat(chat) = &self.screen {
+                    chat.update(cx, |chat, cx| chat.set_phone_card(path, call, cx));
+                }
+            }
             Update::PhoneCall { call_id, result } => {
+                // The chat's card of this call shows what the open transcript just read.
+                if let (Ok(call), Screen::Chat(chat)) = (&result, &self.screen) {
+                    chat.update(cx, |chat, cx| chat.refresh_phone_card(call, cx));
+                }
                 if let Some(Over::Phone(phone)) = &self.over {
                     phone.update(cx, |phone, cx| phone.set_call(&call_id, result, cx));
                 }
@@ -536,6 +545,11 @@ impl Shell {
                 ChatEvent::LoadAttachments(paths) => {
                     this.commands
                         .send(Command::LoadAttachments(paths.clone()))
+                        .ok();
+                }
+                ChatEvent::LoadPhoneCard(path) => {
+                    this.commands
+                        .send(Command::LoadPhoneCard(path.clone()))
                         .ok();
                 }
             }),

@@ -1,23 +1,28 @@
 //! Draws one row of the message list: a bubble, a card, a timestamp.
 
-use std::{cell::Cell, ops::Range, time::Duration};
+use std::{cell::Cell, collections::HashMap, ops::Range, time::Duration};
 
 use gpui::{
-    Animation, AnimationExt, AnyElement, Div, FontWeight, HighlightStyle, MouseButton, ObjectFit,
-    Pixels, SharedString, StyledText, UnderlineStyle, Window, div, img, prelude::*, px, relative,
-    svg,
+    Animation, AnimationExt, AnyElement, Div, FontWeight, HighlightStyle, ImageSource, MouseButton,
+    ObjectFit, Pixels, SharedString, StyledText, UnderlineStyle, Window, div, img,
+    linear_color_stop, linear_gradient, prelude::*, px, relative, svg,
 };
+use openpickle_api::PhoneCallTranscript;
 
 use crate::{
     content::{Card, CardRow, RichText, Span, SpanKind},
     model::{AttachmentKind, Part, Request, RequestStatus, Row, RowKind, Side},
-    theme,
+    phone, theme,
     ui::{
         Pictures,
+        phone::{TRACKED, transcript_line},
         select::{LinkHandler, SelectableText, SharedSelection},
         wrap::keep_words,
     },
 };
+
+/// The calls the phone cards show, by the handoff path of their task.
+pub type PhoneCards = HashMap<String, PhoneCallTranscript>;
 
 /// Widths from the design column (408 pt of content): bubbles hug their text up to these.
 const THEIRS_MAX: f32 = 394. / 408.;
@@ -38,6 +43,10 @@ pub struct RowContext<'a> {
     pub pictures: &'a Pictures,
     /// Whether the row belongs to the message a search result has just opened.
     pub marked: bool,
+    /// The calls that have been read for the phone cards.
+    pub phone_cards: Option<&'a PhoneCards>,
+    /// The character's picture, which stands next to its lines of a call.
+    pub avatar: Option<ImageSource>,
     /// How many of the row's texts have been drawn so far.
     drawn: Cell<usize>,
 }
@@ -62,6 +71,8 @@ impl<'a> RowContext<'a> {
             on_link,
             pictures,
             marked: false,
+            phone_cards: None,
+            avatar: None,
             drawn: Cell::new(0),
         }
     }
@@ -104,6 +115,7 @@ pub fn render_row(cx: &RowContext) -> AnyElement {
             };
             let surface = shaped(row, matches!(part, Part::Bubble(_) | Part::Task(_)));
             let content: AnyElement = match part {
+                Part::PhoneTask { title, path } => phone_card(surface, title, path, cx),
                 Part::Bubble(rich) => bubble(surface, rich, cx).into_any_element(),
                 // A note, not speech: a started task, attachments, a failed send.
                 Part::Task(title) => surface
@@ -118,30 +130,6 @@ pub fn render_row(cx: &RowContext) -> AnyElement {
                     })
                     .child(plain(title, cx))
                     .into_any_element(),
-                Part::PhoneTask { title, path } => {
-                    let target = format!("handoff:{path}");
-                    let on_link = cx.on_link.clone();
-                    let selection = cx.selection.clone();
-                    div()
-                        .id(("phone-task", cx.index))
-                        .px(px(14.))
-                        .py(px(11.))
-                        .max_w(relative(THEIRS_MAX))
-                        .rounded(theme::BUBBLE_RADIUS)
-                        .bg(theme::color(theme::SURFACE))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .cursor_pointer()
-                        .on_click(move |_, window, cx| {
-                            if selection.borrow().is_empty() {
-                                on_link(&target, window, cx);
-                            }
-                        })
-                        .child(super::icon("phone", 17., theme::TEXT_MUTED))
-                        .child(plain(title, cx))
-                        .into_any_element()
-                }
                 Part::Files(files) => {
                     let room = cx.content_width
                         * if row.side == Side::Mine {
@@ -340,6 +328,155 @@ fn file_card(item: &crate::model::Attachment, room: Pixels, cx: &RowContext) -> 
         })
         .child(div().flex_none().child(preview))
         .child(labels)
+        .into_any_element()
+}
+
+/// The transcript in a phone card is the transcript screen at this scale, with text that is
+/// a little larger for it: a line holds fewer words there.
+const CARD_TRANSCRIPT_SCALE: f32 = 0.73;
+const CARD_TEXT_SCALE: f32 = 0.742;
+/// A card shows the end of the call: no more lines than can fill its window.
+const CARD_TRANSCRIPT_LINES: usize = 6;
+
+/// A call Pickle placed: its name, the other side and how long it lasted, over the end of its
+/// transcript. Until the call has been read the card has the task's title alone.
+fn phone_card(surface: Div, title: &str, path: &str, cx: &RowContext) -> AnyElement {
+    let call = cx.phone_cards.and_then(|cards| cards.get(path));
+    let target = format!("handoff:{path}");
+    let on_link = cx.on_link.clone();
+    let selection = cx.selection.clone();
+    // The task is titled "📞 name"; the card has its own phone icon.
+    let name = call.map_or_else(
+        || title.trim_start_matches('📞').trim_start().to_owned(),
+        |call| call.title.clone(),
+    );
+    let counterpart = call
+        .map(|call| call.counterpart_label.clone())
+        .filter(|label| !label.is_empty());
+    let duration = call.and_then(|call| phone::duration_label(call, phone::now_ms()));
+
+    let header = div()
+        .w_full()
+        .pt(px(12.))
+        .pb(px(10.))
+        .pl(px(12.))
+        .pr(px(20.))
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .child(
+            div()
+                .size(px(38.))
+                .flex_none()
+                .rounded(px(12.))
+                .bg(theme::color(theme::TILE))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(super::icon("phone-filled", 17., theme::TEXT)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .child(
+                    div()
+                        .text_size(px(15.))
+                        .line_height(px(20.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .truncate()
+                        .child(name),
+                )
+                .children(counterpart.map(|label| {
+                    div()
+                        .text_size(px(12. * TRACKED))
+                        .line_height(px(16.))
+                        .text_color(theme::alpha(0xffffff, 0.48))
+                        .truncate()
+                        .child(label)
+                })),
+        )
+        .children(duration.map(|duration| {
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(5.))
+                .text_size(px(15.5))
+                .line_height(px(20.))
+                .text_color(theme::color(theme::TEXT_FAINT))
+                .child(super::icon("audio-lines", 16., theme::TEXT_FAINT))
+                .child(duration)
+        }));
+
+    let lines = call.map(|call| {
+        let from = call.lines.len().saturating_sub(CARD_TRANSCRIPT_LINES);
+        &call.lines[from..]
+    });
+    // The window on the transcript: its last lines stand at the bottom, the ones before them
+    // run out under the top, where the page fades in over them.
+    let transcript = lines.filter(|lines| !lines.is_empty()).map(|lines| {
+        div()
+            .relative()
+            .mx(px(4.))
+            .mb(px(4.))
+            .h(px(165.))
+            .rounded(theme::CARD_RADIUS - px(4.))
+            .bg(theme::color(theme::PAGE))
+            .overflow_hidden()
+            .child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .px(px(14.))
+                    .pb(px(13.))
+                    .flex()
+                    .flex_col()
+                    .children(lines.iter().map(|line| {
+                        transcript_line(
+                            line,
+                            cx.avatar.clone(),
+                            CARD_TRANSCRIPT_SCALE,
+                            CARD_TEXT_SCALE,
+                            cx.window,
+                        )
+                    })),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(90.))
+                    .rounded_t(theme::CARD_RADIUS - px(4.))
+                    .bg(linear_gradient(
+                        180.,
+                        linear_color_stop(theme::alpha(theme::PAGE, 0.82), 0.),
+                        linear_color_stop(theme::alpha(theme::PAGE, 0.), 1.),
+                    )),
+            )
+    });
+
+    surface
+        .id(("phone-task", cx.index))
+        .w(px(380.))
+        .max_w_full()
+        .flex()
+        .flex_col()
+        .cursor_pointer()
+        .on_click(move |_, window, cx| {
+            if selection.borrow().is_empty() {
+                on_link(&target, window, cx);
+            }
+        })
+        .child(header)
+        .children(transcript)
         .into_any_element()
 }
 
