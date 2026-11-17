@@ -46,11 +46,24 @@ cargo run -p openpickle-desktop --example gallery -- app   # the whole window: m
 
 Not built: the Profile tab, the menu's 3D World and My Pickle, the microphone and voice calls
 (all drawn, none active); opening a picture full size, saving or sharing a file, the + that
-makes documents; link previews; reactions; answering a request card; other rooms than the one
-with your character. No capture shows the requests for deleting an offer, adding a friend,
+makes documents; website preview cards; reactions; answering a request card. No capture shows the requests for deleting an offer, adding a friend,
 answering a friend request or a friend's own page, so those are left out, as are the contacts
 list, sharing the invite through other apps and the Korean roulette promotion. The texts of the
 new screens are English readings of the app's string keys; the strings were not captured.
+
+## Chat links and attachment previews
+
+- Room cards and `pickle://chat?room_id=…` links open a conversation listed by the
+  signed-in account's `sync()` response. The menu's **Other chats** lists those rooms;
+  **Chat** returns to your own character. Observer rooms have no send composer.
+- Room history, pending messages, drafts, read cursors and live updates stay scoped to
+  their room. Unscoped character events are not inserted into a peer conversation.
+- Generated file links are resolved through the message's attachment map. Clicking a
+  file card or its linked name opens a **thumbnail preview**. For a PDF this is its
+  **first page**, not the original document. Loading failures show a retry action.
+- **Original-file opening, downloading and sharing are not implemented.** The captures
+  show only the thumbnail endpoint, not an original-file download route. Open the
+  original in the Pickle phone app until that route has been captured.
 
 ## Packaging
 

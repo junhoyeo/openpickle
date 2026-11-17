@@ -52,6 +52,9 @@ pub struct Selection {
 
 pub type SharedSelection = Rc<RefCell<Selection>>;
 
+/// A link activation, shared by selectable text and cards.
+pub type LinkHandler = Rc<dyn Fn(&str, &mut Window, &mut App)>;
+
 impl Selection {
     /// The selected stretch in reading order, or `None` when nothing is selected.
     fn span(&self) -> Option<(Position, Position)> {
@@ -208,8 +211,12 @@ impl Selection {
     }
 
     /// Whether the last press ended where it began, which makes it a click.
-    fn is_click(&self) -> bool {
-        self.anchor == self.head
+    fn is_click_at(&self, row: usize, text: usize) -> bool {
+        self.dragging
+            && self.anchor == self.head
+            && self
+                .anchor
+                .is_some_and(|anchor| anchor.row == row && anchor.text == text)
     }
 
     pub fn set_context_row(&mut self, row: usize) {
@@ -232,7 +239,7 @@ pub struct SelectableText {
     pub ordinal: usize,
     pub selection: SharedSelection,
     pub links: Vec<(Range<usize>, SharedString)>,
-    pub on_link: fn(&str, &mut Window, &mut App),
+    pub on_link: LinkHandler,
 }
 
 impl IntoElement for SelectableText {
@@ -398,14 +405,14 @@ impl Element for SelectableText {
 
         window.on_mouse_event({
             let (hitbox, selection, on_link) =
-                (hitbox.clone(), self.selection.clone(), self.on_link);
+                (hitbox.clone(), self.selection.clone(), self.on_link.clone());
             move |event: &MouseUpEvent, phase, window, cx| {
                 let released_here = phase == DispatchPhase::Bubble
                     && event.button == MouseButton::Left
                     && hitbox.is_hovered(window);
                 // A press that did not drag is a click, which follows a link.
                 if released_here
-                    && selection.borrow().is_click()
+                    && selection.borrow().is_click_at(row, ordinal)
                     && let Some(url) = link_at(event.position)
                 {
                     on_link(&url, window, cx);

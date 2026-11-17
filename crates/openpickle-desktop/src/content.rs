@@ -9,6 +9,8 @@ use std::ops::Range;
 /// One visual unit of a message.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Block {
+    /// A link that opens another chat room, which the app puts in a card fence.
+    RoomLink(String),
     Bubble(RichText),
     Card(Card),
 }
@@ -32,7 +34,74 @@ pub enum SpanKind {
     Italic,
     Code,
     Muted,
+    /// A canonical target string. Message conversion resolves file aliases before the UI sees it.
     Link(String),
+}
+
+/// A link action the desktop app supports. Other schemes are inert.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkTarget {
+    Web(String),
+    Room(String),
+    /// The server attachment path, without the `attachment:` prefix.
+    Attachment(String),
+}
+
+impl LinkTarget {
+    /// Parses a canonical link target. This deliberately does not turn arbitrary local paths or
+    /// unsupported internal schemes into web addresses.
+    pub fn parse(target: &str) -> Option<Self> {
+        if target.starts_with("https://") || target.starts_with("http://") {
+            return Some(Self::Web(target.to_owned()));
+        }
+        if let Some(path) = target.strip_prefix("attachment:") {
+            return Self::attachment(path);
+        }
+        let query = target.strip_prefix("pickle://chat?")?;
+        let mut room_id = None;
+        for parameter in query.split('&') {
+            let (name, value) = parameter.split_once('=').unwrap_or((parameter, ""));
+            if name == "room_id" {
+                if room_id.is_some() || !valid_room_id(value) {
+                    return None;
+                }
+                room_id = Some(value);
+            }
+        }
+        room_id.map(|room_id| Self::Room(room_id.to_owned()))
+    }
+
+    /// Builds a canonical target only for a server attachment path.
+    pub fn attachment(path: &str) -> Option<Self> {
+        valid_attachment_path(path).then(|| Self::Attachment(path.to_owned()))
+    }
+
+    /// The canonical string stored in a rich-text link span and passed through the row callback.
+    pub fn into_link(self) -> String {
+        match self {
+            Self::Web(url) => url,
+            Self::Room(room_id) => format!("pickle://chat?room_id={room_id}"),
+            Self::Attachment(path) => format!("attachment:{path}"),
+        }
+    }
+}
+
+fn valid_room_id(room_id: &str) -> bool {
+    !room_id.is_empty()
+        && room_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn valid_attachment_path(path: &str) -> bool {
+    path.strip_prefix("attachments/").is_some_and(|rest| {
+        !rest.is_empty()
+            && !rest.contains('\\')
+            && !rest.chars().any(char::is_control)
+            && rest
+                .split('/')
+                .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+    })
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -118,7 +187,14 @@ fn push_markdown(markdown: &str, blocks: &mut Vec<Block>) {
                 card = Some(String::new());
             }
             (Some(body), Some(_)) => {
-                blocks.push(Block::Card(parse_card(body)));
+                // A card whose whole body is one supported chat address opens that room.
+                // Parsing it here and inline uses the same scheme and query validation.
+                let body = body.trim();
+                if let Some(LinkTarget::Room(room_id)) = LinkTarget::parse(body) {
+                    blocks.push(Block::RoomLink(room_id));
+                } else {
+                    blocks.push(Block::Card(parse_card(body)));
+                }
                 card = None;
             }
             (Some(body), None) => {
@@ -447,6 +523,52 @@ mod tests {
                 range: 7..13,
                 kind: SpanKind::Bold
             }]
+        );
+    }
+
+    #[test]
+    fn link_target_parses_only_supported_canonical_targets() {
+        let cases = [
+            (
+                "https://example.test/a?next=pickle%3A%2F%2Fchat",
+                Some(LinkTarget::Web(
+                    "https://example.test/a?next=pickle%3A%2F%2Fchat".into(),
+                )),
+            ),
+            (
+                "pickle://chat?source=card&room_id=room-test&view=compact",
+                Some(LinkTarget::Room("room-test".into())),
+            ),
+            (
+                "attachment:attachments/2026-11-17/%ED%95%9C%EA%B8%80.pdf",
+                Some(LinkTarget::Attachment(
+                    "attachments/2026-11-17/%ED%95%9C%EA%B8%80.pdf".into(),
+                )),
+            ),
+            ("pickle://chat?room_id=", None),
+            ("pickle://chat?room_id=first&room_id=second", None),
+            ("attachment:/tmp/report.pdf", None),
+            ("attachment:attachments/../secret", None),
+            ("file:///tmp/report.pdf", None),
+            ("javascript:alert(1)", None),
+            ("data:text/plain,no", None),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(LinkTarget::parse(raw), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn room_link_cards_use_the_same_query_parser_as_inline_links() {
+        let blocks = parse_message(
+            "```card\npickle://chat?source=reply&room_id=room-first\n```\n\n```card\npickle://chat?room_id=room-second&source=reply\n```",
+        );
+        assert_eq!(
+            blocks,
+            vec![
+                Block::RoomLink("room-first".into()),
+                Block::RoomLink("room-second".into()),
+            ]
         );
     }
 

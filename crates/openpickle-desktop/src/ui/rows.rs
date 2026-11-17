@@ -3,16 +3,18 @@
 use std::{cell::Cell, ops::Range, time::Duration};
 
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Div, FontWeight, HighlightStyle, MouseButton, Pixels,
-    SharedString, StyledText, UnderlineStyle, Window, div, prelude::*, px, relative, svg,
+    Animation, AnimationExt, AnyElement, Div, FontWeight, HighlightStyle, MouseButton, ObjectFit,
+    Pixels, SharedString, StyledText, UnderlineStyle, Window, div, img, prelude::*, px, relative,
+    svg,
 };
 
 use crate::{
     content::{Card, CardRow, RichText, Span, SpanKind},
-    model::{Part, Request, RequestStatus, Row, RowKind, Side},
+    model::{AttachmentKind, Part, Request, RequestStatus, Row, RowKind, Side},
     theme,
     ui::{
-        select::{SelectableText, SharedSelection},
+        Pictures,
+        select::{LinkHandler, SelectableText, SharedSelection},
         wrap::keep_words,
     },
 };
@@ -31,7 +33,9 @@ pub struct RowContext<'a> {
     /// Width of the message column without its gutters.
     pub content_width: Pixels,
     pub selection: &'a SharedSelection,
-    pub on_link: fn(&str, &mut Window, &mut App),
+    pub on_link: LinkHandler,
+    /// The pictures on disk, for the files a message carries.
+    pub pictures: &'a Pictures,
     /// Whether the row belongs to the message a search result has just opened.
     pub marked: bool,
     /// How many of the row's texts have been drawn so far.
@@ -44,7 +48,8 @@ impl<'a> RowContext<'a> {
         row: &'a Row,
         index: usize,
         selection: &'a SharedSelection,
-        on_link: fn(&str, &mut Window, &mut App),
+        on_link: LinkHandler,
+        pictures: &'a Pictures,
     ) -> Self {
         let content_width =
             window.viewport_size().width.min(theme::COLUMN_MAX) - theme::GUTTER * 2.;
@@ -55,6 +60,7 @@ impl<'a> RowContext<'a> {
             content_width,
             selection,
             on_link,
+            pictures,
             marked: false,
             drawn: Cell::new(0),
         }
@@ -97,8 +103,8 @@ pub fn render_row(cx: &RowContext) -> AnyElement {
                 Side::Theirs => line.justify_start(),
             };
             let surface = shaped(row, matches!(part, Part::Bubble(_) | Part::Task(_)));
-            let content = match part {
-                Part::Bubble(rich) => bubble(surface, rich, cx),
+            let content: AnyElement = match part {
+                Part::Bubble(rich) => bubble(surface, rich, cx).into_any_element(),
                 // A note, not speech: a started task, attachments, a failed send.
                 Part::Task(title) => surface
                     .px(px(14.))
@@ -110,15 +116,84 @@ pub fn render_row(cx: &RowContext) -> AnyElement {
                     .when(row.side == Side::Mine, |note| {
                         note.text_color(theme::alpha(theme::ON_MINE, 0.6))
                     })
-                    .child(plain(title, cx)),
+                    .child(plain(title, cx))
+                    .into_any_element(),
+                Part::Files(files) => {
+                    let room = cx.content_width
+                        * if row.side == Side::Mine {
+                            MINE_MAX
+                        } else {
+                            THEIRS_MAX
+                        }
+                        - px(28.);
+                    surface
+                        .px(px(14.))
+                        .py(px(11.))
+                        .max_w(relative(THEIRS_MAX))
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.))
+                        .children(files.items.iter().map(|item| file_card(item, room, cx)))
+                        .into_any_element()
+                }
+                Part::RoomLink {
+                    room_id,
+                    label,
+                    picture,
+                } => {
+                    let target = format!("pickle://chat?room_id={room_id}");
+                    let on_link = cx.on_link.clone();
+                    let selection = cx.selection.clone();
+                    div()
+                        .id(("room-link", cx.index))
+                        .max_w(relative(THEIRS_MAX))
+                        .px(px(14.))
+                        .py(px(12.))
+                        .rounded(theme::BUBBLE_RADIUS)
+                        .bg(theme::color(theme::SURFACE))
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .cursor_pointer()
+                        .hover(|card| card.bg(theme::color(theme::SURFACE_INSET)))
+                        .on_click(move |_, window, cx| {
+                            if selection.borrow().is_empty() {
+                                on_link(&target, window, cx);
+                            }
+                        })
+                        .child(super::face(cx.pictures.get(picture), 38.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .child(
+                                    div()
+                                        .text_size(theme::LABEL)
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(plain(label, cx)),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .text_color(theme::color(theme::TEXT_FAINT))
+                                        .child("Open chat room"),
+                                ),
+                        )
+                        .into_any_element()
+                }
                 // Cards sit 2 pt further from their neighbors than bubbles do.
                 Part::Card(card) => div()
                     .py(px(2.))
                     .w(relative(THEIRS_MAX))
-                    .child(info_card(surface, card, cx)),
-                Part::Request(request) => {
-                    div().py(px(2.)).child(request_card(surface, request, cx))
-                }
+                    .child(info_card(surface, card, cx))
+                    .into_any_element(),
+                Part::Request(request) => div()
+                    .py(px(2.))
+                    .child(request_card(surface, request, cx))
+                    .into_any_element(),
             };
             line.child(content).into_any_element()
         }
@@ -169,6 +244,79 @@ fn bubble(surface: Div, rich: &RichText, cx: &RowContext) -> Div {
         .py(px(11.))
         .max_w(relative(max))
         .child(rich_text(rich, Some(wrap), cx))
+}
+
+/// A message attachment. The original remains private on Pickle; this card opens a clearly
+/// labelled thumbnail preview using the endpoint observed in the captures.
+fn file_card(item: &crate::model::Attachment, room: Pixels, cx: &RowContext) -> AnyElement {
+    let key = super::archive::thumbnail_key(&item.path);
+    let size = if item.kind == AttachmentKind::Picture {
+        px(110.)
+    } else {
+        px(46.)
+    };
+    let preview = match cx.pictures.get(&key) {
+        Some(source) => img(source)
+            .size(size)
+            .rounded(px(8.))
+            .object_fit(ObjectFit::Contain)
+            .into_any_element(),
+        None => div()
+            .size(size)
+            .rounded(px(8.))
+            .bg(theme::alpha(0xffffff, 0.06))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                svg()
+                    .path("icons/file-text.svg")
+                    .size(px(22.))
+                    .text_color(theme::color(theme::TEXT_MUTED)),
+            )
+            .into_any_element(),
+    };
+    let on_link = cx.on_link.clone();
+    let target = format!("attachment:{}", item.path);
+    let selection = cx.selection.clone();
+    let mut labels = div().flex_1().min_w_0().flex().flex_col().gap(px(3.));
+    if !item.name.is_empty() {
+        labels = labels.child(div().text_size(theme::LABEL).child(plain(&item.name, cx)));
+    }
+    if !item.detail.is_empty() {
+        labels = labels.child(
+            div()
+                .text_size(px(13.))
+                .text_color(theme::color(theme::TEXT_FAINT))
+                .child(plain(&item.detail, cx)),
+        );
+    }
+    labels = labels.child(
+        div()
+            .text_size(px(12.))
+            .text_color(theme::color(theme::LINK))
+            .child("Preview"),
+    );
+    div()
+        .id(SharedString::from(format!(
+            "attachment-{}-{}",
+            cx.index,
+            cx.drawn.get()
+        )))
+        .w(room)
+        .max_w_full()
+        .flex()
+        .items_center()
+        .gap(px(12.))
+        .cursor_pointer()
+        .on_click(move |_, window, cx| {
+            if selection.borrow().is_empty() {
+                on_link(&target, window, cx);
+            }
+        })
+        .child(div().flex_none().child(preview))
+        .child(labels)
+        .into_any_element()
 }
 
 /// Text with its bold, link and code ranges styled. `wrap` is the width body text may fill;
@@ -262,7 +410,7 @@ fn text(content: &str, spans: &[Span], wrap: Option<Pixels>, cx: &RowContext) ->
         ordinal,
         selection: cx.selection.clone(),
         links,
-        on_link: cx.on_link,
+        on_link: cx.on_link.clone(),
     }
     .into_any_element()
 }

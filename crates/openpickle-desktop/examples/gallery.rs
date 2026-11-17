@@ -279,9 +279,15 @@ fn search(messages: &[Message], query: &str) -> Vec<SearchResult> {
 }
 
 fn message(seq: u64, minutes_ago: f64, side: Side, text: &str) -> Message {
+    // A room link has no label here; the sample has none to name.
     let parts = parse_message(text)
         .into_iter()
         .map(|block| match block {
+            Block::RoomLink(room_id) => Part::RoomLink {
+                room_id,
+                label: "Open chat room".into(),
+                picture: String::new(),
+            },
             Block::Bubble(text) => Part::Bubble(Arc::new(text)),
             Block::Card(card) => Part::Card(Arc::new(card)),
         })
@@ -338,6 +344,21 @@ fn main() {
     messages.push(message(7, 9., Side::Theirs, "<bubble>지금 자리 남아있는지 바로 확인해 볼게요!</bubble>\n<bubble>공식 웹사이트 (프로그램 상세)\nhttps://example.com/\n\n직접 둘러보셔도 되고, 폼 입력 귀찮으시면 언제든 말씀해 주세요.</bubble>"));
     messages.push(message(8, 1., Side::Mine, "링크 부탁해"));
 
+    if std::env::args().any(|arg| arg == "links") {
+        let value = serde_json::json!({
+            "id": "sample-links", "role": "assistant", "seq": 9,
+            "at": Local::now().timestamp() as f64,
+            "text": "<bubble>[Open the sample report](downloads/sample.pdf)</bubble>\n```card\npickle://chat?room_id=11111111-1111-4111-8111-111111111111\n```",
+            "app_references": {"pickle://chat?room_id=11111111-1111-4111-8111-111111111111": "Sample room"},
+            "inline_files": {"downloads/sample.pdf": "attachments/2026-01-01/sample.pdf"},
+            "file_meta": {"attachments/2026-01-01/sample.pdf": {"name": "Sample report.pdf", "size": 2048, "pages": 4}}
+        });
+        messages.push(openpickle_desktop::convert::message(
+            &serde_json::from_value(value).unwrap(),
+            None,
+        ));
+    }
+
     // `many` repeats the conversation to check that a long history costs nothing at launch.
     if std::env::args().any(|arg| arg == "many") {
         let sample = messages.clone();
@@ -370,6 +391,9 @@ fn main() {
                 let (commands, mut asked) = tokio::sync::mpsc::unbounded_channel();
                 let (updates, received) = futures::channel::mpsc::unbounded();
                 let conversation = Update::Conversation {
+                    room_id: "primary".into(),
+                    is_character: true,
+                    can_send: true,
                     name: "Pickle".into(),
                     avatar: None,
                     messages: messages.clone(),
@@ -386,8 +410,38 @@ fn main() {
                             Command::LoadSocial => Update::Social(Ok(sample_social())),
                             Command::LoadExplore => Update::Explore(Ok(sample_explore())),
                             Command::LoadArchive => Update::Archive {
+                                room_id: "primary".into(),
                                 attachments: sample_archive(),
                                 complete: true,
+                            },
+                            Command::OpenRoom(room_id) => Update::Conversation {
+                                room_id: if room_id.is_empty() {
+                                    "primary".into()
+                                } else {
+                                    room_id.clone()
+                                },
+                                is_character: room_id.is_empty(),
+                                can_send: room_id.is_empty(),
+                                name: if room_id.is_empty() {
+                                    "Pickle".into()
+                                } else {
+                                    "Sample room".into()
+                                },
+                                avatar: None,
+                                messages: if room_id.is_empty() {
+                                    messages.clone()
+                                } else {
+                                    vec![message(
+                                        1,
+                                        1.,
+                                        Side::Theirs,
+                                        "<bubble>Sample conversation.</bubble>",
+                                    )]
+                                },
+                            },
+                            Command::PreviewAttachment(path) => Update::AttachmentPreview {
+                                path,
+                                result: Err("No thumbnail exists for this sample file.".into()),
                             },
                             _ => continue,
                         };
@@ -433,7 +487,8 @@ fn main() {
             } else {
                 cx.open_window(ui::window_options(cx), |window, cx| {
                     let view = cx.new(|cx| {
-                        let mut view = ChatView::new(cx);
+                        let pictures = cx.new(|_| ui::Pictures::default());
+                        let mut view = ChatView::new(pictures, cx);
                         let (rows, _) = build_rows(&messages, Some(Some("Working")), Local::now());
                         eprintln!("{} messages, {} rows", messages.len(), rows.len());
                         view.set_rows(rows, cx);

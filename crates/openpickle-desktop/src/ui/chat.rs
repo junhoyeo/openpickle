@@ -12,10 +12,10 @@ use gpui::{
 };
 
 use crate::{
-    model::Row,
+    model::{AttachmentKind, Part, Row, RowKind},
     theme,
     ui::{
-        Cancel, Find, HEADER_SOLID, Tab, chrome, header_cover, icon,
+        Cancel, Find, HEADER_SOLID, Pictures, Tab, chrome, header_cover, icon,
         input::{Copy, InputEvent, SelectAll, TextInput},
         rows::{RowContext, render_row},
         select::SharedSelection,
@@ -43,14 +43,23 @@ pub enum ChatEvent {
     Invite,
     /// Another tab was chosen in the tab bar.
     Open(Tab),
+    /// A markdown link or a room/file card was activated.
+    Link(String),
+    /// Thumbnails for attachments newly shown in the conversation.
+    LoadAttachments(Vec<String>),
 }
 
 pub struct ChatView {
     name: SharedString,
     avatar: Option<ImageSource>,
+    /// The pictures on disk, which the messages' files and room links draw from.
+    pictures: Entity<Pictures>,
     rows: Vec<Row>,
     list: ListState,
     input: Entity<TextInput>,
+    can_send: bool,
+    room_focus: FocusHandle,
+    requested_pictures: std::collections::HashSet<String>,
     /// False once the user scrolled up; the list then stops following new messages.
     at_latest: bool,
     /// The text selected in the conversation. Rows share it to draw and to change it.
@@ -74,9 +83,9 @@ struct ContextMenu {
 impl EventEmitter<ChatEvent> for ChatView {}
 
 impl ChatView {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(pictures: Entity<Pictures>, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| TextInput::new("Ask Pickle", cx));
-        let subscriptions = vec![cx.subscribe(&input, |this, input, event, cx| match event {
+        let mut subscriptions = vec![cx.subscribe(&input, |this, input, event, cx| match event {
             InputEvent::Submitted(_) => this.send(&input, cx),
             // The send button appears and disappears with the text.
             InputEvent::Changed => cx.notify(),
@@ -86,6 +95,7 @@ impl ChatView {
                 cx.notify();
             }
         })];
+        subscriptions.push(cx.observe(&pictures, |_, _, cx| cx.notify()));
         let list = ListState::new(0, ListAlignment::Bottom, px(600.));
         let view = cx.entity().downgrade();
         list.set_scroll_handler(move |event, _, cx| {
@@ -101,9 +111,13 @@ impl ChatView {
         Self {
             name: "Pickle".into(),
             avatar: None,
+            pictures,
             rows: Vec::new(),
             list,
             input,
+            can_send: true,
+            room_focus: cx.focus_handle(),
+            requested_pictures: std::collections::HashSet::new(),
             at_latest: true,
             selection: SharedSelection::default(),
             menu: None,
@@ -125,6 +139,31 @@ impl ChatView {
         cx.notify();
     }
 
+    pub fn set_can_send(&mut self, can_send: bool, cx: &mut Context<Self>) {
+        self.can_send = can_send;
+        cx.notify();
+    }
+
+    pub fn draft(&self, cx: &App) -> String {
+        self.input.read(cx).text().to_owned()
+    }
+
+    /// A room switch must not carry selections, scroll positions or a different room's draft.
+    pub fn switch_room(&mut self, can_send: bool, draft: &str, cx: &mut Context<Self>) {
+        self.can_send = can_send;
+        self.input.update(cx, |input, cx| input.set_text(draft, cx));
+        self.selection.borrow_mut().clear();
+        self.selection.borrow_mut().release();
+        self.menu = None;
+        self.found = None;
+        self._found = None;
+        self.requested_pictures.clear();
+        self.list.reset(0);
+        self.rows.clear();
+        self.at_latest = true;
+        cx.notify();
+    }
+
     /// Replaces the rows. Rows before the first changed one keep their measured heights.
     pub fn set_rows(&mut self, rows: Vec<Row>, cx: &mut Context<Self>) {
         let unchanged = self
@@ -138,7 +177,22 @@ impl ChatView {
                 .splice(unchanged..self.rows.len(), rows.len() - unchanged);
         }
         self.selection.borrow_mut().rows_changed(unchanged);
+        let mut missing = Vec::new();
+        for row in &rows {
+            if let RowKind::Part(Part::Files(files)) = &row.kind {
+                for file in &files.items {
+                    let previewable = file.kind == AttachmentKind::Picture
+                        || file.path.to_ascii_lowercase().ends_with(".pdf");
+                    if previewable && self.requested_pictures.insert(file.path.clone()) {
+                        missing.push(file.path.clone());
+                    }
+                }
+            }
+        }
         self.rows = rows;
+        if !missing.is_empty() {
+            cx.emit(ChatEvent::LoadAttachments(missing));
+        }
         cx.notify();
     }
 
@@ -182,6 +236,9 @@ impl ChatView {
     }
 
     fn send(&mut self, input: &Entity<TextInput>, cx: &mut Context<Self>) {
+        if !self.can_send {
+            return;
+        }
         let text = input.update(cx, |input, cx| input.take(cx));
         if !text.trim().is_empty() {
             self.scroll_to_latest(cx);
@@ -376,6 +433,22 @@ impl ChatView {
             .child(div().w(px(4.)))
             .child(action);
 
+        let composer = if self.can_send {
+            composer.into_any_element()
+        } else {
+            div()
+                .h(px(53.))
+                .w_full()
+                .rounded_full()
+                .bg(theme::color(theme::CHROME))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(13.))
+                .text_color(theme::color(theme::TEXT_MUTED))
+                .child("Read-only conversation")
+                .into_any_element()
+        };
         let tab_bar = tab_bar(
             Tab::Chat,
             cx.listener(|_, tab: &Tab, _, cx| cx.emit(ChatEvent::Open(*tab))),
@@ -418,26 +491,36 @@ fn list_padding() -> (Pixels, Pixels) {
     (theme::HEADER_HEIGHT, theme::BOTTOM_BAR_HEIGHT + px(16.))
 }
 
-fn open_link(url: &str, _: &mut Window, cx: &mut App) {
-    if url.starts_with("https://") || url.starts_with("http://") {
-        cx.open_url(url);
-    }
-}
-
 impl Focusable for ChatView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.input.focus_handle(cx)
+        if self.can_send {
+            self.input.focus_handle(cx)
+        } else {
+            self.room_focus.clone()
+        }
     }
 }
 
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.follow_drag(window);
+        let owner = cx.entity().downgrade();
+        let on_link: super::select::LinkHandler = std::rc::Rc::new(move |target, _, cx| {
+            owner
+                .update(cx, |_, cx| cx.emit(ChatEvent::Link(target.to_owned())))
+                .ok();
+        });
         let messages = list(
             self.list.clone(),
-            cx.processor(|this, index: usize, window: &mut Window, _| {
-                let mut row =
-                    RowContext::new(window, &this.rows[index], index, &this.selection, open_link);
+            cx.processor(move |this, index: usize, window: &mut Window, cx| {
+                let mut row = RowContext::new(
+                    window,
+                    &this.rows[index],
+                    index,
+                    &this.selection,
+                    on_link.clone(),
+                    this.pictures.read(cx),
+                );
                 row.marked = this
                     .found
                     .as_ref()
@@ -479,6 +562,8 @@ impl Render for ChatView {
         div()
             .size_full()
             .relative()
+            .track_focus(&self.room_focus)
+            .key_context("Chat")
             .bg(theme::color(theme::PAGE))
             .text_color(theme::color(theme::TEXT))
             .font_family(theme::FONT)
@@ -543,7 +628,8 @@ mod tests {
     ) -> (Entity<ChatView>, &'a mut VisualTestContext) {
         cx.update(crate::ui::bind_keys);
         let (view, cx) = cx.add_window_view(|window, cx| {
-            let view = ChatView::new(cx);
+            let pictures = cx.new(|_| Pictures::default());
+            let view = ChatView::new(pictures, cx);
             window.focus(&view.focus_handle(cx));
             window.activate_window();
             view
@@ -677,5 +763,98 @@ mod tests {
         cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::none());
         cx.simulate_click(first_item, Modifiers::none());
         assert_eq!(copied(cx), Some(texts.join("\n")));
+    }
+
+    #[gpui::test]
+    fn file_and_room_cards_dispatch_links_and_still_copy_their_labels(cx: &mut TestAppContext) {
+        use crate::model::{Attachment, Files};
+        use std::{cell::RefCell, rc::Rc};
+        let (view, cx) = open(cx, &[]);
+        let links = Rc::new(RefCell::new(Vec::<String>::new()));
+        cx.update(|_, cx| {
+            let links = links.clone();
+            cx.subscribe(&view, move |_, event, _| {
+                if let ChatEvent::Link(target) = event {
+                    links.borrow_mut().push(target.clone());
+                }
+            })
+            .detach();
+        });
+        let file = Attachment {
+            path: "attachments/2026-01-01/report.pdf".into(),
+            seq: 1,
+            at: 1.,
+            name: "Sample report.pdf".into(),
+            detail: "PDF · 4 pages".into(),
+            kind: AttachmentKind::File,
+        };
+        let row = |part| Row {
+            kind: RowKind::Part(part),
+            side: Side::Theirs,
+            joined_above: false,
+            joined_below: false,
+        };
+        view.update(cx, |view, cx| {
+            view.set_rows(
+                vec![row(Part::Files(Arc::new(Files { items: vec![file] })))],
+                cx,
+            )
+        });
+        // The only row is bottom-aligned immediately above the composer's reserved space.
+        let at = point(px(60.), HEIGHT - theme::BOTTOM_BAR_HEIGHT - px(35.));
+        cx.simulate_click(at, Modifiers::none());
+        assert_eq!(
+            *links.borrow(),
+            ["attachment:attachments/2026-01-01/report.pdf"]
+        );
+        cx.simulate_keystrokes("cmd-a cmd-c");
+        assert_eq!(
+            copied(cx).as_deref(),
+            Some("Sample report.pdf\nPDF · 4 pages")
+        );
+
+        view.update(cx, |view, cx| {
+            view.set_rows(
+                vec![row(Part::RoomLink {
+                    room_id: "11111111-1111-4111-8111-111111111111".into(),
+                    label: "Sample room".into(),
+                    picture: String::new(),
+                })],
+                cx,
+            )
+        });
+        cx.simulate_click(at, Modifiers::none());
+        assert!(
+            links
+                .borrow()
+                .last()
+                .unwrap()
+                .starts_with("pickle://chat?room_id=")
+        );
+        cx.simulate_keystrokes("cmd-a cmd-c");
+        assert_eq!(copied(cx).as_deref(), Some("Sample room"));
+    }
+
+    #[gpui::test]
+    fn an_observer_composer_does_not_send_or_consume_its_draft(cx: &mut TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+        let (view, cx) = open(cx, &[]);
+        let sent = Rc::new(Cell::new(false));
+        cx.update(|_, cx| {
+            let sent = sent.clone();
+            cx.subscribe(&view, move |_, event, _| {
+                if matches!(event, ChatEvent::Send(_)) {
+                    sent.set(true);
+                }
+            })
+            .detach();
+        });
+        view.update(cx, |view, cx| {
+            view.switch_room(false, "draft", cx);
+            let input = view.input.clone();
+            view.send(&input, cx);
+        });
+        assert!(!sent.get());
+        view.read_with(cx, |view, cx| assert_eq!(view.draft(cx), "draft"));
     }
 }

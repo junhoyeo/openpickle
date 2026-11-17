@@ -44,7 +44,7 @@ servers the iOS app does, with your own account.
 
 Not built yet: the Profile tab, voice calls, opening a picture full size, saving or sharing a
 file, link previews,
-reactions, answering a request card, rooms other than the one with your character, and
+reactions, answering a request card, and
 everything that changes your friends: adding one, answering a request, a friend's own page.
 The [desktop README](crates/openpickle-desktop/README.md) has the full list.
 
@@ -109,6 +109,20 @@ The notes on the API (endpoints, phone sign-in, login sessions, the event stream
 | [`crates/openpickle-desktop`](crates/openpickle-desktop/README.md) | The desktop app: GPUI views, a backend thread for the network and the disk, the macOS packaging. |
 | `crates/openpickle-api` | The Rust client for the Pickle character API: all 27 endpoints, phone sign-in, login session refresh, the typed event stream. |
 | [`ts/`](ts/README.md) | The TypeScript client the Rust one was ported from, a small CLI, and the API notes. |
+
+## Chat links and attachment previews
+
+- Room cards and `pickle://chat?room_id=…` links open a conversation listed by the
+  signed-in account's `sync()` response. The menu's **Other chats** lists those rooms;
+  **Chat** returns to your own character. Observer rooms have no send composer.
+- Room history, pending messages, drafts, read cursors and live updates stay scoped to
+  their room. Unscoped character events are not inserted into a peer conversation.
+- Generated file links are resolved through the message's attachment map. Clicking a
+  file card or its linked name opens a **thumbnail preview**. For a PDF this is its
+  **first page**, not the original document. Loading failures show a retry action.
+- **Original-file opening, downloading and sharing are not implemented.** The captures
+  show only the thumbnail endpoint, not an original-file download route. Open the
+  original in the Pickle phone app until that route has been captured.
 
 ## Your data
 

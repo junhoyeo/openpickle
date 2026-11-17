@@ -1,25 +1,33 @@
 //! The menu on the left: the search button, the sections of the app and Friends.
 
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, MouseButton, Window, div,
-    prelude::*, px, relative,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, MouseButton,
+    SharedString, Subscription, Window, div, prelude::*, px, relative,
 };
 
 use crate::{
+    model::RoomInfo,
     theme,
-    ui::{Cancel, Tab, chrome, icon},
+    ui::{Cancel, Pictures, Tab, chrome, face, icon},
 };
 
+#[derive(Clone)]
 pub enum DrawerEvent {
     Search,
     Friends,
     Open(Tab),
+    /// Show this other chat room.
+    Room(String),
     Close,
 }
 
 pub struct DrawerView {
     /// The tab the window is on, which the menu marks.
     selected: Tab,
+    /// The other chat rooms, newest first.
+    rooms: Vec<RoomInfo>,
+    pictures: Entity<Pictures>,
+    _pictures: Subscription,
     /// Holds the keyboard while the menu is open, so that Escape closes it.
     focus: FocusHandle,
 }
@@ -27,11 +35,20 @@ pub struct DrawerView {
 impl EventEmitter<DrawerEvent> for DrawerView {}
 
 impl DrawerView {
-    pub fn new(selected: Tab, cx: &mut Context<Self>) -> Self {
+    pub fn new(selected: Tab, pictures: Entity<Pictures>, cx: &mut Context<Self>) -> Self {
+        let changed = cx.observe(&pictures, |_, _, cx| cx.notify());
         Self {
             selected,
+            rooms: Vec::new(),
+            pictures,
+            _pictures: changed,
             focus: cx.focus_handle(),
         }
+    }
+
+    pub fn set_rooms(&mut self, rooms: Vec<RoomInfo>, cx: &mut Context<Self>) {
+        self.rooms = rooms;
+        cx.notify();
     }
 }
 
@@ -57,6 +74,7 @@ impl Render for DrawerView {
             let row = div()
                 .id(name)
                 .h(px(50.))
+                .flex_none()
                 .px(px(14.))
                 .flex()
                 .items_center()
@@ -67,15 +85,11 @@ impl Render for DrawerView {
                 .child(icon(name, 23., color))
                 .child(label);
             match leads_to {
-                Some(event) => {
-                    let event = std::cell::Cell::new(Some(event));
-                    row.cursor_pointer()
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            if let Some(event) = event.take() {
-                                cx.emit(event);
-                            }
-                        }))
-                }
+                Some(event) => row
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(event.clone());
+                    })),
                 None => row,
             }
         };
@@ -83,6 +97,7 @@ impl Render for DrawerView {
             .id("drawer")
             .occlude()
             .h_full()
+            .overflow_y_scroll()
             .w(px(300.))
             .max_w(relative(0.84))
             .bg(theme::color(theme::CHROME))
@@ -136,7 +151,45 @@ impl Render for DrawerView {
                 Some(DrawerEvent::Open(Tab::Archive)),
             ))
             .child(row("globe", "3D World", None))
-            .child(row("user-round", "My Pickle", None));
+            .child(row("user-round", "My Pickle", None))
+            .when(!self.rooms.is_empty(), |menu| {
+                menu.child(
+                    div()
+                        .pl(px(12.))
+                        .pt(px(18.))
+                        .pb(px(4.))
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::color(theme::TEXT_FAINT))
+                        .child("Other chats"),
+                )
+                .children(self.rooms.iter().map(|room| {
+                    let room_id = room.room_id.clone();
+                    div()
+                        .id(SharedString::from(room_id.clone()))
+                        .h(px(50.))
+                        .flex_none()
+                        .px(px(14.))
+                        .flex()
+                        .items_center()
+                        .gap(px(14.))
+                        .rounded(px(17.))
+                        .cursor_pointer()
+                        .hover(|row| row.bg(theme::alpha(0xffffff, 0.05)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let _ = this;
+                            cx.emit(DrawerEvent::Room(room_id.clone()));
+                        }))
+                        .child(face(self.pictures.read(cx).get(&room.picture), 32.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(room.title.clone()),
+                        )
+                }))
+            });
         // A press beside the panel closes it.
         div()
             .absolute()

@@ -108,6 +108,18 @@ pub struct Explore {
     pub ranked: Vec<Arc<Offer>>,
 }
 
+/// A chat room other than the one with your own character: a friend's Pickle to talk to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoomInfo {
+    pub room_id: String,
+    /// The exact room title supplied by the server.
+    pub title: String,
+    /// The peer character's picture, by its key in the picture cache. Empty when there is none.
+    pub picture: String,
+    /// True when this room is visible but messages cannot be sent to it.
+    pub observer: bool,
+}
+
 /// A picture or a file that a message of the conversation carries, as the Archive tab lists
 /// it.
 #[derive(Clone, Debug, PartialEq)]
@@ -122,6 +134,12 @@ pub struct Attachment {
     /// `PDF · 12 pages · 1.2 MB`, for a file; empty for a picture.
     pub detail: String,
     pub kind: AttachmentKind,
+}
+
+/// A message's pictures and files, drawn under its text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Files {
+    pub items: Vec<Attachment>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +170,15 @@ pub enum Part {
     Request(Arc<Request>),
     /// A task the character started (a phone call, a purchase).
     Task(Arc<str>),
+    /// Pictures and files the message carries.
+    Files(Arc<Files>),
+    /// A link that opens another chat room.
+    RoomLink {
+        room_id: String,
+        label: String,
+        /// The friend's character's picture, by its key in the picture cache.
+        picture: String,
+    },
 }
 
 /// A question from the character that is answered through a card.
@@ -220,6 +247,13 @@ impl Row {
                 .chain(request.question.as_deref())
                 .chain(request.options.iter().map(|option| option.label.as_str()))
                 .collect(),
+            RowKind::Part(Part::Files(files)) => files
+                .items
+                .iter()
+                .flat_map(|item| [item.name.as_str(), item.detail.as_str()])
+                .filter(|text| !text.is_empty())
+                .collect(),
+            RowKind::Part(Part::RoomLink { label, .. }) => vec![label.as_str()],
         }
     }
 
@@ -232,6 +266,8 @@ impl Row {
                 (Part::Card(a), Part::Card(b)) => Arc::ptr_eq(a, b),
                 (Part::Request(a), Part::Request(b)) => Arc::ptr_eq(a, b),
                 (Part::Task(a), Part::Task(b)) => Arc::ptr_eq(a, b),
+                (Part::Files(a), Part::Files(b)) => Arc::ptr_eq(a, b),
+                (Part::RoomLink { .. }, Part::RoomLink { .. }) => a == b,
                 _ => false,
             },
             (a, b) => a == b,
@@ -339,6 +375,36 @@ mod tests {
             side,
             parts: vec![part; parts],
         }
+    }
+
+    #[test]
+    fn file_row_texts_match_only_the_nonempty_labels_the_ui_draws() {
+        let row = Row {
+            kind: RowKind::Part(Part::Files(Arc::new(Files {
+                items: vec![
+                    Attachment {
+                        path: "attachments/day/photo.png".into(),
+                        seq: 1,
+                        at: 1.,
+                        name: "photo.png".into(),
+                        detail: String::new(),
+                        kind: AttachmentKind::Picture,
+                    },
+                    Attachment {
+                        path: "attachments/day/report.pdf".into(),
+                        seq: 1,
+                        at: 1.,
+                        name: String::new(),
+                        detail: "PDF · 2 pages".into(),
+                        kind: AttachmentKind::File,
+                    },
+                ],
+            }))),
+            side: Side::Theirs,
+            joined_above: false,
+            joined_below: false,
+        };
+        assert_eq!(row.texts(), ["photo.png", "PDF · 2 pages"]);
     }
 
     #[test]
