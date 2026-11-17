@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::{
     phone::CallSummary,
     theme,
-    ui::{Cancel, Identity, chrome, face, icon, input, wrap::keep_hangul},
+    ui::{Cancel, Identity, chrome, icon, input, own_face, wrap::keep_hangul},
 };
 
 /// The top of the header's row of controls. The phone app puts it 6 pt under its status bar;
@@ -342,7 +342,7 @@ impl PhoneView {
             .flex()
             .items_center()
             .gap(px(12.))
-            .child(face(self.identity.avatar.clone(), 40.))
+            .child(own_face(self.identity.avatar.clone(), 40.))
             .child(
                 div()
                     .flex_1()
@@ -662,7 +662,7 @@ impl PhoneView {
                                     .flex()
                                     .items_center()
                                     .gap(px(3.))
-                                    .child(face(self.identity.avatar.clone(), 20.))
+                                    .child(own_face(self.identity.avatar.clone(), 20.))
                                     .child(
                                         div()
                                             .min_w_0()
@@ -1055,7 +1055,7 @@ pub(super) fn transcript_line(
                 .size(scaled(28.))
                 .flex_none()
                 .when(!line.joins_next, |slot| {
-                    slot.child(face(avatar, 28. * scale))
+                    slot.child(own_face(avatar, 28. * scale))
                 }),
         )
     } else {

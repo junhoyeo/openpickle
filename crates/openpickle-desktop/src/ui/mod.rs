@@ -165,6 +165,26 @@ fn face(picture: Option<ImageSource>, size: f32) -> impl IntoElement {
     }
 }
 
+/// The round picture of your own character. It stands on white: the character is drawn for
+/// that, and the phone app shows it so.
+fn own_face(picture: Option<ImageSource>, size: f32) -> impl IntoElement {
+    let disc = div()
+        .size(px(size))
+        .flex_none()
+        .rounded_full()
+        .overflow_hidden()
+        .bg(theme::color(theme::TEXT));
+    match picture {
+        Some(source) => disc.child(
+            img(source)
+                .size_full()
+                .rounded_full()
+                .object_fit(ObjectFit::Cover),
+        ),
+        None => disc,
+    }
+}
+
 /// The header hides what is under it down to here. Further down it fades out and the screen
 /// shows through.
 const HEADER_SOLID: Pixels = px(49.);
@@ -178,20 +198,7 @@ fn tab_header(
     on_invite: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     show_invite: bool,
 ) -> impl IntoElement {
-    let picture = div()
-        .size(px(58.))
-        .rounded_full()
-        .overflow_hidden()
-        .bg(theme::color(theme::TEXT));
-    let picture = match avatar {
-        Some(source) => picture.child(
-            img(source)
-                .size_full()
-                .rounded_full()
-                .object_fit(ObjectFit::Cover),
-        ),
-        None => picture,
-    };
+    let picture = own_face(avatar, 58.);
     div()
         .absolute()
         .top_0()
