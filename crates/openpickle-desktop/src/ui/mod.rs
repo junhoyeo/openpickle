@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod attachment;
 pub mod chat;
 pub mod drawer;
 pub mod explore;
@@ -37,6 +38,8 @@ actions!(
 pub fn bind_keys(cx: &mut App) {
     input::bind_keys(cx);
     cx.bind_keys([
+        KeyBinding::new("cmd-c", input::Copy, Some("Chat")),
+        KeyBinding::new("cmd-a", input::SelectAll, Some("Chat")),
         KeyBinding::new("cmd-f", Find, None),
         KeyBinding::new("escape", Cancel, None),
         KeyBinding::new("up", Previous, None),

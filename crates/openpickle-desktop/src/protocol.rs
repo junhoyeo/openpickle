@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use crate::model::{Attachment, Explore, Message, SearchResult, Social};
+use crate::model::{Attachment, Explore, Message, RoomInfo, SearchResult, Social};
 
 /// UI to backend. Neither side of the protocol can be printed with `{:?}`: a command may hold
 /// a phone number or a sign-in code, and both hold message text.
@@ -15,6 +15,7 @@ pub enum Command {
     /// Send a message to the open conversation. The UI shows it already, under this id, which
     /// the server keeps for its copy. `offer` names the Explore offer the message asks for.
     Send {
+        room_id: String,
         id: String,
         text: String,
         offer: Option<String>,
@@ -27,8 +28,12 @@ pub enum Command {
     OffersShown(Vec<String>),
     /// List the pictures and files of the conversation, reading back to its first message.
     LoadArchive,
+    /// Show this chat room instead: a friend's Pickle, or the character's again when empty.
+    OpenRoom(String),
     /// Load these pictures of the Archive: the attachments themselves, by their paths.
     LoadAttachments(Vec<String>),
+    /// Download the thumbnail (or first-page preview) of one attachment in the open room.
+    PreviewAttachment(String),
     /// Search the messages for this text.
     Search(String),
     /// Whether the chat can be read now: the window is in front and shows the chat. Only
@@ -49,6 +54,9 @@ pub enum Update {
     /// Signed in. Carries the conversation as far as it is known, which at launch is whatever
     /// the disk cache holds.
     Conversation {
+        room_id: String,
+        is_character: bool,
+        can_send: bool,
         name: String,
         avatar: Option<PathBuf>,
         messages: Vec<Message>,
@@ -59,9 +67,16 @@ pub enum Update {
         avatar: Option<PathBuf>,
     },
     /// New or changed messages, matched to known ones by id.
-    Upsert(Vec<Message>),
+    Upsert {
+        room_id: String,
+        messages: Vec<Message>,
+    },
     /// The message the UI sent under this id did not reach the server. The text says why.
-    SendFailed { id: String, reason: String },
+    SendFailed {
+        room_id: String,
+        id: String,
+        reason: String,
+    },
     /// What a search for `query` found, or why it could not be done.
     Found {
         query: String,
@@ -73,14 +88,27 @@ pub enum Update {
     Explore(Result<Explore, String>),
     /// Pictures that are on disk now, by their key.
     Pictures(Vec<(String, PathBuf)>),
+    /// The chat rooms other than the character's, newest activity first.
+    Rooms(Vec<RoomInfo>),
     /// The pictures and files of the conversation, newest first. `complete` says whether the
     /// whole history was read; a list that is not complete grows as older pages arrive.
     Archive {
+        room_id: String,
         attachments: Vec<Attachment>,
         complete: bool,
     },
     /// Whether the character is working on a reply, and on what when it says.
-    Activity(Option<Option<String>>),
+    Activity {
+        room_id: String,
+        activity: Option<Option<String>>,
+    },
+    /// Switching rooms failed. The current conversation remains open.
+    RoomOpenFailed { room_id: String, reason: String },
+    /// A requested attachment thumbnail (or first-page preview) is ready or failed.
+    AttachmentPreview {
+        path: String,
+        result: Result<PathBuf, String>,
+    },
     /// The backend stopped over something on this computer and cannot go on. The text says
     /// what happened.
     Failed(String),

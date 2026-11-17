@@ -9,10 +9,10 @@ use openpickle_api::{
 };
 
 use crate::{
-    content::{Block, parse_message, plain_text},
+    content::{Block, Card, CardRow, LinkTarget, RichText, SpanKind, parse_message, plain_text},
     model::{
-        Attachment, AttachmentKind, Explore, Invite, Message, Offer, OfferSection, Part, Person,
-        Request, RequestOption, RequestStatus, SearchResult, Side, Social,
+        Attachment, AttachmentKind, Explore, Files, Invite, Message, Offer, OfferSection, Part,
+        Person, Request, RequestOption, RequestStatus, RoomInfo, SearchResult, Side, Social,
     },
 };
 
@@ -117,6 +117,44 @@ fn joined(at: &str, now: DateTime<Utc>) -> String {
         1 => "Joined 1 day ago".to_owned(),
         days => format!("Joined {days} days ago"),
     }
+}
+
+/// The chat rooms other than the one with your character: a friend's Pickle each. Also
+/// returns the addresses of their pictures.
+pub fn rooms(rooms: &[openpickle_api::Room]) -> (Vec<RoomInfo>, Vec<String>) {
+    let mut pictures = Vec::new();
+    let infos = rooms
+        .iter()
+        .filter(|room| room.kind != "character")
+        .map(|room| {
+            let picture = room.peer.as_ref().map_or("", |peer| {
+                if peer.character_avatar_url.is_empty() {
+                    &peer.avatar_url
+                } else {
+                    &peer.character_avatar_url
+                }
+            });
+            if !picture.is_empty() {
+                pictures.push(picture.to_owned());
+            }
+            RoomInfo {
+                room_id: room.room_id.clone(),
+                title: if !room.title.is_empty() {
+                    room.title.clone()
+                } else {
+                    room.peer
+                        .as_ref()
+                        .map(|peer| peer.display_name.as_str())
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or("Conversation")
+                        .to_owned()
+                },
+                picture: picture_key(picture).to_owned(),
+                observer: room.observer,
+            }
+        })
+        .collect();
+    (infos, pictures)
 }
 
 /// The friends screen and the invite sheet, from the social snapshot. Also returns the
@@ -304,11 +342,55 @@ pub fn message(item: &HistoryItem, card_state: Option<&CardState>) -> Message {
         _ => (Side::Theirs, bubbles(text, true)),
     };
     let mut parts = parts;
-    // Pictures and files cannot be downloaded yet, so a message says how many it carries.
-    match item.attachments.as_ref().map_or(0, Vec::len) {
-        0 => {}
-        1 => parts.push(Part::Task("1 attachment".into())),
-        count => parts.push(Part::Task(format!("{count} attachments").into())),
+    // Only character-authored Markdown is normalized. Literal links in user messages stay as
+    // typed; the message's own maps are the sole authority for attachment aliases.
+    if item.role != "user" {
+        normalize_part_links(&mut parts, item);
+    }
+    // A chat-room link the character put in a card fence. The app names it in
+    // `app_references`; the members of the card say whose Pickle it is.
+    for block in std::mem::take(&mut parts) {
+        match block {
+            // Resolve every card independently. Map iteration order need not match card order.
+            Part::RoomLink {
+                room_id,
+                label,
+                picture: _,
+            } if label.is_empty() => {
+                let member = item
+                    .app_reference_cards
+                    .iter()
+                    .flatten()
+                    .find(|(target, _)| room_target(target) == Some(room_id.as_str()))
+                    .and_then(|(_, card)| card.members.as_deref()?.first());
+                let label = item
+                    .app_references
+                    .iter()
+                    .flatten()
+                    .find(|(target, _)| room_target(target) == Some(room_id.as_str()))
+                    .map(|(_, label)| label.clone())
+                    .unwrap_or_else(|| {
+                        member
+                            .map(|member| format!("{}'s Pickle", member.profile.display_name))
+                            .unwrap_or_else(|| "Open chat room".to_owned())
+                    });
+                let picture = member
+                    .map(|member| member.profile.character_avatar_url.as_str())
+                    .filter(|url| !url.is_empty())
+                    .unwrap_or("");
+                parts.push(Part::RoomLink {
+                    room_id,
+                    label,
+                    picture: picture_key(picture).to_owned(),
+                });
+            }
+            other => parts.push(other),
+        }
+    }
+    // Pictures and files the message carries, as the app shows them.
+    let carried = attachments(item);
+    if !carried.is_empty() {
+        parts.push(Part::Files(Arc::new(Files { items: carried })));
     }
     Message {
         id: item.id.clone(),
@@ -316,6 +398,146 @@ pub fn message(item: &HistoryItem, card_state: Option<&CardState>) -> Message {
         at: item.at,
         side,
         parts,
+    }
+}
+
+fn room_target(target: &str) -> Option<&str> {
+    match LinkTarget::parse(target) {
+        Some(LinkTarget::Room(room_id)) => {
+            // The returned id must borrow `target`, not the temporary parsed value.
+            let query = target.strip_prefix("pickle://chat?")?;
+            query.split('&').find_map(|parameter| {
+                let (name, value) = parameter.split_once('=')?;
+                (name == "room_id" && value == room_id).then_some(value)
+            })
+        }
+        _ => None,
+    }
+}
+
+fn normalize_part_links(parts: &mut [Part], item: &HistoryItem) {
+    for part in parts {
+        match part {
+            Part::Bubble(text) => normalize_rich_links(Arc::make_mut(text), item),
+            Part::Card(card) => normalize_card_links(Arc::make_mut(card), item),
+            _ => {}
+        }
+    }
+}
+
+fn normalize_card_links(card: &mut Card, item: &HistoryItem) {
+    card.title
+        .iter_mut()
+        .chain(&mut card.subtitle)
+        .for_each(|text| normalize_rich_links(text, item));
+    for row in &mut card.rows {
+        match row {
+            CardRow::Field { label, value } => {
+                normalize_rich_links(label, item);
+                normalize_rich_links(value, item);
+            }
+            CardRow::Heading(text) | CardRow::Text(text) => normalize_rich_links(text, item),
+            CardRow::Table { cells, .. } => cells
+                .iter_mut()
+                .for_each(|text| normalize_rich_links(text, item)),
+        }
+    }
+}
+
+fn normalize_rich_links(text: &mut RichText, item: &HistoryItem) {
+    for span in &mut text.spans {
+        let SpanKind::Link(target) = &mut span.kind else {
+            continue;
+        };
+        if let Some(normalized) = normalize_link(target, item) {
+            *target = normalized;
+        }
+    }
+}
+
+fn normalize_link(target: &str, item: &HistoryItem) -> Option<String> {
+    if let Some(path) = attachment_path(target, item) {
+        return LinkTarget::attachment(path).map(LinkTarget::into_link);
+    }
+    match LinkTarget::parse(target) {
+        Some(LinkTarget::Web(_)) => Some(target.to_owned()),
+        Some(room @ LinkTarget::Room(_)) => Some(room.into_link()),
+        // A literal `attachment:` target is accepted only when this message proves its path.
+        Some(LinkTarget::Attachment(_)) | None => None,
+    }
+}
+
+fn attachment_path<'a>(target: &str, item: &'a HistoryItem) -> Option<&'a str> {
+    let unprefixed = target.strip_prefix("attachment:").unwrap_or(target);
+    if !safe_path_components(unprefixed) {
+        return None;
+    }
+    let decoded = if unprefixed.contains('%') {
+        Some(percent_decode_path(unprefixed)?)
+    } else {
+        None
+    };
+    let matches = |candidate: &str| {
+        candidate == unprefixed
+            || decoded
+                .as_deref()
+                .is_some_and(|decoded| candidate == decoded)
+    };
+    let mapped = item
+        .inline_files
+        .iter()
+        .flatten()
+        .chain(item.inline_images.iter().flatten())
+        .find_map(|(alias, path)| matches(alias).then_some(path.as_str()));
+    if mapped.is_some() {
+        return mapped;
+    }
+    item.attachments
+        .iter()
+        .flatten()
+        .map(String::as_str)
+        .chain(
+            item.inline_files
+                .iter()
+                .flatten()
+                .chain(item.inline_images.iter().flatten())
+                .map(|(_, path)| path.as_str()),
+        )
+        .find(|path| matches(path))
+}
+
+/// Decodes one round of `%XX` bytes for exact comparison with a message-provided alias. `+`
+/// stays a plus. Malformed UTF-8, malformed escapes and traversal components are rejected.
+fn percent_decode_path(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = hex(bytes.get(index + 1).copied()?)?;
+            let low = hex(bytes.get(index + 2).copied()?)?;
+            decoded.push(high << 4 | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    let decoded = String::from_utf8(decoded).ok()?;
+    safe_path_components(&decoded).then_some(decoded)
+}
+
+fn safe_path_components(path: &str) -> bool {
+    path.split(['/', '\\'])
+        .all(|component| component != "." && component != "..")
+}
+
+fn hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -338,9 +560,15 @@ fn bubbles(text: &str, markdown: bool) -> Vec<Part> {
             vec![Part::Bubble(Arc::new(plain_text(text)))]
         };
     }
+    // The room link is filled in by `message`, which reads the message's references.
     parse_message(text)
         .into_iter()
         .map(|block| match block {
+            Block::RoomLink(room_id) => Part::RoomLink {
+                room_id,
+                label: String::new(),
+                picture: String::new(),
+            },
             Block::Bubble(text) => Part::Bubble(Arc::new(text)),
             Block::Card(card) => Part::Card(Arc::new(card)),
         })
@@ -423,6 +651,55 @@ mod tests {
         assert!(files.contains(&("보고서.pdf", "PDF · 12 pages · 1.5 MB")));
         assert!(files.contains(&("표.xlsx", "XLSX · 20 KB")));
         assert!(listed.iter().all(|a| a.kind == AttachmentKind::File));
+    }
+
+    #[test]
+    fn rooms_keep_server_titles_and_include_observers_without_peers() {
+        let base = |id: &str, kind: &str, title: &str, observer: bool| {
+            serde_json::json!({
+                "room_id": id, "kind": kind, "title": title, "peer": null,
+                "member_count": 2, "last_seq": 10, "read_seq": 10, "role": "member",
+                "last_event_at": "2026-11-17T00:00:00Z", "observer": observer,
+                "unread": 0, "muted": false, "pinned_at": null,
+                "peer_read_seq": null, "peer_read_at": null, "peer_joined_at": null,
+                "request_id": "", "request_role": "", "extra_conversation_unread": false
+            })
+        };
+        let own = base("room-own", "character", "My Pickle", false);
+        let observer = base("room-observer", "character_pair", "", true);
+        let mut direct = base("room-direct", "direct", "", false);
+        direct["peer"] = serde_json::json!({
+            "user_id": "user-mina", "handle": "mina", "display_name": "Mina",
+            "avatar_url": "https://img.example/mina-user.png?sig=1",
+            "character_avatar_url": "https://img.example/mina-character.png?sig=2",
+            "character_name": "Sample"
+        });
+        let mut titled = direct.clone();
+        titled["room_id"] = "room-titled".into();
+        titled["title"] = "Server supplied title".into();
+        let input: Vec<openpickle_api::Room> =
+            serde_json::from_value(serde_json::json!([own, observer, direct, titled])).unwrap();
+        let (listed, pictures) = rooms(&input);
+
+        assert_eq!(listed.len(), 3);
+        assert_eq!(
+            (
+                listed[0].room_id.as_str(),
+                listed[0].title.as_str(),
+                listed[0].observer,
+                listed[0].picture.as_str(),
+            ),
+            ("room-observer", "Conversation", true, "")
+        );
+        assert_eq!(listed[1].title, "Mina");
+        assert_eq!(listed[2].title, "Server supplied title");
+        assert_eq!(listed[1].picture, "https://img.example/mina-character.png");
+        assert_eq!(pictures.len(), 2);
+        assert!(
+            pictures
+                .iter()
+                .all(|picture| picture == "https://img.example/mina-character.png?sig=2")
+        );
     }
 
     #[test]
@@ -604,7 +881,122 @@ mod tests {
             ),
             None,
         );
-        assert!(matches!(&photo.parts[..], [Part::Task(note)] if &**note == "2 attachments"));
+        assert!(matches!(
+            &photo.parts[..],
+            [Part::Files(files)] if files.items.len() == 2
+        ));
+    }
+
+    #[test]
+    fn known_message_links_are_normalized_without_changing_visible_text() {
+        let reply = item(serde_json::json!({
+            "role": "assistant", "id": "links", "at": 1.0, "seq": 11,
+            "text": "<bubble>[방](pickle://chat?source=inline&room_id=room-inline) [보고서](downloads/%ED%95%9C%EA%B8%80%20%EB%B3%B4%EA%B3%A0%EC%84%9C.pdf) [웹](https://example.test/a?q=1) [로컬](file:///tmp/private.pdf)</bubble>\n```card\npickle://chat?room_id=room-z\n```\n```card\npickle://chat?source=card&room_id=room-a\n```",
+            "inline_files": {
+                "downloads/한글 보고서.pdf": "attachments/2026-11-17/한글 보고서.pdf"
+            },
+            // BTreeMap order is room-a then room-z, the reverse of the cards above.
+            "app_references": {
+                "pickle://chat?room_id=room-a": "Mina's Pickle",
+                "pickle://chat?room_id=room-z": "Zed's Pickle"
+            },
+            "app_reference_cards": {
+                "pickle://chat?room_id=room-a": {
+                    "kind": "chat", "room_kind": "character_pair",
+                    "members": [{"kind": "character", "user_id": "user-a", "handle": "mina", "display_name": "Mina",
+                                 "character_name": "", "avatar_url": "", "character_avatar_url": "https://img.example/mina.png"}]
+                },
+                "pickle://chat?room_id=room-z": {
+                    "kind": "chat", "room_kind": "character_pair",
+                    "members": [{"kind": "character", "user_id": "user-z", "handle": "zed", "display_name": "Zed",
+                                 "character_name": "", "avatar_url": "", "character_avatar_url": "https://img.example/zed.png"}]
+                }
+            }
+        }));
+        let reply = message(&reply, None);
+        let Part::Bubble(text) = &reply.parts[0] else {
+            panic!()
+        };
+        assert_eq!(text.text, "방 보고서 웹 로컬");
+        let targets: Vec<&str> = text
+            .spans
+            .iter()
+            .filter_map(|span| match &span.kind {
+                SpanKind::Link(target) => Some(target.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                "pickle://chat?room_id=room-inline",
+                "attachment:attachments/2026-11-17/한글 보고서.pdf",
+                "https://example.test/a?q=1",
+                "file:///tmp/private.pdf",
+            ]
+        );
+        assert!(matches!(
+            &reply.parts[1],
+            Part::RoomLink { room_id, label, picture }
+                if room_id == "room-z" && label == "Zed's Pickle"
+                    && picture == "https://img.example/zed.png"
+        ));
+        assert!(matches!(
+            &reply.parts[2],
+            Part::RoomLink { room_id, label, picture }
+                if room_id == "room-a" && label == "Mina's Pickle"
+                    && picture == "https://img.example/mina.png"
+        ));
+    }
+
+    #[test]
+    fn link_normalization_accepts_only_exact_message_attachment_mappings() {
+        let reply = item(serde_json::json!({
+            "role": "assistant", "id": "mapped", "at": 1.0, "seq": 12,
+            "attachments": ["attachments/2026-11-17/photo.png"],
+            "inline_files": {
+                "downloads/report final.pdf": "attachments/2026-11-17/보고서 최종.pdf",
+                "downloads/../secret.pdf": "attachments/2026-11-17/secret.pdf"
+            }
+        }));
+        let cases = [
+            (
+                "downloads/report%20final.pdf",
+                Some("attachment:attachments/2026-11-17/보고서 최종.pdf"),
+            ),
+            ("downloads/report+final.pdf", None),
+            ("downloads/report%ZZfinal.pdf", None),
+            ("downloads/report%2520final.pdf", None),
+            ("downloads/%2e%2e/secret.pdf", None),
+            ("downloads/../secret.pdf", None),
+            (
+                "attachments/2026-11-17/photo.png",
+                Some("attachment:attachments/2026-11-17/photo.png"),
+            ),
+            (
+                "attachment:attachments/2026-11-17/photo.png",
+                Some("attachment:attachments/2026-11-17/photo.png"),
+            ),
+            ("attachment:attachments/2026-11-17/unknown.pdf", None),
+            ("/tmp/report.pdf", None),
+            ("file:///tmp/report.pdf", None),
+            ("javascript:alert(1)", None),
+            (
+                "https://example.test/file?q=1",
+                Some("https://example.test/file?q=1"),
+            ),
+            (
+                "pickle://chat?from=message&room_id=room-test",
+                Some("pickle://chat?room_id=room-test"),
+            ),
+        ];
+        for (target, expected) in cases {
+            assert_eq!(
+                normalize_link(target, &reply).as_deref(),
+                expected,
+                "{target}"
+            );
+        }
     }
 
     #[test]
