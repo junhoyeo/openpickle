@@ -467,6 +467,8 @@ fn phone_card(surface: Div, title: &str, path: &str, cx: &RowContext) -> AnyElem
         .id(("phone-task", cx.index))
         .w(px(380.))
         .max_w_full()
+        // The phone app's card has this one corner closed up, whatever stands above it.
+        .rounded_tl(theme::JOINED_RADIUS)
         .flex()
         .flex_col()
         .cursor_pointer()
