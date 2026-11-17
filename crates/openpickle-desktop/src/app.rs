@@ -1913,4 +1913,49 @@ mod tests {
             _ => panic!("the current requested call should open"),
         });
     }
+
+    #[gpui::test]
+    fn the_phone_overlay_is_visible_above_chat_and_its_close_button_does_not_hang_up(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::ui::bind_keys);
+        let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, received) = futures::channel::mpsc::unbounded();
+        updates
+            .unbounded_send(Update::Conversation {
+                room_id: "primary".into(),
+                is_character: true,
+                can_send: true,
+                name: "Pickle".into(),
+                avatar: None,
+                messages: vec![],
+            })
+            .unwrap();
+        let (shell, cx) =
+            cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
+        cx.simulate_resize(gpui::size(px(440.), px(900.)));
+        cx.simulate_keystrokes("cmd-shift-p");
+        shell.read_with(cx, |shell, _| {
+            assert!(matches!(shell.over, Some(Over::Phone(_))))
+        });
+        while sent.try_recv().is_ok() {}
+        cx.simulate_click(gpui::point(px(400.), px(71.)), gpui::Modifiers::none());
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell.over.is_none(),
+                "the phone Close control must receive the click, not the chat behind it"
+            )
+        });
+        let commands = std::iter::from_fn(|| sent.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, Command::WatchPhoneCall(None)))
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, Command::EndPhoneCall { .. }))
+        );
+    }
 }

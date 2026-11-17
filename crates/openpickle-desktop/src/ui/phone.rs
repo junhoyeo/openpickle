@@ -871,8 +871,11 @@ impl Focusable for PhoneView {
 impl Render for PhoneView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .absolute()
+            .top_0()
+            .left_0()
             .size_full()
-            .relative()
+            .occlude()
             .track_focus(&self.focus)
             .key_context("Phone")
             .bg(theme::color(theme::PAGE))
