@@ -42,6 +42,11 @@ servers the iOS app does, with your own account.
   session of its own, so your phone stays signed in.
 
 <p align="center">
+  <img src="docs/screenshots/phone-card.png" alt="A call Pickle placed for you: its card in the chat, over the end of the transcript" height="540" />
+  <img src="docs/screenshots/phone-call.png" alt="The transcript of a call in progress, with the keys Pickle pressed and the End call button" height="540" />
+</p>
+
+<p align="center">
   <img src="docs/screenshots/explore.png" alt="The Explore tab: what your Pickle offers to do" height="380" />
   <img src="docs/screenshots/search.png" alt="Search results with the matching text in blue" height="380" />
   <img src="docs/screenshots/sign-in.png" alt="Sign-in with a phone number" height="380" />
