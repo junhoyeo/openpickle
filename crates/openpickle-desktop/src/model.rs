@@ -170,6 +170,11 @@ pub enum Part {
     Request(Arc<Request>),
     /// A task the character started (a phone call, a purchase).
     Task(Arc<str>),
+    /// A subagent handoff whose call transcript can be resolved from the handoff list.
+    PhoneTask {
+        title: Arc<str>,
+        path: String,
+    },
     /// Pictures and files the message carries.
     Files(Arc<Files>),
     /// A link that opens another chat room.
@@ -223,6 +228,7 @@ impl Row {
             RowKind::Activity(_) => Vec::new(),
             RowKind::Part(Part::Bubble(text)) => vec![&text.text],
             RowKind::Part(Part::Task(title)) => vec![&**title],
+            RowKind::Part(Part::PhoneTask { title, .. }) => vec![&**title],
             RowKind::Part(Part::Card(card)) => {
                 let mut texts: Vec<&str> = card
                     .title
@@ -314,9 +320,17 @@ pub fn build_rows(
             });
         }
         starts.push(rows.len());
+        // A call's card stands apart: it joins neither the message before it nor the next.
+        let is_call = |message: &Message| {
+            message
+                .parts
+                .iter()
+                .any(|part| matches!(part, Part::PhoneTask { .. }))
+        };
         let continues = !stamped
             && gap < GROUP_WINDOW_S
-            && previous.is_some_and(|previous| previous.side == message.side);
+            && !is_call(message)
+            && previous.is_some_and(|previous| previous.side == message.side && !is_call(previous));
         for (index, part) in message.parts.iter().enumerate() {
             let joined_above = index > 0 || continues;
             if joined_above && let Some(above) = rows.last_mut() {
@@ -446,5 +460,30 @@ mod tests {
         assert!(matches!(&rows[7].kind, RowKind::Activity(Some(label)) if label == "Working"));
         // Each message starts at its first part, after its timestamp.
         assert_eq!(starts, [1, 3, 4, 6]);
+    }
+
+    #[test]
+    fn a_call_card_joins_neither_the_message_before_it_nor_the_next() {
+        let now = Local.timestamp_opt(10_000, 0).unwrap();
+        let mut call = message(10., Side::Theirs, 1);
+        call.parts = vec![Part::PhoneTask {
+            title: "📞 Sample call".into(),
+            path: "handoffs/sample-task".into(),
+        }];
+        let (rows, _) = build_rows(
+            &[
+                message(0., Side::Theirs, 1),
+                call,
+                message(20., Side::Theirs, 1),
+            ],
+            None,
+            now,
+        );
+        let joins: Vec<(bool, bool)> = rows
+            .iter()
+            .filter(|row| matches!(row.kind, RowKind::Part(_)))
+            .map(|row| (row.joined_above, row.joined_below))
+            .collect();
+        assert_eq!(joins, [(false, false); 3]);
     }
 }

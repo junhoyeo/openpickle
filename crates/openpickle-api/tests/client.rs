@@ -8,8 +8,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use mock_server::{MockServer, Reply};
 use openpickle_api::{
-    ClientOptions, Credentials, Error, LoginSession, Method, PickleClient, RequestOptions,
-    decode_access_token,
+    ClientOptions, Credentials, EndPhoneCallOptions, Error, LoginSession, Method, PickleClient,
+    RequestOptions, decode_access_token,
 };
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
@@ -310,6 +310,85 @@ async fn an_offer_is_asked_for_with_its_text_and_its_id() {
             "client_msg_id": "m1",
             "in_call": false,
             "context": { "kind": "offer", "id": "o1" },
+        })
+    );
+}
+
+#[tokio::test]
+async fn phone_calls_read_live_ending_and_completed_shapes_and_encode_the_id() {
+    let line = r#"{"id":"line-1","line_id":"line-1","speaker":"me","text":"Synthetic transcript line","keys":"12#","joins_previous":false,"joins_next":false}"#;
+    let server = MockServer::start(move |request| {
+        let (state, lifecycle) = match request.path.as_str() {
+            "/api/phone-calls/live%2Fid%20%3F" => (
+                r#""live":true,"hangup_requested":false,"footer":"Call in progress""#,
+                r#""started_at_epoch_ms":1700000000000.0"#,
+            ),
+            "/api/phone-calls/ending-id" => (
+                r#""live":true,"hangup_requested":true,"footer":"Ending call""#,
+                r#""started_at_epoch_ms":1700000000000.0,"answered_at_epoch_ms":1700000001000.0"#,
+            ),
+            "/api/phone-calls/completed-id" => (
+                r#""live":false,"hangup_requested":false,"footer":"Call ended""#,
+                r#""started_at_epoch_ms":1700000000000.0,"answered_at_epoch_ms":1700000001000.0,"ended_at_epoch_ms":1700000061000.0,"duration_s":60,"outcome":"answered""#,
+            ),
+            _ => return Reply::json(404, "{}"),
+        };
+        Reply::json(
+            200,
+            format!(
+                r#"{{"kind":"phone_call","call_id":"synthetic-call","title":"Active call","subtitle_lead":"Speaking with","counterpart_label":"Example contact","subtitle_tail":"","started_label":"Now",{state},"lines":[{line}],{lifecycle}}}"#,
+            ),
+        )
+    })
+    .await;
+    let pickle = client(&server, Credentials::AccessToken("synthetic-token".into()));
+
+    let live = pickle.get_phone_call("live/id ?").await.unwrap();
+    let ending = pickle.get_phone_call("ending-id").await.unwrap();
+    let completed = pickle.get_phone_call("completed-id").await.unwrap();
+
+    assert!(live.live && !live.hangup_requested);
+    assert!(live.answered_at_epoch_ms.is_none());
+    assert_eq!(live.lines[0].keys.as_deref(), Some("12#"));
+    assert!(ending.live && ending.hangup_requested);
+    assert!(ending.answered_at_epoch_ms.is_some());
+    assert!(!completed.live && !completed.hangup_requested);
+    assert_eq!(
+        (completed.duration_s, completed.outcome.as_deref()),
+        (Some(60), Some("answered"))
+    );
+    assert_eq!(server.take()[0].path, "/api/phone-calls/live%2Fid%20%3F");
+}
+
+#[tokio::test]
+async fn ending_a_phone_call_preserves_the_retry_action_id_and_false_in_call() {
+    let server = MockServer::start(|_| Reply::json(200, r#"{"status":"ok"}"#)).await;
+    let pickle = client(&server, Credentials::AccessToken("synthetic-token".into()));
+    let options = EndPhoneCallOptions {
+        action_id: Some("stable-action".into()),
+        in_call: false,
+    };
+
+    assert_eq!(
+        pickle
+            .end_phone_call("synthetic-call", options)
+            .await
+            .unwrap()
+            .status,
+        "ok"
+    );
+    let request = &server.take()[0];
+    assert_eq!(
+        (request.method.as_str(), request.path.as_str()),
+        ("POST", "/api/actions")
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
+        serde_json::json!({
+            "action_id": "stable-action",
+            "in_call": false,
+            "payload": { "call_id": "synthetic-call" },
+            "kind": "end_phone_call",
         })
     );
 }

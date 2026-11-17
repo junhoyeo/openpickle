@@ -31,6 +31,7 @@ use tokio::{
 use crate::{
     convert,
     model::{Attachment, Message},
+    phone::CallSummary,
     profile::ProfileData,
     protocol::{Command, Update},
     store::{Session, Store},
@@ -219,6 +220,11 @@ async fn sign_in(
             | Command::LoadSocial
             | Command::LoadExplore
             | Command::LoadProfile
+            | Command::LoadPhoneCalls
+            | Command::ResolvePhoneTask(_)
+            | Command::LoadPhoneCard(_)
+            | Command::WatchPhoneCall(_)
+            | Command::EndPhoneCall { .. }
             | Command::OffersShown(_)
             | Command::LoadArchive
             | Command::LoadAttachments(_)
@@ -400,6 +406,12 @@ impl Conversation {
                 known.text = heard.text;
                 known.at = heard.at;
                 known.seq = heard.seq;
+                if heard.title.is_some() {
+                    known.title = heard.title;
+                }
+                if heard.path.is_some() {
+                    known.path = heard.path;
+                }
             }
             None => {
                 self.items.insert(id.clone(), heard);
@@ -418,6 +430,98 @@ impl Conversation {
     }
 }
 
+/// The capture repeatedly fetches the open call while it is live (median about 3.75 s).
+/// This interval is for display refresh only, never an automatic call action.
+const PHONE_REFRESH: Duration = Duration::from_secs(4);
+
+fn valid_call_id(id: &str) -> bool {
+    // IDs are opaque server values. The API client encodes the entire value as one path
+    // segment; restricting it to hexadecimal/ASCII would reject valid future records.
+    !id.trim().is_empty() && !id.chars().any(char::is_control)
+}
+
+/// What the handoff list says about the call of a task.
+enum TaskCall {
+    Call(String),
+    /// The task has not finished: it may still place its call.
+    Running,
+    /// The task finished without a call.
+    NoCall,
+    /// The list does not have the task.
+    Unlisted,
+}
+
+fn task_call(handoffs: &openpickle_api::HandoffsScreen, path: &str) -> TaskCall {
+    let item = handoffs
+        .active_items
+        .iter()
+        .chain(&handoffs.recent_items)
+        .chain(&handoffs.items)
+        .find(|item| format!("handoffs/{}", item.name) == path);
+    match item {
+        None => TaskCall::Unlisted,
+        Some(item) => match item.phone_call_id.clone().filter(|id| valid_call_id(id)) {
+            Some(call_id) => TaskCall::Call(call_id),
+            None if item.finished_at_epoch_ms.is_none() => TaskCall::Running,
+            None => TaskCall::NoCall,
+        },
+    }
+}
+
+/// The call of the task at this handoff path, when the list has that task and it has a call.
+fn task_call_id(handoffs: &openpickle_api::HandoffsScreen, path: &str) -> Option<String> {
+    match task_call(handoffs, path) {
+        TaskCall::Call(call_id) => Some(call_id),
+        _ => None,
+    }
+}
+
+struct PhoneWatch {
+    id: String,
+    latest: Option<openpickle_api::PhoneCallTranscript>,
+    next_refresh: Option<Instant>,
+    end_requested: bool,
+}
+
+impl PhoneWatch {
+    fn new(id: String) -> Self {
+        Self {
+            id,
+            latest: None,
+            next_refresh: None,
+            end_requested: false,
+        }
+    }
+
+    fn can_end(&self, call_id: &str) -> bool {
+        !self.end_requested
+            && self.id == call_id
+            && self
+                .latest
+                .as_ref()
+                .is_some_and(|call| call.call_id == call_id && call.live && !call.hangup_requested)
+    }
+}
+
+/// The phone cards of the chat: which tasks show a call that is still live, and so is read
+/// again, and the handoff list the cards drawn together were found in.
+#[derive(Default)]
+struct PhoneCards {
+    /// Handoff path and call id of each live call a card shows.
+    live: Vec<(String, String)>,
+    /// Tasks whose card was drawn before they had a call, and until when one that the handoff
+    /// list does not have is still asked about.
+    waiting: Vec<(String, Instant)>,
+    next_refresh: Option<Instant>,
+    handoffs: Option<(Instant, openpickle_api::HandoffsScreen)>,
+}
+
+/// How long one reading of the handoff list serves the cards that are drawn together.
+const CARD_HANDOFFS_FRESH: Duration = Duration::from_secs(10);
+/// How long a card waits for a task the handoff list does not have: a task that has just
+/// started is listed within seconds, one from long ago never is.
+const CARD_UNLISTED_WAIT: Duration = Duration::from_secs(30);
+
 struct Live {
     client: PickleClient,
     store: Store,
@@ -425,6 +529,8 @@ struct Live {
     conversation: Conversation,
     identity: Identity,
     profile: Option<ProfileData>,
+    phone_watch: Option<PhoneWatch>,
+    phone_cards: PhoneCards,
     /// Whether the window is in front; only then does reading count as "seen".
     active: bool,
     /// Whether the history on this computer reaches back to the first message.
@@ -506,6 +612,8 @@ async fn converse(
         conversation,
         identity,
         profile: None,
+        phone_watch: None,
+        phone_cards: PhoneCards::default(),
         // The window says when it comes to the front.
         active: false,
         history_complete: false,
@@ -524,6 +632,12 @@ async fn converse(
     let mut opened_at = Instant::now();
     let mut backoff = Backoff::default();
     loop {
+        let watch_deadline = live
+            .phone_watch
+            .as_ref()
+            .and_then(|watch| watch.next_refresh);
+        let cards_deadline = live.phone_cards.next_refresh;
+        let phone_deadline = watch_deadline.into_iter().chain(cards_deadline).min();
         tokio::select! {
             command = commands.recv() => match command {
                 None | Some(Command::Quit) => return Ended::Closed,
@@ -575,6 +689,45 @@ async fn converse(
                         }
                         Err(error) if session_is_gone(&error) => return Ended::SignedOut,
                         Err(error) => live.send(Update::Social(Err(explain(&error)))),
+                    }
+                }
+                Some(Command::ResolvePhoneTask(path)) => {
+                    if let Err(error) = live.resolve_phone_task(path).await
+                        && session_is_gone(&error) { return Ended::SignedOut; }
+                }
+                Some(Command::LoadPhoneCard(path)) => {
+                    if let Err(error) = live.load_phone_card(path).await
+                        && session_is_gone(&error) { return Ended::SignedOut; }
+                }
+                Some(Command::LoadPhoneCalls) => {
+                    if let Some(cached) = live.cached_once::<Vec<CallSummary>>("phone-calls.json") {
+                        live.send(Update::PhoneCalls(Ok(cached)));
+                    }
+                    if let Err(error) = live.load_phone_calls().await {
+                        if session_is_gone(&error) { return Ended::SignedOut; }
+                        live.send(Update::PhoneCalls(Err(explain(&error))));
+                    }
+                }
+                Some(Command::WatchPhoneCall(call_id)) => {
+                    live.phone_watch = match call_id {
+                        Some(id) if valid_call_id(&id) => Some(PhoneWatch::new(id)),
+                        Some(id) => {
+                            live.send(Update::PhoneCall { call_id: id,
+                                result: Err("This call link is not valid.".into()) });
+                            None
+                        }
+                        None => None,
+                    };
+                    if live.phone_watch.is_some()
+                        && let Err(error) = live.refresh_phone_call().await
+                        && session_is_gone(&error) {
+                        return Ended::SignedOut;
+                    }
+                }
+                Some(Command::EndPhoneCall { call_id, action_id }) => {
+                    if let Err(error) = live.end_phone_call(call_id, action_id).await
+                        && session_is_gone(&error) {
+                        return Ended::SignedOut;
                     }
                 }
                 Some(Command::LoadProfile) => {
@@ -637,6 +790,19 @@ async fn converse(
                     live.mark_read().await;
                 }
                 Some(Command::RequestCode(_) | Command::VerifyCode(_)) => {}
+            },
+            _ = tokio::time::sleep_until(phone_deadline.unwrap_or_else(Instant::now)), if phone_deadline.is_some() => {
+                let now = Instant::now();
+                if watch_deadline.is_some_and(|at| at <= now)
+                    && let Err(error) = live.refresh_phone_call().await
+                    && session_is_gone(&error) {
+                    return Ended::SignedOut;
+                }
+                if cards_deadline.is_some_and(|at| at <= now)
+                    && let Err(error) = live.refresh_phone_cards().await
+                    && session_is_gone(&error) {
+                    return Ended::SignedOut;
+                }
             },
             event = next_event(&mut events), if events.is_some() => match event {
                 Some(Ok(PickleEvent::Retry(delay))) => backoff.server_asks(delay),
@@ -936,6 +1102,27 @@ impl Live {
                     });
                 }
             }
+            PickleEvent::Chat(ChatEvent::Subagent {
+                role,
+                id,
+                title,
+                path,
+                at,
+                seq,
+                ..
+            }) => {
+                if self.conversation.room_id == self.character_room
+                    && let Ok(item) = serde_json::from_value::<HistoryItem>(serde_json::json!({
+                        "role":role,"id":id,"title":title,"path":path,"at":at,"seq":seq
+                    }))
+                    && let Some(message) = self.conversation.hear(item)
+                {
+                    self.send(Update::Upsert {
+                        room_id: self.character_room.clone(),
+                        messages: vec![message],
+                    });
+                }
+            }
             PickleEvent::Chat(ChatEvent::Pending { on }) => {
                 if self.conversation.room_id == self.character_room {
                     self.send(Update::Activity {
@@ -1106,6 +1293,255 @@ impl Live {
             .insert(name)
             .then(|| self.store.cached(name))
             .flatten()
+    }
+
+    async fn resolve_phone_task(&mut self, path: String) -> openpickle_api::Result<()> {
+        if !matches!(
+            crate::content::LinkTarget::parse(&format!("handoff:{path}")),
+            Some(crate::content::LinkTarget::PhoneTask(_))
+        ) {
+            self.send(Update::PhoneTask {
+                path,
+                result: Err("This task link is not valid.".into()),
+            });
+            return Ok(());
+        }
+        match self.client.get_handoffs().await {
+            Ok(handoffs) => {
+                let call_id = task_call_id(&handoffs, &path);
+                self.send(Update::PhoneTask {
+                    path,
+                    result: call_id
+                        .ok_or_else(|| "No phone transcript is available for this task.".into()),
+                });
+                Ok(())
+            }
+            Err(error) => {
+                self.send(Update::PhoneTask {
+                    path,
+                    result: Err(explain(&error)),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    /// Reads the call of a phone task for its card. A task that has not placed its call yet is
+    /// asked about again until it has one or ends without. A task that finished without a call
+    /// gets no card: it stays a title that opens nothing more.
+    async fn load_phone_card(&mut self, path: String) -> openpickle_api::Result<()> {
+        if !matches!(
+            crate::content::LinkTarget::parse(&format!("handoff:{path}")),
+            Some(crate::content::LinkTarget::PhoneTask(_))
+        ) {
+            return Ok(());
+        }
+        let fresh = self
+            .phone_cards
+            .handoffs
+            .as_ref()
+            .is_some_and(|(read_at, _)| read_at.elapsed() < CARD_HANDOFFS_FRESH);
+        if !fresh {
+            let handoffs = self.client.get_handoffs().await?;
+            self.phone_cards.handoffs = Some((Instant::now(), handoffs));
+        }
+        let call = self
+            .phone_cards
+            .handoffs
+            .as_ref()
+            .map_or(TaskCall::Unlisted, |(_, handoffs)| {
+                task_call(handoffs, &path)
+            });
+        match call {
+            TaskCall::Call(call_id) => self.read_phone_card(path, call_id).await,
+            TaskCall::NoCall => Ok(()),
+            TaskCall::Running | TaskCall::Unlisted => {
+                let cards = &mut self.phone_cards;
+                if !cards.waiting.iter().any(|(waiting, _)| *waiting == path) {
+                    cards
+                        .waiting
+                        .push((path, Instant::now() + CARD_UNLISTED_WAIT));
+                }
+                cards
+                    .next_refresh
+                    .get_or_insert_with(|| Instant::now() + PHONE_REFRESH);
+                Ok(())
+            }
+        }
+    }
+
+    async fn read_phone_card(
+        &mut self,
+        path: String,
+        call_id: String,
+    ) -> openpickle_api::Result<()> {
+        let call = self.client.get_phone_call(&call_id).await?;
+        if call.call_id != call_id {
+            return Ok(());
+        }
+        let cards = &mut self.phone_cards;
+        cards.live.retain(|(shown, _)| *shown != path);
+        if call.live {
+            cards.live.push((path.clone(), call_id));
+            cards
+                .next_refresh
+                .get_or_insert_with(|| Instant::now() + PHONE_REFRESH);
+        }
+        self.send(Update::PhoneCard { path, call });
+        Ok(())
+    }
+
+    /// Reads the live calls of the cards again, and asks the handoff list about the tasks
+    /// that had no call yet. A card whose call ended is read no more.
+    async fn refresh_phone_cards(&mut self) -> openpickle_api::Result<()> {
+        self.phone_cards.next_refresh = None;
+        for (path, call_id) in std::mem::take(&mut self.phone_cards.live) {
+            match self.read_phone_card(path.clone(), call_id.clone()).await {
+                Ok(()) => {}
+                Err(error) if session_is_gone(&error) => return Err(error),
+                // One failed reading does not end the card: it is tried again with the others.
+                Err(_) => self.phone_cards.live.push((path, call_id)),
+            }
+        }
+        let waiting = std::mem::take(&mut self.phone_cards.waiting);
+        if !waiting.is_empty() {
+            let handoffs = match self.client.get_handoffs().await {
+                Ok(handoffs) => Some(handoffs),
+                Err(error) if session_is_gone(&error) => return Err(error),
+                Err(_) => None,
+            };
+            for (path, until) in waiting {
+                match handoffs.as_ref().map(|handoffs| task_call(handoffs, &path)) {
+                    Some(TaskCall::Call(call_id)) => {
+                        match self.read_phone_card(path.clone(), call_id).await {
+                            Ok(()) => {}
+                            Err(error) if session_is_gone(&error) => return Err(error),
+                            Err(_) => self.phone_cards.waiting.push((path, until)),
+                        }
+                    }
+                    Some(TaskCall::NoCall) => {}
+                    Some(TaskCall::Unlisted) if Instant::now() >= until => {}
+                    // Still running, not listed yet, or the list could not be read.
+                    _ => self.phone_cards.waiting.push((path, until)),
+                }
+            }
+            if let Some(handoffs) = handoffs {
+                self.phone_cards.handoffs = Some((Instant::now(), handoffs));
+            }
+        }
+        let cards = &mut self.phone_cards;
+        if !cards.live.is_empty() || !cards.waiting.is_empty() {
+            cards
+                .next_refresh
+                .get_or_insert_with(|| Instant::now() + PHONE_REFRESH);
+        }
+        Ok(())
+    }
+
+    async fn load_phone_calls(&mut self) -> openpickle_api::Result<()> {
+        let (handoffs, extras) = tokio::try_join!(
+            self.client.get_handoffs(),
+            self.client.get_extra_conversations(),
+        )?;
+        let calls = CallSummary::from_screens(&handoffs, &extras);
+        self.store.cache("phone-calls.json", &calls).ok();
+        self.send(Update::PhoneCalls(Ok(calls)));
+        Ok(())
+    }
+
+    async fn refresh_phone_call(&mut self) -> openpickle_api::Result<()> {
+        let Some(call_id) = self.phone_watch.as_ref().map(|watch| watch.id.clone()) else {
+            return Ok(());
+        };
+        match self.client.get_phone_call(&call_id).await {
+            Ok(call) if call.call_id == call_id => {
+                if let Some(watch) = &mut self.phone_watch {
+                    watch.next_refresh = call.live.then(|| Instant::now() + PHONE_REFRESH);
+                    watch.latest = Some(call.clone());
+                }
+                self.send(Update::PhoneCall {
+                    call_id,
+                    result: Ok(call),
+                });
+                Ok(())
+            }
+            Ok(_) => {
+                self.phone_watch = None;
+                self.send(Update::PhoneCall {
+                    call_id,
+                    result: Err("Pickle returned a different call. Open the call again.".into()),
+                });
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(watch) = &mut self.phone_watch {
+                    // A failed first read needs an explicit retry; an already known live call
+                    // continues refreshing while its view remains open.
+                    watch.next_refresh = watch
+                        .latest
+                        .as_ref()
+                        .filter(|call| call.live)
+                        .map(|_| Instant::now() + PHONE_REFRESH);
+                }
+                self.send(Update::PhoneCall {
+                    call_id,
+                    result: Err(explain(&error)),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    async fn end_phone_call(
+        &mut self,
+        call_id: String,
+        action_id: String,
+    ) -> openpickle_api::Result<()> {
+        let can_end = self
+            .phone_watch
+            .as_ref()
+            .is_some_and(|watch| watch.can_end(&call_id));
+        if !can_end || uuid::Uuid::parse_str(&action_id).is_err() {
+            self.send(Update::PhoneCallEnded {
+                call_id,
+                result: Err("This call is not available to end. Refresh its status first.".into()),
+            });
+            return Ok(());
+        }
+        let options = openpickle_api::EndPhoneCallOptions {
+            action_id: Some(action_id),
+            in_call: false,
+        };
+        match self.client.end_phone_call(&call_id, options).await {
+            Ok(reply) if reply.status == "ok" => {
+                if let Some(watch) = &mut self.phone_watch {
+                    watch.end_requested = true;
+                    if let Some(call) = &mut watch.latest {
+                        call.hangup_requested = true;
+                    }
+                    watch.next_refresh = Some(Instant::now());
+                }
+                self.send(Update::PhoneCallEnded {
+                    call_id,
+                    result: Ok(()),
+                });
+                Ok(())
+            }
+            Ok(_) => {
+                self.send(Update::PhoneCallEnded {
+                    call_id,
+                    result: Err("Pickle did not accept the end-call request.".into()),
+                });
+                Ok(())
+            }
+            Err(error) => {
+                self.send(Update::PhoneCallEnded {
+                    call_id,
+                    result: Err(explain(&error)),
+                });
+                Err(error)
+            }
+        }
     }
 
     /// Reads only the captured profile/bootstrap/catalog routes. Session tokens and the
@@ -1564,6 +2000,37 @@ mod tests {
                                 .to_string(),
                             )
                         }
+                    } else if target == "/api/screens/handoffs" {
+                        // A task that has just started places its call a moment later: the
+                        // list has its call from the second reading on.
+                        let readings = server_requests
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|path| *path == "/api/screens/handoffs")
+                            .count();
+                        let mut starting = serde_json::json!({
+                            "name":"starting-task","title":"Starting call","state":"running",
+                            "requested_at_epoch_ms":2.0,"time_text":"Now"
+                        });
+                        if readings > 1 {
+                            starting["phone_call_id"] = "completed-call".into();
+                        }
+                        ("200 OK", serde_json::json!({
+                            "kind":"handoffs","items":[{
+                                "name":"sample-task","title":"Sample call","state":"running",
+                                "requested_at_epoch_ms":1.0,"time_text":"Now","phone_call_id":"sample-call"
+                            }, {
+                                "name":"finished-task","title":"Not a call","state":"done",
+                                "requested_at_epoch_ms":1.0,"finished_at_epoch_ms":2.0,"time_text":"Now"
+                            }],"handoff_estimate_pct":0.0,"active_items":[starting],"recent_items":[],
+                            "active_count":1,"recent_count":0,"sections":[]
+                        }).to_string())
+                    } else if let Some(id) = target.strip_prefix("/api/phone-calls/") {
+                        let call = phone_snapshot(id, id != "completed-call", false);
+                        ("200 OK", serde_json::to_string(&call).unwrap())
+                    } else if target == "/api/actions" {
+                        ("200 OK", "{\"status\":\"ok\"}".to_owned())
                     } else {
                         let after = target
                             .split('?')
@@ -1710,6 +2177,8 @@ mod tests {
             conversation: Conversation::load(&store, "primary"),
             identity: Identity::default(),
             profile: None,
+            phone_watch: None,
+            phone_cards: PhoneCards::default(),
             active: false,
             history_complete: false,
             character_room: "primary".to_owned(),
@@ -2250,5 +2719,217 @@ mod tests {
 
         assert!(log.broken);
         assert!(store.log::<Record>(&log.name).is_empty());
+    }
+
+    fn phone_snapshot(
+        call_id: &str,
+        live: bool,
+        requested: bool,
+    ) -> openpickle_api::PhoneCallTranscript {
+        serde_json::from_value(serde_json::json!({
+            "kind":"phone_call", "call_id":call_id, "title":"Sample call",
+            "subtitle_lead":"", "counterpart_label":"Library", "subtitle_tail":"",
+            "started_label":"Today", "live":live, "hangup_requested":requested,
+            "footer":"Sample status", "lines":[], "started_at_epoch_ms":1000.0
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_phone_end_requires_the_current_verified_live_call() {
+        let mut watch = PhoneWatch::new("sample-call".into());
+        assert!(
+            !watch.can_end("sample-call"),
+            "a cached or unverified call is not enough"
+        );
+        watch.latest = Some(phone_snapshot("sample-call", true, false));
+        assert!(watch.can_end("sample-call"));
+        assert!(!watch.can_end("other-call"));
+        watch.latest = Some(phone_snapshot("sample-call", true, true));
+        assert!(!watch.can_end("sample-call"));
+        watch.latest = Some(phone_snapshot("sample-call", false, false));
+        assert!(!watch.can_end("sample-call"));
+        watch.latest = Some(phone_snapshot("sample-call", true, false));
+        watch.end_requested = true;
+        assert!(
+            !watch.can_end("sample-call"),
+            "a lagging poll cannot undo an accepted end request"
+        );
+    }
+
+    #[test]
+    fn phone_ids_preserve_opaque_server_values() {
+        assert!(valid_call_id("a1b2c3d4e5f6"));
+        assert!(valid_call_id("sample-call_1"));
+        assert!(valid_call_id("통화/one?record=two"));
+        assert!(!valid_call_id(""));
+        assert!(!valid_call_id("  "));
+        assert!(!valid_call_id("call\nother"));
+    }
+
+    #[tokio::test]
+    async fn ending_a_phone_call_needs_a_verified_snapshot_and_sends_one_action() {
+        let server = HistoryServer::start();
+        let (mut live, mut received) = fixture_live("phone-actions", &server);
+        let id = "sample-call".to_owned();
+        let action_id = uuid::Uuid::new_v4().to_string();
+        live.phone_watch = Some(PhoneWatch::new(id.clone()));
+        live.end_phone_call(id.clone(), action_id.clone())
+            .await
+            .unwrap();
+        assert!(
+            server.requests.lock().unwrap().is_empty(),
+            "opening a view is not permission to end"
+        );
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Update::PhoneCallEnded { result: Err(_), .. }
+        ));
+
+        live.refresh_phone_call().await.unwrap();
+        assert!(live.phone_watch.as_ref().unwrap().next_refresh.is_some());
+        live.end_phone_call(id.clone(), action_id.clone())
+            .await
+            .unwrap();
+        live.end_phone_call(id, action_id).await.unwrap();
+        let requests = server.requests.lock().unwrap().clone();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|path| path.as_str() == "/api/actions")
+                .count(),
+            1
+        );
+        // Closing the view prevents refresh; it sends no hangup action.
+        live.phone_watch = None;
+        live.refresh_phone_call().await.unwrap();
+        assert_eq!(*server.requests.lock().unwrap(), requests);
+
+        live.phone_watch = Some(PhoneWatch::new("completed-call".into()));
+        live.refresh_phone_call().await.unwrap();
+        assert!(live.phone_watch.as_ref().unwrap().next_refresh.is_none());
+        live.end_phone_call("completed-call".into(), uuid::Uuid::new_v4().to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|path| path.as_str() == "/api/actions")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_phone_card_reads_its_call_and_a_live_one_again_without_actions() {
+        let server = HistoryServer::start();
+        let (mut live, mut received) = fixture_live("phone-card", &server);
+        live.load_phone_card("handoffs/sample-task".into())
+            .await
+            .unwrap();
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Update::PhoneCard { path, call }
+                if path == "handoffs/sample-task" && call.call_id == "sample-call" && call.live
+        ));
+        assert!(live.phone_cards.next_refresh.is_some());
+        // A task that finished without a call, and a path that names no task, get no card
+        // and are not asked about again.
+        live.load_phone_card("handoffs/finished-task".into())
+            .await
+            .unwrap();
+        live.load_phone_card("handoffs/../sample-task".into())
+            .await
+            .unwrap();
+        assert!(received.try_recv().is_err());
+        assert!(live.phone_cards.waiting.is_empty());
+        live.refresh_phone_cards().await.unwrap();
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Update::PhoneCard { path, .. } if path == "handoffs/sample-task"
+        ));
+        let requests = server.requests.lock().unwrap();
+        // One reading of the handoff list served the cards that were drawn together.
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|path| *path == "/api/screens/handoffs")
+                .count(),
+            1
+        );
+        assert!(requests.iter().all(|path| {
+            path == "/api/screens/handoffs" || path == "/api/phone-calls/sample-call"
+        }));
+    }
+
+    #[tokio::test]
+    async fn a_card_drawn_before_its_task_placed_the_call_waits_for_it() {
+        let server = HistoryServer::start();
+        let (mut live, mut received) = fixture_live("phone-card-waits", &server);
+        // The task is running and has no call yet.
+        live.load_phone_card("handoffs/starting-task".into())
+            .await
+            .unwrap();
+        assert!(received.try_recv().is_err());
+        assert_eq!(live.phone_cards.waiting.len(), 1);
+        assert!(live.phone_cards.next_refresh.is_some());
+        // The next reading of the list has its call, and the card gets it.
+        live.refresh_phone_cards().await.unwrap();
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Update::PhoneCard { path, call }
+                if path == "handoffs/starting-task" && call.call_id == "completed-call" && !call.live
+        ));
+        assert!(live.phone_cards.waiting.is_empty());
+        assert!(live.phone_cards.next_refresh.is_none());
+
+        // A task the list does not have is asked about for a while, then no more.
+        live.load_phone_card("handoffs/unknown-task".into())
+            .await
+            .unwrap();
+        assert_eq!(live.phone_cards.waiting.len(), 1);
+        live.refresh_phone_cards().await.unwrap();
+        assert_eq!(live.phone_cards.waiting.len(), 1);
+        live.phone_cards.waiting[0].1 = Instant::now();
+        live.refresh_phone_cards().await.unwrap();
+        assert!(live.phone_cards.waiting.is_empty());
+        assert!(received.try_recv().is_err());
+        assert!(server.requests.lock().unwrap().iter().all(|path| {
+            path == "/api/screens/handoffs" || path == "/api/phone-calls/completed-call"
+        }));
+    }
+
+    #[tokio::test]
+    async fn a_phone_task_resolves_from_the_exact_authorized_handoff_without_actions() {
+        let server = HistoryServer::start();
+        let (mut live, mut received) = fixture_live("phone-handoff", &server);
+        live.resolve_phone_task("handoffs/sample-task".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(received.try_recv().unwrap(),Update::PhoneTask { path,result:Ok(id) }
+            if path=="handoffs/sample-task" && id=="sample-call")
+        );
+        live.resolve_phone_task("handoffs/sample".into())
+            .await
+            .unwrap();
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Update::PhoneTask { result: Err(_), .. }
+        ));
+        let before = server.requests.lock().unwrap().len();
+        live.resolve_phone_task("handoffs/../sample-task".into())
+            .await
+            .unwrap();
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Update::PhoneTask { result: Err(_), .. }
+        ));
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), before);
+        assert!(requests.iter().all(|path| path == "/api/screens/handoffs"));
     }
 }

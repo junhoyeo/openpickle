@@ -11,13 +11,15 @@ use gpui::{
     SharedString, Subscription, Task, Window, anchored, deferred, div, list, point, prelude::*, px,
 };
 
+use openpickle_api::PhoneCallTranscript;
+
 use crate::{
     model::{AttachmentKind, Part, Row, RowKind},
     theme,
     ui::{
         Cancel, Find, HEADER_SOLID, Pictures, Tab, chrome, header_cover, icon,
         input::{Copy, InputEvent, SelectAll, TextInput},
-        rows::{RowContext, render_row},
+        rows::{PhoneCards, RowContext, render_row},
         select::SharedSelection,
         tab_bar, tab_header,
     },
@@ -43,10 +45,14 @@ pub enum ChatEvent {
     Invite,
     /// Another tab was chosen in the tab bar.
     Open(Tab),
+    /// Browse calls placed by Pickle. This is not a microphone or dial action.
+    PhoneCalls,
     /// A markdown link or a room/file card was activated.
     Link(String),
     /// Thumbnails for attachments newly shown in the conversation.
     LoadAttachments(Vec<String>),
+    /// The call behind a phone card that was drawn for the first time, by its handoff path.
+    LoadPhoneCard(String),
 }
 
 pub struct ChatView {
@@ -60,6 +66,11 @@ pub struct ChatView {
     can_send: bool,
     room_focus: FocusHandle,
     requested_pictures: std::collections::HashSet<String>,
+    /// The calls the phone cards show, by the handoff path of their task.
+    phone_cards: PhoneCards,
+    requested_phone_cards: std::collections::HashSet<String>,
+    /// Redraws the cards of live calls each second, for the time they have lasted.
+    call_clock: Option<Task<()>>,
     /// False once the user scrolled up; the list then stops following new messages.
     at_latest: bool,
     /// The text selected in the conversation. Rows share it to draw and to change it.
@@ -118,6 +129,9 @@ impl ChatView {
             can_send: true,
             room_focus: cx.focus_handle(),
             requested_pictures: std::collections::HashSet::new(),
+            phone_cards: PhoneCards::new(),
+            requested_phone_cards: std::collections::HashSet::new(),
+            call_clock: None,
             at_latest: true,
             selection: SharedSelection::default(),
             menu: None,
@@ -158,6 +172,8 @@ impl ChatView {
         self.found = None;
         self._found = None;
         self.requested_pictures.clear();
+        // The cards are asked for again when they are next drawn.
+        self.requested_phone_cards.clear();
         self.list.reset(0);
         self.rows.clear();
         self.at_latest = true;
@@ -194,6 +210,56 @@ impl ChatView {
             cx.emit(ChatEvent::LoadAttachments(missing));
         }
         cx.notify();
+    }
+
+    /// Shows the call of a phone task in its card. The card grows with it, so its rows are
+    /// measured again.
+    pub fn set_phone_card(
+        &mut self,
+        path: String,
+        call: PhoneCallTranscript,
+        cx: &mut Context<Self>,
+    ) {
+        for (index, row) in self.rows.iter().enumerate() {
+            if matches!(&row.kind, RowKind::Part(Part::PhoneTask { path: shown, .. }) if *shown == path)
+            {
+                self.list.splice(index..index + 1, 1);
+            }
+        }
+        self.phone_cards.insert(path, call);
+        if self.call_clock.is_none() && self.phone_cards.values().any(|call| call.live) {
+            self.call_clock = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                    let live = this.update(cx, |this, cx| {
+                        let live = this.phone_cards.values().any(|call| call.live);
+                        if live {
+                            cx.notify();
+                        } else {
+                            this.call_clock = None;
+                        }
+                        live
+                    });
+                    if !matches!(live, Ok(true)) {
+                        break;
+                    }
+                }
+            }));
+        }
+        cx.notify();
+    }
+
+    /// Takes a newer reading of a call for the cards that already show it.
+    pub fn refresh_phone_card(&mut self, call: &PhoneCallTranscript, cx: &mut Context<Self>) {
+        let paths: Vec<String> = self
+            .phone_cards
+            .iter()
+            .filter(|(_, shown)| shown.call_id == call.call_id)
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in paths {
+            self.set_phone_card(path, call.clone(), cx);
+        }
     }
 
     /// Scrolls to a message, given the rows it is drawn as, and marks it for a moment. The
@@ -417,7 +483,10 @@ impl ChatView {
                     this.send(&input, cx);
                 }))
         } else {
-            action.child(icon("phone", 17., theme::CHROME))
+            action
+                .cursor_pointer()
+                .child(icon("phone", 17., theme::CHROME))
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(ChatEvent::PhoneCalls)))
         };
         let composer = chrome("composer")
             .w_full()
@@ -513,6 +582,12 @@ impl Render for ChatView {
         let messages = list(
             self.list.clone(),
             cx.processor(move |this, index: usize, window: &mut Window, cx| {
+                // A phone card asks for its call when it is first drawn.
+                if let RowKind::Part(Part::PhoneTask { path, .. }) = &this.rows[index].kind
+                    && this.requested_phone_cards.insert(path.clone())
+                {
+                    cx.emit(ChatEvent::LoadPhoneCard(path.clone()));
+                }
                 let mut row = RowContext::new(
                     window,
                     &this.rows[index],
@@ -525,6 +600,8 @@ impl Render for ChatView {
                     .found
                     .as_ref()
                     .is_some_and(|found| found.contains(&index));
+                row.phone_cards = Some(&this.phone_cards);
+                row.avatar = this.avatar.clone();
                 render_row(&row)
             }),
         )
@@ -834,6 +911,71 @@ mod tests {
         );
         cx.simulate_keystrokes("cmd-a cmd-c");
         assert_eq!(copied(cx).as_deref(), Some("Sample room"));
+    }
+
+    #[gpui::test]
+    fn a_phone_card_asks_for_its_call_once_and_opens_the_task(cx: &mut TestAppContext) {
+        use std::{cell::RefCell, rc::Rc};
+        let (view, cx) = open(cx, &[]);
+        let events = Rc::new(RefCell::new(Vec::<String>::new()));
+        cx.update(|_, cx| {
+            let events = events.clone();
+            cx.subscribe(&view, move |_, event, _| match event {
+                ChatEvent::LoadPhoneCard(path) => events.borrow_mut().push(format!("load {path}")),
+                ChatEvent::Link(target) => events.borrow_mut().push(format!("open {target}")),
+                _ => {}
+            })
+            .detach();
+        });
+        let rows = || {
+            vec![Row {
+                kind: RowKind::Part(Part::PhoneTask {
+                    title: "📞 Sample call".into(),
+                    path: "handoffs/sample-task".into(),
+                }),
+                side: Side::Theirs,
+                joined_above: false,
+                joined_below: false,
+            }]
+        };
+        view.update(cx, |view, cx| view.set_rows(rows(), cx));
+        cx.run_until_parked();
+        assert_eq!(*events.borrow(), ["load handoffs/sample-task"]);
+
+        // The call arrives, a newer reading of it follows, and the card is drawn again.
+        let call = |live: bool| -> PhoneCallTranscript {
+            serde_json::from_value(serde_json::json!({
+                "kind": "phone_call", "call_id": "sample-call", "title": "Sample call",
+                "subtitle_lead": "with ", "counterpart_label": "someone", "subtitle_tail": "",
+                "started_label": "Today", "live": live, "hangup_requested": false,
+                "footer": "", "duration_s": 5,
+                "lines": [{
+                    "id": "1", "line_id": "1", "speaker": "them", "text": "Hello",
+                    "joins_previous": false, "joins_next": false,
+                }],
+            }))
+            .unwrap()
+        };
+        view.update(cx, |view, cx| {
+            view.set_phone_card("handoffs/sample-task".into(), call(true), cx);
+            view.refresh_phone_card(&call(false), cx);
+            assert!(!view.phone_cards["handoffs/sample-task"].live);
+            // A reading of another call changes no card.
+            let mut other = call(true);
+            other.call_id = "another-call".into();
+            view.refresh_phone_card(&other, cx);
+            assert!(!view.phone_cards["handoffs/sample-task"].live);
+        });
+        cx.run_until_parked();
+        assert_eq!(events.borrow().len(), 1, "a drawn card is asked for once");
+
+        // The only row is bottom-aligned immediately above the composer's reserved space.
+        let at = point(px(60.), HEIGHT - theme::BOTTOM_BAR_HEIGHT - px(60.));
+        cx.simulate_click(at, Modifiers::none());
+        assert_eq!(
+            events.borrow().last().map(String::as_str),
+            Some("open handoff:handoffs/sample-task")
+        );
     }
 
     #[gpui::test]

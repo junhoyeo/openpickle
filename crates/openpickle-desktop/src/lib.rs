@@ -4,6 +4,7 @@ pub mod backend;
 pub mod content;
 pub mod convert;
 pub mod model;
+pub mod phone;
 pub mod profile;
 pub mod protocol;
 pub mod store;

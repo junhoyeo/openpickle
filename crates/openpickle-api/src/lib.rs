@@ -9,8 +9,8 @@ pub mod types;
 
 pub use client::{
     AccessTokenClaims, Auth, ClientOptions, ClientProfile, Credentials, DEFAULT_BASE_URL,
-    LoginSession, PickleClient, RequestOptions, RotateCallback, SendMessageOptions, TokenProvider,
-    decode_access_token, random_nonce,
+    EndPhoneCallOptions, LoginSession, PickleClient, RequestOptions, RotateCallback,
+    SendMessageOptions, TokenProvider, decode_access_token, random_nonce,
 };
 pub use events::{PickleEvent, SseFrame, SseParser};
 pub use reqwest::Method;

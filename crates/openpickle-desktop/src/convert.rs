@@ -334,7 +334,19 @@ pub fn message(item: &HistoryItem, card_state: Option<&CardState>) -> Message {
             Side::Theirs,
             item.title
                 .iter()
-                .map(|title| Part::Task(title.as_str().into()))
+                .map(|title| {
+                    let task = item
+                        .path
+                        .as_ref()
+                        .and_then(|path| LinkTarget::parse(&format!("handoff:{path}")));
+                    match task {
+                        Some(LinkTarget::PhoneTask(path)) => Part::PhoneTask {
+                            title: title.as_str().into(),
+                            path,
+                        },
+                        _ => Part::Task(title.as_str().into()),
+                    }
+                })
                 .collect(),
         ),
         // In a room between two characters, yours speaks on your side.
@@ -462,6 +474,7 @@ fn normalize_link(target: &str, item: &HistoryItem) -> Option<String> {
     match LinkTarget::parse(target) {
         Some(LinkTarget::Web(_)) => Some(target.to_owned()),
         Some(room @ LinkTarget::Room(_)) => Some(room.into_link()),
+        Some(task @ LinkTarget::PhoneTask(_)) => Some(task.into_link()),
         // A literal `attachment:` target is accepted only when this message proves its path.
         Some(LinkTarget::Attachment(_)) | None => None,
     }
@@ -1041,5 +1054,24 @@ mod tests {
             (request.caption.as_str(), request.status),
             ("샘플 verification code", RequestStatus::Expired)
         );
+    }
+
+    #[test]
+    fn captured_subagent_handoffs_are_clickable_task_links() {
+        let task = item(serde_json::json!({
+            "role":"subagent","id":"sample-task-message","at":1.0,"seq":8,
+            "title":"Library opening hours","path":"handoffs/sample-library-task"
+        }));
+        let converted = message(&task, None);
+        assert!(matches!(&converted.parts[..],[Part::PhoneTask {title,path}]
+            if &**title=="Library opening hours" && path=="handoffs/sample-library-task"));
+        let unsupported = item(serde_json::json!({
+            "role":"subagent","id":"another-task","at":2.0,"seq":9,
+            "title":"Other task","path":"documents/sample.txt"
+        }));
+        assert!(matches!(
+            &message(&unsupported, None).parts[..],
+            [Part::Task(_)]
+        ));
     }
 }

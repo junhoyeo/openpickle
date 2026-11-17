@@ -159,6 +159,26 @@ pub enum ChatEvent {
         parts: Vec<i64>,
         prev_seq: i64,
     },
+    /// A partial character reply before it is assigned a room sequence number.
+    AssistantPartial {
+        role: String,
+        id: String,
+        text: String,
+        at: f64,
+        channel: String,
+        parts: Vec<i64>,
+    },
+    /// A stored subagent result linked to a path.
+    Subagent {
+        role: String,
+        id: String,
+        title: String,
+        path: String,
+        at: f64,
+        seq: i64,
+        prev_seq: i64,
+        channel: String,
+    },
     /// Whether the character is working on a turn.
     Pending { on: bool },
     /// `chat_turn_started`, `chat_turn_finished`, …

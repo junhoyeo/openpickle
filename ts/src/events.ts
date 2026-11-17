@@ -96,6 +96,28 @@ export type ChatEvent =
       parts: number[];
       prev_seq: number;
     }
+  | {
+      /** A partial character reply before it is assigned a room sequence number. */
+      kind: "assistant_partial";
+      role: string;
+      id: string;
+      text: string;
+      at: number;
+      channel: string;
+      parts: number[];
+    }
+  | {
+      /** A stored subagent result linked to a path. */
+      kind: "subagent";
+      role: string;
+      id: string;
+      title: string;
+      path: string;
+      at: number;
+      seq: number;
+      prev_seq: number;
+      channel: string;
+    }
   | { kind: "pending"; on: boolean }
   | { kind: "responder"; state: "chat_turn_started" | "chat_turn_finished" | (string & {}) }
   | { kind: "activity"; state: "thinking" | "tool" | (string & {}); label?: string; typing?: boolean }

@@ -15,10 +15,12 @@ use crate::{
     content::LinkTarget,
     convert,
     model::{Message, Part, RoomInfo, Social, UNCONFIRMED_SEQ, build_rows},
+    phone::CallSummary,
     protocol::{Command, Update},
     theme,
     ui::{
-        Identity, OpenArchive, OpenChat, OpenExplore, OpenFriends, OpenProfile, Pictures, Tab,
+        Identity, OpenArchive, OpenChat, OpenExplore, OpenFriends, OpenPhoneCalls, OpenProfile,
+        Pictures, Tab,
         archive::{ArchiveEvent, ArchiveView},
         attachment::{AttachmentEvent, AttachmentView},
         chat::{ChatEvent, ChatView},
@@ -27,6 +29,7 @@ use crate::{
         friends::{FriendsEvent, FriendsView},
         invite::{InviteEvent, InviteView},
         login::{LoginEvent, LoginView},
+        phone::{PhoneEvent, PhoneView},
         profile::{ProfileEvent, ProfileView},
         search::{SearchEvent, SearchView},
     },
@@ -47,6 +50,7 @@ enum Over {
     Drawer(Entity<DrawerView>),
     Invite(Entity<InviteView>),
     Attachment(Entity<AttachmentView>),
+    Phone(Entity<PhoneView>),
     /// The search screen, which lives in `Shell::search`.
     Search,
 }
@@ -77,6 +81,8 @@ pub struct Shell {
     social: Option<Social>,
     /// The other chat rooms as last listed.
     rooms: Vec<RoomInfo>,
+    calls: Vec<CallSummary>,
+    pending_phone_task: Option<String>,
     /// The open conversation, oldest first.
     messages: Vec<Message>,
     room_id: String,
@@ -131,6 +137,8 @@ impl Shell {
             pictures: cx.new(|_| Pictures::default()),
             social: None,
             rooms: Vec::new(),
+            calls: Vec::new(),
+            pending_phone_task: None,
             messages: Vec::new(),
             room_id: String::new(),
             is_character: true,
@@ -321,6 +329,51 @@ impl Shell {
                     view.update(cx, |view, cx| view.loaded(result, cx));
                 }
             }
+            Update::PhoneTask { path, result } => {
+                if self.pending_phone_task.as_deref() == Some(path.as_str()) {
+                    self.pending_phone_task = None;
+                    match result {
+                        Ok(call_id) => {
+                            self.notice = None;
+                            self.open_phone(Some(call_id), window, cx);
+                        }
+                        Err(reason) => {
+                            self.notice = Some(reason.into());
+                            cx.notify();
+                        }
+                    }
+                }
+            }
+            Update::PhoneCalls(result) => {
+                if let Ok(calls) = &result {
+                    self.calls = calls.clone();
+                    if let Some(Over::Drawer(drawer)) = &self.over {
+                        drawer.update(cx, |drawer, cx| drawer.set_calls(calls.clone(), cx));
+                    }
+                }
+                if let Some(Over::Phone(phone)) = &self.over {
+                    phone.update(cx, |phone, cx| phone.set_calls(result, cx));
+                }
+            }
+            Update::PhoneCard { path, call } => {
+                if let Screen::Chat(chat) = &self.screen {
+                    chat.update(cx, |chat, cx| chat.set_phone_card(path, call, cx));
+                }
+            }
+            Update::PhoneCall { call_id, result } => {
+                // The chat's card of this call shows what the open transcript just read.
+                if let (Ok(call), Screen::Chat(chat)) = (&result, &self.screen) {
+                    chat.update(cx, |chat, cx| chat.refresh_phone_card(call, cx));
+                }
+                if let Some(Over::Phone(phone)) = &self.over {
+                    phone.update(cx, |phone, cx| phone.set_call(&call_id, result, cx));
+                }
+            }
+            Update::PhoneCallEnded { call_id, result } => {
+                if let Some(Over::Phone(phone)) = &self.over {
+                    phone.update(cx, |phone, cx| phone.set_end_result(&call_id, result, cx));
+                }
+            }
             Update::Rooms(rooms) => {
                 self.rooms = rooms;
                 self.refresh_room_avatar(cx);
@@ -398,6 +451,8 @@ impl Shell {
         self.search = None;
         self.social = None;
         self.rooms.clear();
+        self.calls.clear();
+        self.pending_phone_task = None;
         self.drafts.clear();
         self.pending.clear();
         self.offers_asked.clear();
@@ -453,6 +508,9 @@ impl Shell {
         if let Some(profile) = &self.profile {
             profile.update(cx, |profile, cx| profile.set_identity(identity.clone(), cx));
         }
+        if let Some(Over::Phone(phone)) = &self.over {
+            phone.update(cx, |phone, cx| phone.set_identity(identity.clone(), cx));
+        }
     }
 
     fn show_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -482,10 +540,16 @@ impl Shell {
                 ChatEvent::Menu => this.open_drawer(window, cx),
                 ChatEvent::Invite => this.open_invite(window, cx),
                 ChatEvent::Open(tab) => this.open_tab(*tab, window, cx),
+                ChatEvent::PhoneCalls => this.open_phone(None, window, cx),
                 ChatEvent::Link(target) => this.open_link(target, window, cx),
                 ChatEvent::LoadAttachments(paths) => {
                     this.commands
                         .send(Command::LoadAttachments(paths.clone()))
+                        .ok();
+                }
+                ChatEvent::LoadPhoneCard(path) => {
+                    this.commands
+                        .send(Command::LoadPhoneCard(path.clone()))
                         .ok();
                 }
             }),
@@ -500,6 +564,9 @@ impl Shell {
     fn open_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.screen, Screen::Chat(_)) {
             return;
+        }
+        if matches!(self.over, Some(Over::Phone(_))) {
+            self.commands.send(Command::WatchPhoneCall(None)).ok();
         }
         match tab {
             Tab::Chat => {}
@@ -650,7 +717,11 @@ impl Shell {
 
     /// Closes what is open on top and gives the keyboard back to the section.
     fn close_over(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.over, Some(Over::Phone(_))) {
+            self.commands.send(Command::WatchPhoneCall(None)).ok();
+        }
         self.over = None;
+        self.pending_phone_task = None;
         self._over_events = None;
         let Screen::Chat(chat) = &self.screen else {
             return;
@@ -676,14 +747,18 @@ impl Shell {
     fn open_drawer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let tab = self.tab;
         let rooms = self.rooms.clone();
+        let calls = self.calls.clone();
         let pictures = self.pictures.clone();
         let drawer = cx.new(|cx| {
             let mut drawer = DrawerView::new(tab, pictures, cx);
             drawer.set_rooms(rooms, cx);
+            drawer.set_calls(calls, cx);
             drawer
         });
         self._over_events = Some(
             cx.subscribe_in(&drawer, window, |this, _, event, window, cx| match event {
+                DrawerEvent::PhoneCalls => this.open_phone(None, window, cx),
+                DrawerEvent::Phone(call_id) => this.open_phone(Some(call_id.clone()), window, cx),
                 DrawerEvent::Search => this.open_search(window, cx),
                 DrawerEvent::Friends => this.open_tab(Tab::Friends, window, cx),
                 DrawerEvent::Open(Tab::Chat) => this.open_room("", window, cx),
@@ -697,6 +772,88 @@ impl Shell {
         );
         window.focus(&drawer.focus_handle(cx));
         self.over = Some(Over::Drawer(drawer));
+        self.commands.send(Command::LoadPhoneCalls).ok();
+        self.report_reading(window);
+        cx.notify();
+    }
+
+    fn request_phone_list(&mut self, cx: &mut Context<Self>) {
+        if self.commands.send(Command::LoadPhoneCalls).is_err()
+            && let Some(Over::Phone(phone)) = &self.over
+        {
+            phone.update(cx, |phone, cx| {
+                phone.set_calls(Err("OpenPickle has stopped. Reopen the app.".into()), cx)
+            });
+        }
+    }
+
+    fn request_phone_call(&mut self, call_id: &str, cx: &mut Context<Self>) {
+        if self
+            .commands
+            .send(Command::WatchPhoneCall(Some(call_id.to_owned())))
+            .is_err()
+            && let Some(Over::Phone(phone)) = &self.over
+        {
+            phone.update(cx, |phone, cx| {
+                phone.set_call(
+                    call_id,
+                    Err("OpenPickle has stopped. Reopen the app.".into()),
+                    cx,
+                )
+            });
+        }
+    }
+
+    fn open_phone(&mut self, call_id: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_phone_task = None;
+        if matches!(self.over, Some(Over::Phone(_))) {
+            self.commands.send(Command::WatchPhoneCall(None)).ok();
+        }
+        let identity = self.identity.clone();
+        let initial_call = call_id.clone();
+        let view = cx.new(|cx| PhoneView::new(identity, initial_call, cx));
+        if !self.calls.is_empty() {
+            view.update(cx, |view, cx| view.set_calls(Ok(self.calls.clone()), cx));
+        }
+        self._over_events =
+            Some(
+                cx.subscribe_in(&view, window, |this, view, event, window, cx| match event {
+                    PhoneEvent::Close => this.close_over(window, cx),
+                    PhoneEvent::Open(call_id) | PhoneEvent::Refresh(call_id) => {
+                        this.request_phone_call(call_id, cx)
+                    }
+                    PhoneEvent::Back => {
+                        this.commands.send(Command::WatchPhoneCall(None)).ok();
+                        this.request_phone_list(cx);
+                    }
+                    PhoneEvent::Reload => this.request_phone_list(cx),
+                    PhoneEvent::End { call_id, action_id } => {
+                        if this
+                            .commands
+                            .send(Command::EndPhoneCall {
+                                call_id: call_id.clone(),
+                                action_id: action_id.clone(),
+                            })
+                            .is_err()
+                        {
+                            view.update(cx, |view, cx| {
+                                view.set_end_result(
+                                    call_id,
+                                    Err("OpenPickle has stopped. The end request was not sent."
+                                        .into()),
+                                    cx,
+                                )
+                            });
+                        }
+                    }
+                }),
+            );
+        window.focus(&view.focus_handle(cx));
+        self.over = Some(Over::Phone(view));
+        if let Some(call_id) = call_id {
+            self.request_phone_call(&call_id, cx);
+        }
+        self.request_phone_list(cx);
         self.report_reading(window);
         cx.notify();
     }
@@ -761,6 +918,16 @@ impl Shell {
         match LinkTarget::parse(target) {
             Some(LinkTarget::Web(url)) => cx.open_url(&url),
             Some(LinkTarget::Room(room)) => self.open_room(&room, window, cx),
+            Some(LinkTarget::PhoneTask(path)) => {
+                self.pending_phone_task = Some(path.clone());
+                self.notice = Some("Opening phone transcript…".into());
+                if self.commands.send(Command::ResolvePhoneTask(path)).is_err() {
+                    self.pending_phone_task = None;
+                    self.notice =
+                        Some("OpenPickle has stopped. Reopen the app to load this call.".into());
+                }
+                cx.notify();
+            }
             Some(LinkTarget::Attachment(path)) => {
                 let attachment = self
                     .messages
@@ -946,6 +1113,11 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|this, _: &OpenProfile, window, cx| {
                 this.open_tab(Tab::Profile, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenPhoneCalls, window, cx| {
+                if matches!(this.screen, Screen::Chat(_)) {
+                    this.open_phone(None, window, cx);
+                }
             }));
         match &self.screen {
             Screen::Starting => screen,
@@ -955,6 +1127,7 @@ impl Render for Shell {
                     Some(Over::Drawer(drawer)) => Some(drawer.clone().into()),
                     Some(Over::Invite(invite)) => Some(invite.clone().into()),
                     Some(Over::Attachment(preview)) => Some(preview.clone().into()),
+                    Some(Over::Phone(phone)) => Some(phone.clone().into()),
                     Some(Over::Search) => self.search.clone().map(AnyView::from),
                     None => None,
                 };
@@ -984,6 +1157,7 @@ impl Render for Shell {
                                     .child("×")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.notice = None;
+                                        this.pending_phone_task = None;
                                         cx.notify();
                                     })),
                             )
@@ -1655,5 +1829,147 @@ mod tests {
         cx.run_until_parked();
         cx.simulate_keystrokes("cmd-1");
         shell.read_with(cx, |shell, _| assert_eq!(shell.tab, Tab::Chat));
+    }
+
+    #[gpui::test]
+    fn opening_or_closing_phone_views_never_ends_a_call(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::ui::bind_keys);
+        let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, received) = futures::channel::mpsc::unbounded();
+        updates
+            .unbounded_send(Update::Conversation {
+                room_id: "primary".into(),
+                is_character: true,
+                can_send: true,
+                name: "Pickle".into(),
+                avatar: None,
+                messages: vec![],
+            })
+            .unwrap();
+        let (shell, cx) = cx.add_window_view(|window, cx| {
+            window.activate_window();
+            Shell::new(commands, received, window, cx)
+        });
+        while sent.try_recv().is_ok() {}
+        shell.update_in(cx, |shell, window, cx| {
+            shell.open_phone(Some("sample-call".into()), window, cx)
+        });
+        let opened = std::iter::from_fn(|| sent.try_recv().ok()).collect::<Vec<_>>();
+        assert!(opened.iter().any(
+            |command| matches!(command, Command::WatchPhoneCall(Some(id)) if id == "sample-call")
+        ));
+        assert!(
+            !opened
+                .iter()
+                .any(|command| matches!(command, Command::EndPhoneCall { .. }))
+        );
+        assert!(
+            !opened
+                .iter()
+                .any(|command| matches!(command, Command::Active(true)))
+        );
+        shell.update_in(cx, |shell, window, cx| shell.close_over(window, cx));
+        let closed = std::iter::from_fn(|| sent.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            closed
+                .iter()
+                .any(|command| matches!(command, Command::WatchPhoneCall(None)))
+        );
+        assert!(
+            !closed
+                .iter()
+                .any(|command| matches!(command, Command::EndPhoneCall { .. }))
+        );
+    }
+
+    #[gpui::test]
+    fn an_old_phone_task_result_cannot_open_over_the_new_request(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::ui::bind_keys);
+        let (commands, _received_commands) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, received) = futures::channel::mpsc::unbounded();
+        updates
+            .unbounded_send(Update::Conversation {
+                room_id: "primary".into(),
+                is_character: true,
+                can_send: true,
+                name: "Pickle".into(),
+                avatar: None,
+                messages: vec![],
+            })
+            .unwrap();
+        let (shell, cx) =
+            cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
+        shell.update_in(cx, |shell, window, cx| {
+            shell.open_link("handoff:handoffs/first-task", window, cx)
+        });
+        shell.update_in(cx, |shell, window, cx| {
+            shell.open_link("handoff:handoffs/second-task", window, cx)
+        });
+        updates
+            .unbounded_send(Update::PhoneTask {
+                path: "handoffs/first-task".into(),
+                result: Ok("first-call".into()),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| assert!(shell.over.is_none()));
+        updates
+            .unbounded_send(Update::PhoneTask {
+                path: "handoffs/second-task".into(),
+                result: Ok("second-call".into()),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| match &shell.over {
+            Some(Over::Phone(view)) => {
+                assert_eq!(view.read(cx).selected_call(), Some("second-call"))
+            }
+            _ => panic!("the current requested call should open"),
+        });
+    }
+
+    #[gpui::test]
+    fn the_phone_overlay_is_visible_above_chat_and_its_close_button_does_not_hang_up(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::ui::bind_keys);
+        let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, received) = futures::channel::mpsc::unbounded();
+        updates
+            .unbounded_send(Update::Conversation {
+                room_id: "primary".into(),
+                is_character: true,
+                can_send: true,
+                name: "Pickle".into(),
+                avatar: None,
+                messages: vec![],
+            })
+            .unwrap();
+        let (shell, cx) =
+            cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
+        cx.simulate_resize(gpui::size(px(440.), px(900.)));
+        cx.simulate_keystrokes("cmd-shift-p");
+        shell.read_with(cx, |shell, _| {
+            assert!(matches!(shell.over, Some(Over::Phone(_))))
+        });
+        while sent.try_recv().is_ok() {}
+        cx.simulate_click(gpui::point(px(400.), px(71.)), gpui::Modifiers::none());
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell.over.is_none(),
+                "the phone Close control must receive the click, not the chat behind it"
+            )
+        });
+        let commands = std::iter::from_fn(|| sent.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, Command::WatchPhoneCall(None)))
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, Command::EndPhoneCall { .. }))
+        );
     }
 }

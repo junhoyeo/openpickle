@@ -460,6 +460,45 @@ export interface SendMessageResponse {
   seq: number | null;
 }
 
+// ---- Phone calls ----
+
+export interface PhoneCallLine {
+  id: string;
+  line_id: string;
+  speaker: Open<"me" | "them">;
+  text: string;
+  /** Keypad input represented by this line, when present. */
+  keys?: string;
+  joins_previous: boolean;
+  joins_next: boolean;
+}
+
+/** `GET /api/phone-calls/{call_id}`: call state and the transcript collected so far. */
+export interface PhoneCallTranscript {
+  kind: "phone_call";
+  call_id: string;
+  title: string;
+  subtitle_lead: string;
+  counterpart_label: string;
+  subtitle_tail: string;
+  started_label: string;
+  live: boolean;
+  hangup_requested: boolean;
+  footer: string;
+  lines: PhoneCallLine[];
+  started_at_epoch_ms?: number;
+  answered_at_epoch_ms?: number;
+  ended_at_epoch_ms?: number;
+  duration_s?: number;
+  outcome?: string;
+}
+
+export interface EndPhoneCallOptions {
+  /** Defaults to a new random UUID. Reuse an id when retrying the same action. */
+  actionId?: string;
+  inCall?: boolean;
+}
+
 // ---- Social ----
 
 export interface Friend extends UserSummary {
@@ -512,18 +551,24 @@ export interface HandoffItem {
   name: string;
   title: string;
   state: Open<"done" | "canceled" | "running" | "planned">;
-  subtitle: string;
+  /** Present on completed and older entries; active entries may use the log and phone fields. */
+  subtitle?: string;
   requested_at_epoch_ms: number;
   finished_at_epoch_ms?: number;
-  result_text: string;
+  result_text?: string;
   time_text: string;
+  latest_log_text?: string;
+  latest_log_kind?: string;
   phone_call_id?: string;
+  phone_status_text?: string;
+  phone_answered_at_epoch_ms?: number;
 }
 
 export interface HandoffsScreen {
   kind: "list";
   items: HandoffItem[];
   handoff_estimate_pct: number;
+  status_subtitle?: string;
   active_items: HandoffItem[];
   recent_items: HandoffItem[];
   active_count: number;

@@ -231,6 +231,14 @@ pub struct SendMessageOptions {
     pub context: Option<MessageContext>,
 }
 
+/// Options of [`PickleClient::end_phone_call`].
+#[derive(Clone, Debug, Default)]
+pub struct EndPhoneCallOptions {
+    /// Defaults to a new random UUID. Reuse an id when retrying the same action.
+    pub action_id: Option<String>,
+    pub in_call: bool,
+}
+
 /// The claims of an access token.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AccessTokenClaims {
@@ -636,6 +644,36 @@ impl PickleClient {
         let body = json!({ "seq": seq, "device_id": self.inner.device_id });
         self.request(Method::PUT, &path, RequestOptions::default().json(&body)?)
             .await
+    }
+
+    /// `GET /api/phone-calls/{call_id}`: call state and the transcript collected so far.
+    pub async fn get_phone_call(&self, call_id: &str) -> Result<PhoneCallTranscript> {
+        let path = format!("/api/phone-calls/{}", encode_component(call_id));
+        self.request(Method::GET, &path, RequestOptions::default())
+            .await
+    }
+
+    /// Sends the captured `end_phone_call` action. Keep `action_id` stable when retrying.
+    pub async fn end_phone_call(
+        &self,
+        call_id: &str,
+        options: EndPhoneCallOptions,
+    ) -> Result<StatusOk> {
+        let action_id = options
+            .action_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let body = json!({
+            "action_id": action_id,
+            "in_call": options.in_call,
+            "payload": { "call_id": call_id },
+            "kind": "end_phone_call",
+        });
+        self.request(
+            Method::POST,
+            "/api/actions",
+            RequestOptions::default().json(&body)?,
+        )
+        .await
     }
 
     /// `GET /api/events`: the live event stream. The server opens with its current state and

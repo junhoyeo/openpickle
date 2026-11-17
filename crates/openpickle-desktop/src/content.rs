@@ -43,6 +43,8 @@ pub enum SpanKind {
 pub enum LinkTarget {
     Web(String),
     Room(String),
+    /// A task listed by the account's handoff screen; resolve to a call before opening.
+    PhoneTask(String),
     /// The server attachment path, without the `attachment:` prefix.
     Attachment(String),
 }
@@ -53,6 +55,17 @@ impl LinkTarget {
     pub fn parse(target: &str) -> Option<Self> {
         if target.starts_with("https://") || target.starts_with("http://") {
             return Some(Self::Web(target.to_owned()));
+        }
+        if let Some(path) = target.strip_prefix("handoff:") {
+            let name = path.strip_prefix("handoffs/")?;
+            if name.is_empty()
+                || name.contains('/')
+                || name.chars().any(char::is_control)
+                || matches!(name, "." | "..")
+            {
+                return None;
+            }
+            return Some(Self::PhoneTask(path.to_owned()));
         }
         if let Some(path) = target.strip_prefix("attachment:") {
             return Self::attachment(path);
@@ -81,6 +94,7 @@ impl LinkTarget {
         match self {
             Self::Web(url) => url,
             Self::Room(room_id) => format!("pickle://chat?room_id={room_id}"),
+            Self::PhoneTask(path) => format!("handoff:{path}"),
             Self::Attachment(path) => format!("attachment:{path}"),
         }
     }

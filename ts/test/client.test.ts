@@ -1,6 +1,12 @@
 import { expect, test } from "bun:test";
 import { PickleApiError, PickleClient, decodeAccessToken } from "../src/client.ts";
-import type { ExploreSectionsScreen, HistoryPage, MessageSearchScreen, Offer } from "../src/types.ts";
+import type {
+  ExploreSectionsScreen,
+  HistoryPage,
+  MessageSearchScreen,
+  Offer,
+  PhoneCallTranscript,
+} from "../src/types.ts";
 
 function recorder(status: number, body: string) {
   const calls: { url: string; init: RequestInit }[] = [];
@@ -187,6 +193,83 @@ test("getHistoryPage asks for messages before a sequence number, limit first", a
     "/api/rooms/room-1/history/page?limit=250&before_seq=7",
   ]);
   expect(calls[0]!.init.method).toBe("GET");
+});
+
+test("getPhoneCall reads live, ending, and completed transcript shapes and encodes the id as one segment", async () => {
+  const live: PhoneCallTranscript = {
+    kind: "phone_call",
+    call_id: "synthetic-live",
+    title: "Active call",
+    subtitle_lead: "Speaking with",
+    counterpart_label: "Example contact",
+    subtitle_tail: "",
+    started_label: "Now",
+    live: true,
+    hangup_requested: false,
+    footer: "Call in progress",
+    lines: [
+      {
+        id: "line-1",
+        line_id: "line-1",
+        speaker: "me",
+        text: "Synthetic transcript line",
+        keys: "12#",
+        joins_previous: false,
+        joins_next: false,
+      },
+    ],
+    started_at_epoch_ms: 1_700_000_000_000,
+  };
+  const ending: PhoneCallTranscript = {
+    ...live,
+    call_id: "synthetic-ending",
+    live: true,
+    hangup_requested: true,
+    footer: "Ending call",
+    answered_at_epoch_ms: 1_700_000_001_000,
+  };
+  const completed: PhoneCallTranscript = {
+    ...ending,
+    call_id: "synthetic-completed",
+    live: false,
+    hangup_requested: false,
+    footer: "Call ended",
+    ended_at_epoch_ms: 1_700_000_061_000,
+    duration_s: 60,
+    outcome: "answered",
+  };
+  const replies = [live, ending, completed];
+  const calls: { url: string; init: RequestInit }[] = [];
+  const fetch = (async (url: string, init: RequestInit) => {
+    calls.push({ url, init });
+    return new Response(JSON.stringify(replies[calls.length - 1]), {
+      headers: { "content-type": "application/json" },
+    });
+  }) as unknown as typeof globalThis.fetch;
+  const pickle = new PickleClient({ accessToken: "synthetic-token", fetch });
+
+  expect(await pickle.getPhoneCall("live/id ?")).toEqual(live);
+  expect(await pickle.getPhoneCall("ending-id")).toEqual(ending);
+  expect(await pickle.getPhoneCall("completed-id")).toEqual(completed);
+  expect(calls[0]!.url).toBe(`${pickle.baseUrl}/api/phone-calls/live%2Fid%20%3F`);
+  expect(calls.every((call) => call.init.method === "GET" && call.init.body === undefined)).toBe(true);
+});
+
+test("endPhoneCall sends the captured action and preserves a retry action id", async () => {
+  const { calls, fetch } = recorder(200, '{"status":"ok"}');
+  const pickle = new PickleClient({ accessToken: "synthetic-token", fetch });
+
+  expect(await pickle.endPhoneCall("synthetic-call", { actionId: "stable-action", inCall: false })).toEqual({
+    status: "ok",
+  });
+  expect(calls[0]!.url).toBe(`${pickle.baseUrl}/api/actions`);
+  expect(calls[0]!.init.method).toBe("POST");
+  expect(JSON.parse(String(calls[0]!.init.body))).toEqual({
+    action_id: "stable-action",
+    in_call: false,
+    payload: { call_id: "synthetic-call" },
+    kind: "end_phone_call",
+  });
 });
 
 test("getAttachmentThumbnail encodes each path segment and returns the JPEG", async () => {

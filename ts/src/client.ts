@@ -3,6 +3,7 @@ import type {
   ApiErrorBody,
   Character,
   EnclaveNode,
+  EndPhoneCallOptions,
   ExploreSectionsScreen,
   HistoryDelta,
   HistoryPage,
@@ -16,6 +17,7 @@ import type {
   LogStoreListings,
   LogStoreListingsRequest,
   PermissionSnapshot,
+  PhoneCallTranscript,
   PhoneCodeRequested,
   Profile,
   RegisterResponse,
@@ -315,6 +317,26 @@ export class PickleClient {
   markRead(roomId: string, seq: number): Promise<StatusOk> {
     return this.request("PUT", `/api/rooms/${encodeURIComponent(roomId)}/read`, {
       body: { seq, device_id: this.deviceId },
+    });
+  }
+
+  /** `GET /api/phone-calls/{call_id}`: call state and the transcript collected so far. */
+  getPhoneCall(callId: string): Promise<PhoneCallTranscript> {
+    return this.request("GET", `/api/phone-calls/${encodeURIComponent(callId)}`);
+  }
+
+  /** Sends the captured `end_phone_call` action. Keep `actionId` stable when retrying. */
+  endPhoneCall(
+    callId: string,
+    options: EndPhoneCallOptions = {},
+  ): Promise<StatusOk> {
+    return this.request("POST", "/api/actions", {
+      body: {
+        action_id: options.actionId ?? crypto.randomUUID(),
+        in_call: options.inCall ?? false,
+        payload: { call_id: callId },
+        kind: "end_phone_call",
+      },
     });
   }
 
