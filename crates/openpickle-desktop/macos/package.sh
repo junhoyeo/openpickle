@@ -34,7 +34,8 @@ case "$target" in
 esac
 image=$out/OpenPickle-$version-$arch.dmg
 
-cargo build --locked --release -p openpickle-desktop "${build_target[@]}"
+# macOS ships bash 3.2, where expanding an empty array is an error under `set -u`.
+cargo build --locked --release -p openpickle-desktop ${build_target[@]+"${build_target[@]}"}
 
 # Keep images made for another architecture when this script is invoked twice in one job.
 rm -rf "$app" "$out/AppIcon.iconset" "$out/image"
