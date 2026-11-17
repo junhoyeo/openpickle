@@ -28,6 +28,108 @@ pub struct SearchResult {
     pub matches: Vec<Range<usize>>,
 }
 
+/// Someone on Pickle, as the friends and invite screens list them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Person {
+    pub id: String,
+    pub name: String,
+    /// Their character's picture, named by its key in the picture cache. Empty when there
+    /// is none.
+    pub picture: String,
+    /// A line under the name, where a list has one: `Joined 3 days ago`.
+    pub note: String,
+}
+
+/// What the friends screen and the invite sheet show.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Social {
+    pub friends: Vec<Person>,
+    /// People who asked to be friends.
+    pub requests: Vec<Person>,
+    /// How many people are blocked.
+    pub blocked: usize,
+    pub invite: Invite,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Invite {
+    /// The link to share. Empty when the server gave none.
+    pub url: String,
+    /// How many invites are left.
+    pub left: i64,
+    pub joined: Vec<Person>,
+    pub inviters: Vec<Person>,
+}
+
+/// Something the character offers to do, on the Explore tab.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Offer {
+    pub id: String,
+    /// The section the offer belongs to.
+    pub section: String,
+    /// What the character would do. Empty for some offers, which then show only `detail`.
+    pub title: String,
+    pub detail: String,
+    /// The message that asks for the offer.
+    pub ask: String,
+    /// The offer's picture, named by its key in the picture cache.
+    pub picture: String,
+    /// The name of a system symbol, for an offer without a picture.
+    pub symbol: String,
+    /// `75,776 people asked for this`, or empty.
+    pub asked_by: String,
+    pub steps: Vec<String>,
+    /// The areas the offer is listed under.
+    pub areas: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OfferSection {
+    pub id: String,
+    pub title: String,
+    pub offers: Vec<Arc<Offer>>,
+    /// How many offers show before the section is expanded.
+    pub preview: usize,
+    /// Whether the section has more to show than its preview.
+    pub expandable: bool,
+}
+
+/// The Explore tab's content.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Explore {
+    /// The areas that have a filter chip.
+    pub areas: Vec<String>,
+    /// The offers of the "popular" section, which an expanded section does not repeat.
+    pub popular: Vec<String>,
+    pub sections: Vec<OfferSection>,
+    /// The offers no section previews, listed after the sections.
+    pub more: Vec<Arc<Offer>>,
+    /// Every offer in the server's order of rank: what an area's filter lists.
+    pub ranked: Vec<Arc<Offer>>,
+}
+
+/// A picture or a file that a message of the conversation carries, as the Archive tab lists
+/// it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Attachment {
+    /// The server's path of the attachment: `attachments/<day>/<file name>`.
+    pub path: String,
+    /// The sequence number of the message that carries it.
+    pub seq: u64,
+    /// Unix seconds of that message.
+    pub at: f64,
+    pub name: String,
+    /// `PDF · 12 pages · 1.2 MB`, for a file; empty for a picture.
+    pub detail: String,
+    pub kind: AttachmentKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentKind {
+    Picture,
+    File,
+}
+
 /// Messages typed here that the server has not confirmed yet are numbered above this, which
 /// is above every real sequence number. They stay last, in typing order.
 pub const UNCONFIRMED_SEQ: u64 = u64::MAX - 1_000_000;

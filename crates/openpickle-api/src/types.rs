@@ -443,6 +443,19 @@ pub struct MessageContext {
     pub button_index: Option<i64>,
 }
 
+impl MessageContext {
+    /// The context of a message sent from an offer on the Explore tab. The message's text is
+    /// the offer's `cta_label`.
+    pub fn offer(offer_id: impl Into<String>) -> Self {
+        Self {
+            kind: "offer".into(),
+            id: offer_id.into(),
+            quote: None,
+            button_index: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReplyTo {
     pub target_id: String,
@@ -581,6 +594,18 @@ pub struct HistoryWindow {
     pub log_epoch: String,
     pub projection_version: i64,
     pub read_seq: i64,
+}
+
+/// `GET /api/rooms/{room}/history/page`: messages before a sequence number, newest first.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HistoryPage {
+    pub v: i64,
+    pub messages: Vec<HistoryItem>,
+    pub reactions: Vec<Reaction>,
+    pub card_states: Vec<CardState>,
+    pub has_more: bool,
+    /// The `before_seq` of the page before this one.
+    pub next_before: i64,
 }
 
 /// `GET /api/rooms/{room}/history/delta`.
@@ -774,6 +799,55 @@ pub struct ExtraConversationsScreen {
     pub kind: String,
     pub items: Vec<ExtraConversation>,
     pub counterpart_name: String,
+}
+
+/// Something the character offers to do for you, shown on the Explore tab.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Offer {
+    pub offer_id: String,
+    /// What the character would do, in its own words. Empty for some suggestions.
+    pub title: String,
+    pub detail: String,
+    /// The text of the button, which is also the message that asks for the offer.
+    pub cta_label: String,
+    /// Address of the offer's picture.
+    pub icon_image: String,
+    /// An SF Symbol name (`banknote`, `house`, `airplane`, …), for when there is no picture.
+    pub icon_symbol: String,
+    /// `money`, `shopping`, `health`, `people`, `work`, `travel`, `home` or `fun`.
+    pub area: String,
+    pub areas: Vec<String>,
+    /// `75,776 people asked for this`, or empty.
+    pub accepted_users_label: String,
+    /// How the character goes about it. Missing in `ranked_items`.
+    #[serde(default)]
+    pub steps: Vec<String>,
+    /// The section an offer of `more_items` or `ranked_items` belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExploreSection {
+    /// `popular`, `character`, `trending`, `money_back`, `shopping`, …
+    pub section_id: String,
+    pub title: String,
+    pub items: Vec<Offer>,
+    /// How many of `items` show before the section is expanded, and how many more it holds.
+    pub preview_count: i64,
+    pub expand_count: i64,
+    pub areas: Vec<String>,
+}
+
+/// `GET /api/screens/explore-sections`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExploreSectionsScreen {
+    pub kind: String,
+    pub areas: Vec<String>,
+    pub popular_ids: Vec<String>,
+    pub sections: Vec<ExploreSection>,
+    pub more_items: Vec<Offer>,
+    pub ranked_items: Vec<Offer>,
 }
 
 /// `GET /api/screens/message-search`: the messages that contain the query, newest first. The

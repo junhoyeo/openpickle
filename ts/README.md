@@ -1,10 +1,10 @@
 # @openpickle/client
 
 A typed TypeScript client for the Pickle character API (`https://character-api-prod.picklemem.com`),
-the backend of the Pickle iOS app. It was built from four Proxyman captures of the iOS app
-(version 1.1.19, build 202611071128) taken on 2026-11-16 and 2026-11-17, 32 endpoints in all. A
+the backend of the Pickle iOS app. It was built from six Proxyman captures of the iOS app
+(version 1.1.19, build 202611071128) taken on 2026-11-16 and 2026-11-17, 36 endpoints in all. A
 full history export and login session refreshes were run against the live API; phone sign-in has
-only been replayed against its capture. The client covers 28 endpoints. It has no runtime dependencies and
+only been replayed against its capture. The client covers 32 endpoints. It has no runtime dependencies and
 uses `fetch`. It runs on Bun, and on Node versions that load TypeScript directly (tested on
 Node 26); older Node needs a bundler.
 
@@ -104,13 +104,17 @@ All of these were in the captures. `scripts/verify-capture.ts` checks each one a
 | GET | `/api/events` | `events()` | Server-sent events. See [Events](#events). |
 | GET | `/api/rooms/{room}/history` | `getHistory(room)` | The newest messages of a room (up to 200), reactions inline. The app calls it after a fresh sign-in. |
 | GET | `/api/rooms/{room}/history/delta?after_seq=&limit=` | `getHistoryDelta(room, { afterSeq, limit })`, `history(room)` | Messages, reactions and card states after a sequence number, up to 500 per page. `history()` pages from the start. |
-| POST | `/api/rooms/{room}/messages` | `sendMessage(room, text, { clientMsgId?, inCall? })` | Returns `{ status, responder, seq: null }`. The reply arrives on `events()`. |
+| GET | `/api/rooms/{room}/history/page?limit=&before_seq=` | `getHistoryPage(room, { beforeSeq, limit })` | Up to 250 messages before a sequence number, with reactions and card states. See [History pages and attachments](#history-pages-and-attachments). |
+| GET | `/api/attachments/{path}/thumbnail` | `getAttachmentThumbnail(path)` | A JPEG preview of a photo or PDF in a message. Returns `{ bytes, contentType }`. |
+| POST | `/api/rooms/{room}/messages` | `sendMessage(room, text, { clientMsgId?, inCall?, context? })` | Returns `{ status, responder, seq: null }`. The reply arrives on `events()`. `context` marks a message sent from an [Explore](#explore) offer. |
 | PUT | `/api/rooms/{room}/read` | `markRead(room, seq)` | Moves this device's read cursor. |
 | GET | `/api/character` | `getCharacter()` | Look, level, XP, energy, jelly. |
 | GET | `/api/profile?region=` | `getProfile(region?)` | Your profile, including phone and birthday. |
 | GET | `/api/social/snapshot?scopes=` | `getSocialSnapshot(scopes?)` | Friends, requests, blocked, invite, activity. Each scope has its own status. |
-| GET | `/api/screens/{kind}` | `getScreen(kind, query?)` | Data for server-driven screens. `handoffs`, `extra-conversations`, `roulette-promo` and `message-search` are typed. |
+| GET | `/api/screens/{kind}` | `getScreen(kind, query?)` | Data for server-driven screens. `handoffs`, `extra-conversations`, `roulette-promo`, `message-search` and `explore-sections` are typed. |
 | GET | `/api/screens/message-search?query=` | `searchMessages(query)` | Messages containing the text, newest first. See [Message search](#message-search). |
+| GET | `/api/screens/explore-sections` | `getExploreSections()` | Things the character offers to do, in sections. See [Explore](#explore). |
+| POST | `/api/offers/impressions` | `reportOfferImpressions(offerIds)` | Reports which offers were shown. Answered with `{}`. |
 | PUT | `/api/device/permissions` | `reportPermissions(snapshots)` | Which device data sources the app may read. |
 | POST | `/api/device/location/token` | `requestLocationToken()` | `409 location_disabled` while location sharing is off. |
 | GET | `/api/ui-definitions` | `getUiDefinitions()` | The server-driven UI bundle (about 2 MB). No token needed. |
@@ -139,15 +143,12 @@ error handling.
 ### Not in the captures
 
 - **Apple, Kakao and LINE sign-in.** Only phone sign-in was captured.
-- **Older history pages.** `getHistory()` returns the newest 200 messages; the request the app
-  uses to page further back was not captured. `history()` reads everything through
-  `history/delta` from sequence 0 instead.
 - **Other screen kinds.** The UI definitions name these data kinds: `activity`, `bubble`,
   `bubbles`, `character-voices`, `character_avatar_history`, `character_colors`,
   `character_settings`, `character_sharing`, `clone_brief`, `connection-detail`, `connections`,
-  `explore-sections`, `friend`, `friend-request`, `handle_check`, `handoff`,
-  `notification_settings`, `page`, `phone_call`,
-  `scheduled-action`, `scheduled-action-run`, `scheduled-actions`, `ticket-history`, `vault`.
+  `friend`, `friend-request`, `handle_check`, `handoff`, `notification_settings`, `page`,
+  `phone_call`, `scheduled-action`, `scheduled-action-run`, `scheduled-actions`, `ticket-history`,
+  `vault`.
   Whether each one is served at `/api/screens/{kind}` is unverified. `profile` is also a data kind,
   and it is served at `/api/profile`, so the pattern does not hold for every kind.
   `getScreen(kind)` returns `unknown` for these; `getUiDefinitions().samples[kind]` shows the
@@ -204,6 +205,129 @@ covers phone call transcripts, and a non-empty `room_id` would point to another 
 were seen, so `kind` is typed as an open string. Queries with spaces or ASCII text were not
 captured either; the client encodes them the same way.
 
+## Explore
+
+The app's Explore screen lists things the character offers to do for you ("offers"), such as
+finding money you are owed or watching flight prices. `getExploreSections()` calls
+`GET /api/screens/explore-sections`, which takes no parameters. The response, shortened:
+
+```json
+{
+  "kind": "explore-sections",
+  "areas": ["money", "shopping", "health", "people", "work", "travel", "home", "fun"],
+  "popular_ids": ["3f2a…"],
+  "sections": [
+    {
+      "section_id": "popular",
+      "title": "Popular lately",
+      "items": [
+        {
+          "offer_id": "3f2a…",
+          "title": "Find a refund",
+          "detail": "Check recent orders for a refund you are owed.",
+          "cta_label": "Find refunds I am owed",
+          "icon_image": "https://….cloudfront.net/….png",
+          "icon_symbol": "banknote",
+          "area": "money",
+          "accepted_users_label": "1,234 people asked for this",
+          "steps": ["Read order emails", "List refunds"],
+          "areas": ["money"]
+        }
+      ],
+      "preview_count": 1,
+      "expand_count": 0,
+      "areas": ["money"]
+    }
+  ],
+  "more_items": [{ "offer_id": "…", "section_id": "money_back", "…": "every offer field" }],
+  "ranked_items": [{ "offer_id": "3f2a…", "section_id": "popular", "…": "every offer field but steps" }]
+}
+```
+
+- `sections[].items` holds every offer of a section. The app shows the first `preview_count`
+  (3, or fewer when the section is smaller) and the rest after the section is expanded.
+- `more_items` holds each offer that is in no section's preview, once, with the `section_id` it
+  belongs to. A section's `expand_count` is the number of its offers in `more_items`.
+- `ranked_items` holds every offer once, with its `section_id` and without `steps`, in the server's
+  order.
+- `popular_ids` are the offer ids of the `popular` section, in order. An offer can be in two
+  sections, e.g. `popular` and its own area's section.
+- `icon_symbol` is an SF Symbol name; every offer of an area had the same one.
+
+`reportOfferImpressions(offerIds)` calls `POST /api/offers/impressions` with
+`{"offer_ids": [...]}`, and the server answers `{}`. The app sent it once, after Explore loaded,
+with the preview offers of the first sections.
+
+Tapping an offer sends a message to your character: its text is the offer's `cta_label`, and the
+body carries the offer as context. Pass the same to `sendMessage`:
+
+```ts
+await pickle.sendMessage(room, offer.cta_label, { context: { id: offer.offer_id, kind: "offer" } });
+// {"text":"…","client_msg_id":"…","in_call":false,"context":{"id":"<offer_id>","kind":"offer"}}
+```
+
+Without `context`, the body has no `context` key, as before.
+
+What the capture showed (one Explore session): three identical Explore responses, each with
+8 areas, 14 sections, 176 section items (173 distinct offers), 134 `more_items` and 173
+`ranked_items`. Every offer had every field; one had an empty `title`, one an empty
+`accepted_users_label`, many had no `steps`, and one had two `areas`. One impressions report with
+9 ids, and one message sent from an offer.
+
+What it did not show: a section id or area outside these, a `context.kind` other than `offer`
+(so both are open strings), an Explore response that changed between loads, and whether the
+server needs the impressions report before an offer message is accepted.
+
+## History pages and attachments
+
+`getHistoryPage(room, { beforeSeq, limit })` calls
+`GET /api/rooms/{room}/history/page?limit=250&before_seq=<seq>`, the request the app uses to
+scroll back through a room. The parameters go in that order, `limit` first. The response:
+
+```json
+{
+  "v": 1,
+  "messages": [{ "role": "user", "id": "m-7", "text": "older", "at": 1700000000, "seq": 7 }],
+  "reactions": [{ "seq": 9, "target_id": "m-7", "part": 0, "actor": "assistant", "emoji": "👍", "at": 1700000070 }],
+  "card_states": [{ "seq": 12, "id": "req-1", "state": "answered", "option_id": "yes" }],
+  "has_more": true,
+  "next_before": 7
+}
+```
+
+`messages` are the messages before `before_seq`, oldest first, and have no inline `reactions`.
+While `has_more` is true, `next_before` is the oldest `seq` of the page: pass it as the next
+`beforeSeq`. The `attachments` CLI command starts from `getHistory()` and pages back from its
+oldest message the same way.
+
+Messages refer to photos and files by attachment path, `attachments/<date>/<file name>`:
+
+- `attachments`: the paths a message of yours carries.
+- `image_meta`: path to `{ w, h, blurhash }`, for photos of yours and images the character sent.
+- `file_meta`: path to `{ name, size, pages? }` (`size` in bytes, `pages` for PDFs), for files
+  the character sent.
+- `inline_images` and `inline_files`: a path the character wrote in its reply (such as
+  `downloads/report.pdf`) to the attachment path it was stored under.
+
+`getAttachmentThumbnail(path)` calls `GET /api/attachments/{path}/thumbnail` and returns
+`{ bytes, contentType }`, a JPEG. Each path segment is percent-encoded on its own, so
+`attachments/2026-01-02/여행 계획.pdf` becomes
+`/api/attachments/attachments/2026-01-02/%EC%97%AC%ED%96%89%20%EA%B3%84%ED%9A%8D.pdf/thumbnail`.
+The app sends this request with the bearer token and the common headers, but without its
+`X-Client-*` and `X-Pickle-*` headers, and so does the client.
+
+What the capture showed (one session): 4 history pages of the character room, back to its first
+message (44, 250, 250 and 165 messages, the last with `has_more: false`). The app started below
+the room's `last_seq`, at messages it did not hold yet, and did not call `getHistory()` first.
+On the last page `next_before` was 1, not the oldest `seq`. Card states were `answered`,
+`expired` or `superseded`. 12 thumbnails, all `200 image/jpeg`: 9 of photos and 3 of PDFs with
+Korean file names, two of them with spaces. Across the pages, 7 messages had `attachments`, 12 had `image_meta`, and one had
+`file_meta` and `inline_files` with PDF, spreadsheet and text files.
+
+What it did not show: a thumbnail of a spreadsheet or text file, a thumbnail request that failed,
+the full-size attachment, a `limit` other than 250, and paging in a room other than your
+character's.
+
 ## Events
 
 `events()` opens `GET /api/events` and yields typed events until the server closes the stream.
@@ -240,6 +364,9 @@ bun src/cli.ts login +821012345678  # texts a code, asks for it, writes the sess
 bun src/cli.ts sync
 bun src/cli.ts send character "안녕"
 bun src/cli.ts search 점심         # one result per line: seq, date, label, snippet with [matches]
+bun src/cli.ts explore travel       # Explore offers by section: title, call to action, how many asked
+bun src/cli.ts attachments character  # photos and files, newest first: date, kind, name, size, path
+bun src/cli.ts thumbnail "attachments/2026-01-02/scan 1.pdf" scan.jpg  # JPEG thumbnail of one
 bun src/cli.ts export ./messages    # full history of every room, one JSON file per room
 bun src/cli.ts events               # one JSON object per line
 bun src/cli.ts screen handoffs
@@ -253,7 +380,7 @@ bun src/cli.ts token                # claims and seconds left of PICKLE_TOKEN
 bun install
 bun run typecheck
 bun test
-bun run verify:capture ~/Downloads/character-api-prod.picklemem.com_11-16-2026-20-45-31.proxymanlogv2
+bun run verify:capture ~/Downloads/character-api-prod.picklemem.com_11-17-2026-02-42-21.proxymanlogv2
 ```
 
 The client was also run against the live API. With an access token from the second capture,

@@ -2,12 +2,257 @@
 
 use std::sync::Arc;
 
-use openpickle_api::{CardState, HistoryItem, MessageSearchItem};
+use chrono::{DateTime, Utc};
+use openpickle_api::{
+    CardState, ExploreSectionsScreen, FileMeta, FriendRequest, HistoryItem, InviteMember,
+    MessageSearchItem, SocialSnapshot, UserSummary,
+};
 
 use crate::{
     content::{Block, parse_message, plain_text},
-    model::{Message, Part, Request, RequestOption, RequestStatus, SearchResult, Side},
+    model::{
+        Attachment, AttachmentKind, Explore, Invite, Message, Offer, OfferSection, Part, Person,
+        Request, RequestOption, RequestStatus, SearchResult, Side, Social,
+    },
 };
+
+/// The pictures and files a history item carries: what you sent (`attachments`), and what the
+/// character put in its reply (`inline_images`, `inline_files`, whose values are attachment
+/// paths). The item's `image_meta` and `file_meta` say which is which.
+pub fn attachments(item: &HistoryItem) -> Vec<Attachment> {
+    let sent = item.attachments.iter().flatten();
+    let images = item.inline_images.iter().flat_map(|images| images.values());
+    let files = item.inline_files.iter().flat_map(|files| files.values());
+    let mut paths: Vec<&String> = sent.chain(images).chain(files).collect();
+    paths.dedup();
+    paths
+        .into_iter()
+        .map(|path| {
+            let file = item.file_meta.as_ref().and_then(|meta| meta.get(path));
+            let picture = item
+                .image_meta
+                .as_ref()
+                .is_some_and(|meta| meta.contains_key(path));
+            let name = match file {
+                Some(file) if !file.name.is_empty() => file.name.clone(),
+                _ => path.rsplit('/').next().unwrap_or(path).to_owned(),
+            };
+            let picture = picture || (file.is_none() && is_picture_name(&name));
+            Attachment {
+                path: path.clone(),
+                seq: item.seq.max(0) as u64,
+                at: item.at,
+                detail: file.map(file_detail).unwrap_or_default(),
+                name,
+                kind: if picture {
+                    AttachmentKind::Picture
+                } else {
+                    AttachmentKind::File
+                },
+            }
+        })
+        .collect()
+}
+
+fn is_picture_name(name: &str) -> bool {
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase());
+    matches!(
+        extension.as_deref(),
+        Some("jpg" | "jpeg" | "png" | "gif" | "heic" | "webp")
+    )
+}
+
+/// `PDF · 12 pages · 1.2 MB`.
+fn file_detail(file: &FileMeta) -> String {
+    let mut detail = Vec::new();
+    if let Some((_, extension)) = file.name.rsplit_once('.') {
+        detail.push(extension.to_ascii_uppercase());
+    }
+    match file.pages {
+        Some(1) => detail.push("1 page".to_owned()),
+        Some(pages) if pages > 1 => detail.push(format!("{pages} pages")),
+        _ => {}
+    }
+    let size = file.size.max(0) as f64;
+    detail.push(match size {
+        _ if size < 1024. => format!("{size} B"),
+        _ if size < 1024. * 1024. => format!("{:.0} KB", size / 1024.),
+        _ => format!("{:.1} MB", size / (1024. * 1024.)),
+    });
+    detail.join(" · ")
+}
+
+/// The name of a picture in the cache: its address without the signature, which changes with
+/// every answer of the server.
+pub fn picture_key(url: &str) -> &str {
+    url.split('?').next().unwrap_or_default()
+}
+
+fn person(user: &UserSummary, note: String, pictures: &mut Vec<String>) -> Person {
+    // Lists show the character, as the app does, and fall back to the person's own picture.
+    let picture = match user.character_avatar_url.is_empty() {
+        true => &user.avatar_url,
+        false => &user.character_avatar_url,
+    };
+    if !picture.is_empty() {
+        pictures.push(picture.clone());
+    }
+    Person {
+        id: user.user_id.clone(),
+        name: user.display_name.clone(),
+        picture: picture_key(picture).to_owned(),
+        note,
+    }
+}
+
+/// `Joined today`, `Joined 1 day ago`, `Joined 12 days ago`; empty when the date is not one.
+fn joined(at: &str, now: DateTime<Utc>) -> String {
+    let Ok(at) = DateTime::parse_from_rfc3339(at) else {
+        return String::new();
+    };
+    match (now - at.with_timezone(&Utc)).num_days() {
+        ..=0 => "Joined today".to_owned(),
+        1 => "Joined 1 day ago".to_owned(),
+        days => format!("Joined {days} days ago"),
+    }
+}
+
+/// The friends screen and the invite sheet, from the social snapshot. Also returns the
+/// addresses of the pictures they show.
+pub fn social(snapshot: &SocialSnapshot, now: DateTime<Utc>) -> (Social, Vec<String>) {
+    let mut pictures = Vec::new();
+    let scopes = &snapshot.scopes;
+    let mut members = |members: &[InviteMember]| -> Vec<Person> {
+        members
+            .iter()
+            .map(|member| {
+                person(
+                    &member.user.user,
+                    joined(&member.joined_at, now),
+                    &mut pictures,
+                )
+            })
+            .collect()
+    };
+    let invite = scopes.invite.as_ref().map(|invite| &invite.data);
+    let invite = Invite {
+        url: invite.map(|invite| invite.url.clone()).unwrap_or_default(),
+        left: invite.map_or(0, |invite| {
+            (invite.invites_total - invite.invites_used).max(0)
+        }),
+        joined: invite
+            .map(|invite| members(&invite.signups))
+            .unwrap_or_default(),
+        inviters: invite
+            .map(|invite| members(&invite.inviters))
+            .unwrap_or_default(),
+    };
+    let friends = scopes.friends.as_ref().map(|friends| &friends.data.friends);
+    let friends = friends
+        .into_iter()
+        .flatten()
+        .map(|friend| person(&friend.user, String::new(), &mut pictures))
+        .collect();
+    // No request to you was ever captured. One that reads like a request from you is shown.
+    let requests = scopes
+        .requests
+        .as_ref()
+        .map(|requests| &requests.data.incoming);
+    let requests = requests
+        .into_iter()
+        .flatten()
+        .filter_map(|request| serde_json::from_value::<FriendRequest>(request.clone()).ok())
+        .map(|request| person(&request.user, String::new(), &mut pictures))
+        .collect();
+    let blocked = scopes
+        .blocked
+        .as_ref()
+        .map_or(0, |blocked| blocked.data.blocked.len());
+    let social = Social {
+        friends,
+        requests,
+        blocked,
+        invite,
+    };
+    (social, pictures)
+}
+
+/// The Explore tab, from the server's sections. Also returns the addresses of the pictures.
+pub fn explore(screen: ExploreSectionsScreen) -> (Explore, Vec<String>) {
+    let mut pictures = Vec::new();
+    // The ranked list comes without the steps, which the offer's sheet shows.
+    let steps: std::collections::HashMap<String, Vec<String>> = screen
+        .sections
+        .iter()
+        .flat_map(|section| &section.items)
+        .chain(&screen.more_items)
+        .filter(|offer| !offer.steps.is_empty())
+        .map(|offer| (offer.offer_id.clone(), offer.steps.clone()))
+        .collect();
+    let mut offer = |offer: openpickle_api::Offer, section: &str| {
+        if !offer.icon_image.is_empty() {
+            pictures.push(offer.icon_image.clone());
+        }
+        let mut areas = offer.areas;
+        if !areas.contains(&offer.area) {
+            areas.push(offer.area);
+        }
+        Arc::new(Offer {
+            section: offer.section_id.unwrap_or_else(|| section.to_owned()),
+            steps: match offer.steps.is_empty() {
+                true => steps.get(&offer.offer_id).cloned().unwrap_or_default(),
+                false => offer.steps,
+            },
+            id: offer.offer_id,
+            title: offer.title,
+            detail: offer.detail,
+            ask: offer.cta_label,
+            picture: picture_key(&offer.icon_image).to_owned(),
+            symbol: offer.icon_symbol,
+            asked_by: offer.accepted_users_label,
+            areas,
+        })
+    };
+    let sections = screen
+        .sections
+        .into_iter()
+        .map(|section| {
+            let id = section.section_id;
+            let count = section.items.len();
+            OfferSection {
+                offers: section
+                    .items
+                    .into_iter()
+                    .map(|item| offer(item, &id))
+                    .collect(),
+                preview: usize::try_from(section.preview_count)
+                    .unwrap_or(count)
+                    .min(count),
+                expandable: section.expand_count > 0,
+                title: section.title,
+                id,
+            }
+        })
+        .collect();
+    let explore = Explore {
+        areas: screen.areas,
+        popular: screen.popular_ids,
+        sections,
+        more: screen
+            .more_items
+            .into_iter()
+            .map(|item| offer(item, ""))
+            .collect(),
+        ranked: screen
+            .ranked_items
+            .into_iter()
+            .map(|item| offer(item, ""))
+            .collect(),
+    };
+    (explore, pictures)
+}
 
 /// A search result as the search screen draws it. `room_id` is the open conversation: only a
 /// message in it can be opened. The server names that room with an empty id.
@@ -140,6 +385,149 @@ mod tests {
 
     fn item(json: serde_json::Value) -> HistoryItem {
         serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn a_message_lists_what_it_carries_as_pictures_and_files() {
+        let sent = item(serde_json::json!({
+            "role": "user", "id": "u", "at": 1.0, "seq": 7,
+            "attachments": ["attachments/2026-11-05/IMG_0001.jpg", "attachments/2026-11-05/scan.HEIC"],
+            "image_meta": {"attachments/2026-11-05/IMG_0001.jpg": {"w": 10, "h": 10, "blurhash": ""}},
+        }));
+        let listed = attachments(&sent);
+        assert_eq!(
+            listed.iter().map(|a| a.kind).collect::<Vec<_>>(),
+            [AttachmentKind::Picture; 2]
+        );
+        assert_eq!(
+            (listed[0].name.as_str(), listed[0].seq),
+            ("IMG_0001.jpg", 7)
+        );
+
+        let reply = item(serde_json::json!({
+            "role": "assistant", "id": "a", "at": 2.0, "seq": 8, "text": "<bubble>여기요</bubble>",
+            "inline_files": {
+                "downloads/보고서.pdf": "attachments/2026-11-05/보고서.pdf",
+                "downloads/표.xlsx": "attachments/2026-11-05/표.xlsx",
+            },
+            "file_meta": {
+                "attachments/2026-11-05/보고서.pdf": {"name": "보고서.pdf", "size": 1_572_864, "pages": 12},
+                "attachments/2026-11-05/표.xlsx": {"name": "표.xlsx", "size": 20_480},
+            },
+        }));
+        let listed = attachments(&reply);
+        let files: Vec<(&str, &str)> = listed
+            .iter()
+            .map(|a| (a.name.as_str(), a.detail.as_str()))
+            .collect();
+        assert!(files.contains(&("보고서.pdf", "PDF · 12 pages · 1.5 MB")));
+        assert!(files.contains(&("표.xlsx", "XLSX · 20 KB")));
+        assert!(listed.iter().all(|a| a.kind == AttachmentKind::File));
+    }
+
+    #[test]
+    fn the_social_snapshot_becomes_the_friends_and_invite_lists() {
+        let user = |id: &str, name: &str| {
+            serde_json::json!({
+                "user_id": id, "handle": id, "display_name": name, "character_name": "",
+                "avatar_url": format!("https://img.example/{id}.jpg?sig=1"),
+                "character_avatar_url": format!("https://img.example/{id}-character.png?sig=2"),
+            })
+        };
+        let friend = |id: &str, name: &str| {
+            let mut friend = user(id, name);
+            friend["since"] = "2026-11-01T00:00:00Z".into();
+            friend["relation_label"] = "".into();
+            friend["speech_style"] = "".into();
+            friend
+        };
+        let mut joined_user = user("u3", "Gyu");
+        joined_user["character_level"] = 3.into();
+        joined_user["joined_at"] = "2026-11-10T09:00:00Z".into();
+        let snapshot: SocialSnapshot = serde_json::from_value(serde_json::json!({
+            "v": 1,
+            "scopes": {
+                "friends": {"status": 200, "data": {
+                    "friends": [friend("u1", "Mina"), friend("u2", "Jun")],
+                    "birthdays_this_week": [], "friends_reward_granted": false,
+                }},
+                "requests": {"status": 200, "data": {"incoming": [{"unexpected": true}], "outgoing": []}},
+                "blocked": {"status": 200, "data": {"blocked": [{}]}},
+                "invite": {"status": 200, "data": {
+                    "invite_only": true, "url": "https://pickle.example/i/abc", "code": "abc",
+                    "invites_used": 4, "invites_total": 3,
+                    "signups": [{"user": joined_user, "joined_at": "2026-11-13T09:00:00Z"}],
+                    "inviters": [],
+                }},
+            },
+        }))
+        .unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-11-16T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let (social, pictures) = social(&snapshot, now);
+
+        assert_eq!(
+            social
+                .friends
+                .iter()
+                .map(|friend| friend.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Mina", "Jun"]
+        );
+        // The picture is the character's, named without its signature; the address keeps it.
+        assert_eq!(
+            social.friends[0].picture,
+            "https://img.example/u1-character.png"
+        );
+        assert!(pictures.contains(&"https://img.example/u1-character.png?sig=2".to_owned()));
+        // More invites used than given is none left, not a negative number.
+        assert_eq!(
+            (social.invite.left, social.invite.joined[0].note.as_str()),
+            (0, "Joined 3 days ago")
+        );
+        // A request of a shape that was never seen is left out; the rest still shows.
+        assert_eq!((social.requests.len(), social.blocked), (0, 1));
+    }
+
+    #[test]
+    fn explore_offers_keep_their_section_and_get_their_steps_back() {
+        let offer = |id: &str, steps: &[&str]| {
+            serde_json::json!({
+                "offer_id": id, "title": "제목", "detail": "설명", "cta_label": "해줘",
+                "icon_image": format!("https://img.example/{id}.png"), "icon_symbol": "house",
+                "area": "home", "areas": ["money"], "accepted_users_label": "", "steps": steps,
+            })
+        };
+        let mut ranked = offer("a", &[]);
+        ranked["section_id"] = "money_back".into();
+        ranked.as_object_mut().unwrap().remove("steps");
+        let screen: ExploreSectionsScreen = serde_json::from_value(serde_json::json!({
+            "kind": "explore-sections", "areas": ["money", "home"], "popular_ids": ["a"],
+            "sections": [{
+                "section_id": "money_back", "title": "받을 돈", "areas": ["money"],
+                "items": [offer("a", &["하나", "둘"]), offer("b", &["셋"])],
+                "preview_count": 1, "expand_count": 1,
+            }],
+            "more_items": [], "ranked_items": [ranked],
+        }))
+        .unwrap();
+        let (explore, pictures) = explore(screen);
+
+        let section = &explore.sections[0];
+        assert_eq!(
+            (
+                section.preview,
+                section.expandable,
+                section.offers[1].section.as_str()
+            ),
+            (1, true, "money_back")
+        );
+        // The ranked copy of an offer has no steps of its own.
+        assert_eq!(explore.ranked[0].steps, ["하나", "둘"]);
+        // An offer is listed under its own area as well as under the others.
+        assert_eq!(explore.ranked[0].areas, ["money", "home"]);
+        assert_eq!(pictures.len(), 3);
     }
 
     #[test]

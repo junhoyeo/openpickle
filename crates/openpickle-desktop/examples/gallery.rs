@@ -20,10 +20,220 @@ use openpickle_desktop::{
     app::Shell,
     assets::Assets,
     content::{Block, parse_message},
-    model::{Message, Part, Request, RequestStatus, SearchResult, Side, build_rows},
+    model::{
+        Attachment, AttachmentKind, Explore, Invite, Message, Offer, OfferSection, Part, Person,
+        Request, RequestStatus, SearchResult, Side, Social, build_rows,
+    },
     protocol::{Command, Update},
     ui::{self, chat::ChatView, login::LoginView},
 };
+
+fn person(name: &str, note: &str) -> Person {
+    Person {
+        id: name.into(),
+        name: name.into(),
+        picture: String::new(),
+        note: note.into(),
+    }
+}
+
+/// Made-up friends and a made-up invite link.
+fn sample_social() -> Social {
+    let names = [
+        "민지", "Jun", "서연", "Haru", "도윤", "Mina", "지호", "Sora", "예린", "Theo", "하준",
+        "Lena",
+    ];
+    Social {
+        friends: names.iter().map(|name| person(name, "")).collect(),
+        requests: vec![person("Noah", "")],
+        blocked: 1,
+        invite: Invite {
+            url: "https://pickle.example/invite/sample".into(),
+            left: 2,
+            joined: vec![
+                person("서연", "Joined 3 days ago"),
+                person("Theo", "Joined today"),
+            ],
+            inviters: vec![person("Mina", "Joined 40 days ago")],
+        },
+    }
+}
+
+/// Made-up attachments: pictures over three days and two documents. No picture files exist,
+/// so the tiles stay empty.
+fn sample_archive() -> Vec<Attachment> {
+    let day = 24. * 3600.;
+    let now = Local::now().timestamp() as f64;
+    let picture = |n: u32, days_ago: f64| Attachment {
+        path: format!("attachments/sample/IMG_{n:04}.jpg"),
+        seq: 1,
+        at: now - days_ago * day,
+        name: format!("IMG_{n:04}.jpg"),
+        detail: String::new(),
+        kind: AttachmentKind::Picture,
+    };
+    let file = |name: &str, detail: &str, days_ago: f64| Attachment {
+        path: format!("attachments/sample/{name}"),
+        seq: 2,
+        at: now - days_ago * day,
+        name: name.into(),
+        detail: detail.into(),
+        kind: AttachmentKind::File,
+    };
+    let mut attachments: Vec<Attachment> =
+        (0..7).map(|n| picture(n, (n / 3) as f64 * 2.)).collect();
+    attachments.push(file("모임 장소 비교.pdf", "PDF · 3 pages · 412 KB", 1.));
+    attachments.push(file("budget.xlsx", "XLSX · 20 KB", 6.));
+    attachments.sort_by(|a, b| b.at.total_cmp(&a.at));
+    attachments
+}
+
+/// Made-up offers in the shape of the server's: three sections, one of which expands.
+fn sample_explore() -> Explore {
+    let offer = |id: &str, section: &str, area: &str, symbol: &str, title: &str, ask: &str| {
+        Arc::new(Offer {
+            id: id.into(),
+            section: section.into(),
+            title: title.into(),
+            detail:
+                "신청부터 결과 확인까지 제가 대신 챙겨 드릴게요. 필요한 확인은 그때그때 여쭤볼게요."
+                    .into(),
+            ask: ask.into(),
+            picture: String::new(),
+            symbol: symbol.into(),
+            asked_by: "1,204 people asked for this".into(),
+            steps: vec![
+                "먼저 지금 상태를 확인해요".into(),
+                "필요한 신청을 대신 넣어요. 본인 확인은 직접 해 주셔야 해요".into(),
+                "결과를 정리해서 알려 드려요".into(),
+            ],
+            areas: vec![area.into()],
+        })
+    };
+    let popular = vec![
+        offer(
+            "p1",
+            "popular",
+            "home",
+            "house",
+            "안 쓰는 사이트 계정을 정리해 드릴게요.",
+            "안 쓰는 계정 지워줘",
+        ),
+        offer(
+            "p2",
+            "popular",
+            "money",
+            "banknote",
+            "놓친 환급금을 찾아 드릴게요.",
+            "환급금 찾아줘",
+        ),
+        offer(
+            "p3",
+            "popular",
+            "travel",
+            "airplane",
+            "마일리지 좌석이 열리면 바로 알려 드릴게요.",
+            "마일리지 좌석 찾아줘",
+        ),
+    ];
+    let money = vec![
+        offer(
+            "m1",
+            "money_back",
+            "money",
+            "banknote",
+            "통신비 미환급금을 조회해 드릴게요.",
+            "통신비 환급 조회해줘",
+        ),
+        offer(
+            "m2",
+            "money_back",
+            "money",
+            "doc.text",
+            "연말정산 누락분을 확인해 드릴게요.",
+            "연말정산 확인해줘",
+        ),
+        offer(
+            "m3",
+            "money_back",
+            "health",
+            "cross.case",
+            "실손보험 청구를 대신 넣어 드릴게요.",
+            "실손보험 청구해줘",
+        ),
+        offer(
+            "m4",
+            "money_back",
+            "money",
+            "banknote",
+            "카드 포인트를 현금으로 바꿔 드릴게요.",
+            "카드 포인트 바꿔줘",
+        ),
+        offer(
+            "m5",
+            "money_back",
+            "shopping",
+            "bag",
+            "지연 배송 보상을 받아 드릴게요.",
+            "배송 보상 받아줘",
+        ),
+    ];
+    let trips = vec![
+        offer(
+            "t1",
+            "travel",
+            "travel",
+            "ticket",
+            "취소표가 나오면 바로 잡아 드릴게요.",
+            "취소표 잡아줘",
+        ),
+        offer(
+            "t2",
+            "travel",
+            "people",
+            "person.2",
+            "모임 날짜를 대신 조율해 드릴게요.",
+            "모임 날짜 잡아줘",
+        ),
+    ];
+    let ranked: Vec<Arc<Offer>> = popular
+        .iter()
+        .chain(&money)
+        .chain(&trips)
+        .cloned()
+        .collect();
+    Explore {
+        areas: ["money", "shopping", "health", "people", "travel", "home"]
+            .map(String::from)
+            .to_vec(),
+        popular: popular.iter().map(|offer| offer.id.clone()).collect(),
+        more: money[3..].to_vec(),
+        sections: vec![
+            OfferSection {
+                id: "popular".into(),
+                title: "Popular lately".into(),
+                offers: popular,
+                preview: 3,
+                expandable: false,
+            },
+            OfferSection {
+                id: "money_back".into(),
+                title: "Money you're owed".into(),
+                offers: money,
+                preview: 3,
+                expandable: true,
+            },
+            OfferSection {
+                id: "travel".into(),
+                title: "Trips and flights".into(),
+                offers: trips,
+                preview: 2,
+                expandable: false,
+            },
+        ],
+        ranked,
+    }
+}
 
 /// Plays one step of input into the window.
 fn play(step: &str, window: &mut Window, cx: &mut App) {
@@ -168,12 +378,20 @@ fn main() {
                 let messages = messages.clone();
                 std::thread::spawn(move || {
                     while let Some(command) = asked.blocking_recv() {
-                        if let Command::Search(query) = command {
-                            let results = Ok(search(&messages, &query));
-                            updates
-                                .unbounded_send(Update::Found { query, results })
-                                .ok();
-                        }
+                        let update = match command {
+                            Command::Search(query) => Update::Found {
+                                results: Ok(search(&messages, &query)),
+                                query,
+                            },
+                            Command::LoadSocial => Update::Social(Ok(sample_social())),
+                            Command::LoadExplore => Update::Explore(Ok(sample_explore())),
+                            Command::LoadArchive => Update::Archive {
+                                attachments: sample_archive(),
+                                complete: true,
+                            },
+                            _ => continue,
+                        };
+                        updates.unbounded_send(update).ok();
                     }
                 });
                 let options = match float {

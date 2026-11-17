@@ -52,16 +52,23 @@ const routes: [method: string, path: RegExp, call: Call][] = [
     const q = new URLSearchParams(f.query);
     return c.getHistoryDelta(room!, { afterSeq: Number(q.get("after_seq")), limit: Number(q.get("limit")) });
   }],
+  ["GET", /^\/api\/rooms\/([^/]+)\/history\/page$/, (c, f, _j, [room]) => {
+    const q = new URLSearchParams(f.query);
+    return c.getHistoryPage(room!, { beforeSeq: Number(q.get("before_seq")), limit: Number(q.get("limit")) });
+  }],
   ["POST", /^\/api\/rooms\/([^/]+)\/messages$/, (c, _f, j, [room]) =>
-    c.sendMessage(room!, j.text, { clientMsgId: j.client_msg_id, inCall: j.in_call })],
+    c.sendMessage(room!, j.text, { clientMsgId: j.client_msg_id, inCall: j.in_call, context: j.context })],
   ["PUT", /^\/api\/rooms\/([^/]+)\/read$/, (c, _f, j, [room]) => c.markRead(room!, j.seq)],
+  ["GET", /^\/api\/attachments\/(.+)\/thumbnail$/, (c, _f, _j, [path]) => c.getAttachmentThumbnail(path!)],
   ["GET", /^\/api\/character$/, (c) => c.getCharacter()],
   ["GET", /^\/api\/profile$/, (c, f) => c.getProfile(new URLSearchParams(f.query).get("region")!)],
   ["GET", /^\/api\/social\/snapshot$/, (c, f) =>
     c.getSocialSnapshot(new URLSearchParams(f.query).get("scopes")!.split(",") as never)],
   ["GET", /^\/api\/screens\/message-search$/, (c, f) => c.searchMessages(new URLSearchParams(f.query).get("query")!)],
+  ["GET", /^\/api\/screens\/explore-sections$/, (c) => c.getExploreSections()],
   ["GET", /^\/api\/screens\/(handoffs|extra-conversations|roulette-promo)$/, (c, _f, _j, [kind]) =>
     c.getScreen(kind!)],
+  ["POST", /^\/api\/offers\/impressions$/, (c, _f, j) => c.reportOfferImpressions(j.offer_ids)],
   ["PUT", /^\/api\/device\/permissions$/, (c, _f, j) => c.reportPermissions(j.snapshots)],
   ["POST", /^\/api\/device\/location\/token$/, (c) => c.requestLocationToken()],
   ["GET", /^\/api\/ui-definitions$/, (c) => c.getUiDefinitions()],
@@ -176,7 +183,10 @@ const uncovered = new Map<string, number>();
 
 for (const flow of flows) {
   const route = routes.find(([method, path]) => method === flow.method && path.test(flow.path));
-  const label = `${flow.method} ${flow.path.replace(/\/rooms\/[^/]+/, "/rooms/{room}").replace(/\/nodes\/[^/]{43}/, "/nodes/{node}")}`;
+  const label = `${flow.method} ${flow.path
+    .replace(/\/rooms\/[^/]+/, "/rooms/{room}")
+    .replace(/\/nodes\/[^/]{43}/, "/nodes/{node}")
+    .replace(/^\/api\/attachments\/.+\/thumbnail$/, "/api/attachments/{path}/thumbnail")}`;
   if (!route) {
     uncovered.set(label, (uncovered.get(label) ?? 0) + 1);
     continue;

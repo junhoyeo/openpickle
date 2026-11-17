@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
-// Small CLI over PickleClient. Output is JSON, except `search`. Credentials come from one of:
+// Small CLI over PickleClient. Output is JSON, except `search`, `explore`, `attachments` and
+// `thumbnail`. Credentials come from one of:
 //   PICKLE_SESSION_FILE  a JSON file holding {"login_session_token": "ls_…"}. Each run refreshes
 //                        once and writes the next token back, so never run two at once.
 //   PICKLE_TOKEN         an access token (the app's Authorization header), valid for 5 minutes.
@@ -9,7 +10,7 @@ import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { PickleClient, decodeAccessToken } from "./client.ts";
-import type { LoginSessionRefresh } from "./types.ts";
+import type { HistoryItem, LoginSessionRefresh } from "./types.ts";
 
 const USAGE = `usage: PICKLE_SESSION_FILE=<file> pickle <command>
        PICKLE_TOKEN=<jwt> pickle <command>
@@ -22,6 +23,12 @@ const USAGE = `usage: PICKLE_SESSION_FILE=<file> pickle <command>
   send <room> <text>           send a message; <room> may be "character"
   search <query>               messages containing <query>, newest first, one per line:
                                seq, date, label and the snippet with matches in [brackets]
+  explore [area]               Explore sections and their offers: title, call to action and
+                               how many asked; [area] (e.g. money, travel) keeps that area only
+  attachments <room>           photos and files sent in the room, newest first, one per line:
+                               date, kind (image or file), file name, size (bytes for
+                               files, width x height for images) and the attachment path
+  thumbnail <path> <out file>  write the JPEG thumbnail of an attachment path to <out file>
   export <dir>                 write the full history of every room to <dir>/<room_id>.json
   events                       stream live events, one JSON object per line
   session | register | character | profile | social
@@ -76,6 +83,22 @@ async function resolveRoom(room: string): Promise<string> {
   return own.room_id;
 }
 
+/**
+ * Every message of a room, newest first: the newest window, then history pages before its oldest
+ * message, as the app pages back from what it already holds.
+ */
+async function* newestFirst(roomId: string): AsyncGenerator<HistoryItem> {
+  const { messages } = await pickle.getHistory(roomId);
+  yield* [...messages].reverse();
+  let beforeSeq = messages[0]?.seq;
+  while (beforeSeq !== undefined) {
+    const page = await pickle.getHistoryPage(roomId, { beforeSeq });
+    yield* [...page.messages].reverse();
+    if (!page.has_more || page.next_before >= beforeSeq) return;
+    beforeSeq = page.next_before;
+  }
+}
+
 switch (command) {
   case "token": {
     if (!token) throw new Error("token reads PICKLE_TOKEN");
@@ -105,6 +128,46 @@ switch (command) {
       const snippet = item.segments.map((s) => (s.match ? `[${s.text}]` : s.text)).join("");
       console.log(`${item.seq}\t${item.date_label}\t${item.label}\t${snippet}`);
     }
+    break;
+  }
+  case "explore": {
+    const [area] = args;
+    const { sections } = await pickle.getExploreSections();
+    for (const section of sections) {
+      const offers = area ? section.items.filter((offer) => offer.areas.includes(area)) : section.items;
+      if (offers.length === 0) continue;
+      console.log(section.title);
+      for (const offer of offers) {
+        console.log(`  ${offer.title}\t${offer.cta_label}\t${offer.accepted_users_label}`);
+      }
+    }
+    break;
+  }
+  case "attachments": {
+    const [room] = args;
+    if (!room) throw new Error("attachments <room>");
+    const seen = new Set<string>();
+    for await (const item of newestFirst(await resolveRoom(room))) {
+      const paths = [...(item.attachments ?? []), ...Object.keys(item.image_meta ?? {}), ...Object.keys(item.file_meta ?? {})];
+      for (const path of paths) {
+        if (seen.has(path)) continue;
+        seen.add(path);
+        const image = item.image_meta?.[path];
+        const file = item.file_meta?.[path];
+        const date = new Date(item.at * 1000).toISOString().slice(0, 10);
+        const name = file?.name ?? path.slice(path.lastIndexOf("/") + 1);
+        const size = image ? `${image.w}x${image.h}` : file ? String(file.size) : "-";
+        console.log(`${date}\t${image ? "image" : "file"}\t${name}\t${size}\t${path}`);
+      }
+    }
+    break;
+  }
+  case "thumbnail": {
+    const [path, out] = args;
+    if (!path || !out) throw new Error("thumbnail <path> <out file>");
+    const { bytes, contentType } = await pickle.getAttachmentThumbnail(path);
+    await writeFile(out, bytes);
+    console.error(`${contentType}, ${bytes.length} bytes written to ${out}`);
     break;
   }
   case "export": {

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { PickleApiError, PickleClient, decodeAccessToken } from "../src/client.ts";
-import type { MessageSearchScreen } from "../src/types.ts";
+import type { ExploreSectionsScreen, HistoryPage, MessageSearchScreen, Offer } from "../src/types.ts";
 
 function recorder(status: number, body: string) {
   const calls: { url: string; init: RequestInit }[] = [];
@@ -113,4 +113,95 @@ test("searchMessages percent-encodes the query and returns the snippet runs", as
   expect(calls[0]!.init.method).toBe("GET");
   expect(result).toEqual(body);
   expect(result.items[0]!.segments.filter((s) => s.match).map((s) => s.text)).toEqual(["점심 메뉴"]);
+});
+
+const offer: Offer = {
+  offer_id: "offer-1",
+  title: "Find a refund",
+  detail: "Check recent orders for a refund you are owed.",
+  cta_label: "Find refunds I am owed",
+  icon_image: "https://example.com/icons/money.png",
+  icon_symbol: "banknote",
+  area: "money",
+  accepted_users_label: "1,234 people asked for this",
+  steps: ["Read order emails", "List refunds"],
+  areas: ["money"],
+};
+
+test("getExploreSections reads the Explore screen", async () => {
+  const { steps: _steps, ...ranked } = offer;
+  const body: ExploreSectionsScreen = {
+    kind: "explore-sections",
+    areas: ["money", "fun"],
+    popular_ids: ["offer-1"],
+    sections: [{ section_id: "popular", title: "Popular", items: [offer], preview_count: 1, expand_count: 0, areas: ["money"] }],
+    more_items: [],
+    ranked_items: [{ ...ranked, section_id: "popular" }],
+  };
+  const { calls, fetch } = recorder(200, JSON.stringify(body));
+  const pickle = new PickleClient({ accessToken: "t", fetch });
+  expect(await pickle.getExploreSections()).toEqual(body);
+  expect(calls[0]!.url).toBe(`${pickle.baseUrl}/api/screens/explore-sections`);
+  expect(calls[0]!.init.method).toBe("GET");
+  expect(calls[0]!.init.body).toBeUndefined();
+});
+
+test("reportOfferImpressions sends the shown offer ids", async () => {
+  const { calls, fetch } = recorder(200, "{}");
+  const pickle = new PickleClient({ accessToken: "t", fetch });
+  expect(await pickle.reportOfferImpressions(["offer-1", "offer-2"])).toEqual({});
+  expect(calls[0]!.url).toBe(`${pickle.baseUrl}/api/offers/impressions`);
+  expect(calls[0]!.init.method).toBe("POST");
+  expect(calls[0]!.init.body).toBe('{"offer_ids":["offer-1","offer-2"]}');
+});
+
+test("sendMessage sends a context only when given one", async () => {
+  const { calls, fetch } = recorder(200, '{"status":"ok","responder":"chat","seq":null}');
+  const pickle = new PickleClient({ accessToken: "t", fetch });
+  await pickle.sendMessage("room-1", "hi", { clientMsgId: "m1" });
+  await pickle.sendMessage("room-1", offer.cta_label, { clientMsgId: "m2", context: { id: offer.offer_id, kind: "offer" } });
+  expect(calls.map((call) => call.init.body)).toEqual([
+    '{"text":"hi","client_msg_id":"m1","in_call":false}',
+    '{"text":"Find refunds I am owed","client_msg_id":"m2","in_call":false,"context":{"id":"offer-1","kind":"offer"}}',
+  ]);
+});
+
+test("getHistoryPage asks for messages before a sequence number, limit first", async () => {
+  const body: HistoryPage = {
+    v: 1,
+    messages: [
+      { role: "user", id: "m-7", text: "older", at: 1700000000, seq: 7, attachments: ["attachments/2026-01-02/scan 1.pdf"] },
+      { role: "assistant", id: "m-8", text: "<bubble>reply</bubble>", at: 1700000060, seq: 8 },
+    ],
+    reactions: [{ seq: 9, target_id: "m-7", part: 0, actor: "assistant", emoji: "👍", at: 1700000070 }],
+    card_states: [],
+    has_more: true,
+    next_before: 7,
+  };
+  const { calls, fetch } = recorder(200, JSON.stringify(body));
+  const pickle = new PickleClient({ accessToken: "t", fetch });
+  expect(await pickle.getHistoryPage("room-1", { beforeSeq: 12, limit: 2 })).toEqual(body);
+  await pickle.getHistoryPage("room-1", { beforeSeq: 7 });
+  expect(calls.map((call) => call.url.replace(pickle.baseUrl, ""))).toEqual([
+    "/api/rooms/room-1/history/page?limit=2&before_seq=12",
+    "/api/rooms/room-1/history/page?limit=250&before_seq=7",
+  ]);
+  expect(calls[0]!.init.method).toBe("GET");
+});
+
+test("getAttachmentThumbnail encodes each path segment and returns the JPEG", async () => {
+  const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
+  const calls: { url: string; init: RequestInit }[] = [];
+  const fetch = (async (url: string, init: RequestInit) => {
+    calls.push({ url, init });
+    return new Response(jpeg, { headers: { "content-type": "image/jpeg" } });
+  }) as unknown as typeof globalThis.fetch;
+  const pickle = new PickleClient({ accessToken: "t", fetch });
+  const thumbnail = await pickle.getAttachmentThumbnail("attachments/2026-01-02/여행 계획 v2.pdf");
+  expect(calls[0]!.url).toBe(
+    `${pickle.baseUrl}/api/attachments/attachments/2026-01-02/%EC%97%AC%ED%96%89%20%EA%B3%84%ED%9A%8D%20v2.pdf/thumbnail`,
+  );
+  expect(Object.keys(calls[0]!.init.headers as Record<string, string>)).not.toContain("X-Client-Version");
+  expect((calls[0]!.init.headers as Record<string, string>).Authorization).toBe("Bearer t");
+  expect(thumbnail).toEqual({ bytes: jpeg, contentType: "image/jpeg" });
 });

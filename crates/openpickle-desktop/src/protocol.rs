@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use crate::model::{Message, SearchResult};
+use crate::model::{Attachment, Explore, Message, SearchResult, Social};
 
 /// UI to backend. Neither side of the protocol can be printed with `{:?}`: a command may hold
 /// a phone number or a sign-in code, and both hold message text.
@@ -13,11 +13,26 @@ pub enum Command {
     /// Sign in with the texted code.
     VerifyCode(String),
     /// Send a message to the open conversation. The UI shows it already, under this id, which
-    /// the server keeps for its copy.
-    Send { id: String, text: String },
+    /// the server keeps for its copy. `offer` names the Explore offer the message asks for.
+    Send {
+        id: String,
+        text: String,
+        offer: Option<String>,
+    },
+    /// Read the friends and the invite link: what was cached first, then the server's answer.
+    LoadSocial,
+    /// Read the Explore tab's offers, in the same two steps.
+    LoadExplore,
+    /// These offers were on screen.
+    OffersShown(Vec<String>),
+    /// List the pictures and files of the conversation, reading back to its first message.
+    LoadArchive,
+    /// Load these pictures of the Archive: the attachments themselves, by their paths.
+    LoadAttachments(Vec<String>),
     /// Search the messages for this text.
     Search(String),
-    /// The window came to the front (`true`) or went behind (`false`).
+    /// Whether the chat can be read now: the window is in front and shows the chat. Only
+    /// then do new messages count as read.
     Active(bool),
     /// The app is quitting: stop after the network call in flight, if there is one.
     Quit,
@@ -51,6 +66,18 @@ pub enum Update {
     Found {
         query: String,
         results: Result<Vec<SearchResult>, String>,
+    },
+    /// The friends and the invite link, or why they could not be read.
+    Social(Result<Social, String>),
+    /// The Explore tab's offers, or why they could not be read.
+    Explore(Result<Explore, String>),
+    /// Pictures that are on disk now, by their key.
+    Pictures(Vec<(String, PathBuf)>),
+    /// The pictures and files of the conversation, newest first. `complete` says whether the
+    /// whole history was read; a list that is not complete grows as older pages arrive.
+    Archive {
+        attachments: Vec<Attachment>,
+        complete: bool,
     },
     /// Whether the character is working on a reply, and on what when it says.
     Activity(Option<Option<String>>),

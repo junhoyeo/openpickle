@@ -178,6 +178,8 @@ pub enum Auth {
     /// App identity headers and the bearer token.
     #[default]
     Bearer,
+    /// The bearer token without the app identity headers, as the app loads pictures.
+    BearerOnly,
     /// App identity headers only.
     App,
     /// Neither.
@@ -224,6 +226,9 @@ pub struct SendMessageOptions {
     /// Defaults to a new random UUID.
     pub client_msg_id: Option<String>,
     pub in_call: bool,
+    /// What the message is about, when it is sent from something on screen: an offer on the
+    /// Explore tab ([`MessageContext::offer`]).
+    pub context: Option<MessageContext>,
 }
 
 /// The claims of an access token.
@@ -526,6 +531,32 @@ impl PickleClient {
             .await
     }
 
+    /// `GET /api/rooms/{room}/history/page`: up to `limit` messages before `before_seq`, newest
+    /// first. The answer's `next_before` is the `before_seq` of the page before it. The app
+    /// asks for 250 at a time.
+    pub async fn get_history_page(
+        &self,
+        room_id: &str,
+        before_seq: i64,
+        limit: u32,
+    ) -> Result<HistoryPage> {
+        let path = format!("/api/rooms/{}/history/page", encode_component(room_id));
+        let options = RequestOptions::default()
+            .query("limit", limit)
+            .query("before_seq", before_seq);
+        self.request(Method::GET, &path, options).await
+    }
+
+    /// `GET /api/attachments/{path}/thumbnail`: a JPEG of a message's attachment, a picture or
+    /// a document's first page. `path` is as messages name it: `attachments/<day>/<file>`.
+    pub async fn get_attachment_thumbnail(&self, path: &str) -> Result<bytes::Bytes> {
+        let encoded: Vec<String> = path.split('/').map(encode_component).collect();
+        let path = format!("/api/attachments/{}/thumbnail", encoded.join("/"));
+        let options = RequestOptions::default().auth(Auth::BearerOnly);
+        let response = self.send(Method::GET, &path, options).await?;
+        Ok(response.bytes().await?)
+    }
+
     /// `GET /api/rooms/{room}/history`: the latest messages of a room (up to 200).
     pub async fn get_history(&self, room_id: &str) -> Result<HistoryWindow> {
         let path = format!("/api/rooms/{}/history", encode_component(room_id));
@@ -587,8 +618,11 @@ impl PickleClient {
             .client_msg_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let path = format!("/api/rooms/{}/messages", encode_component(room_id));
-        let body =
+        let mut body =
             json!({ "text": text, "client_msg_id": client_msg_id, "in_call": options.in_call });
+        if let Some(context) = &options.context {
+            body["context"] = serde_json::to_value(context).map_err(Error::Encode)?;
+        }
         let mut response: SendMessageResponse = self
             .request(Method::POST, &path, RequestOptions::default().json(&body)?)
             .await?;
@@ -679,6 +713,23 @@ impl PickleClient {
     /// `GET /api/screens/extra-conversations`.
     pub async fn get_extra_conversations(&self) -> Result<ExtraConversationsScreen> {
         self.get_screen_as("extra-conversations", &[]).await
+    }
+
+    /// `GET /api/screens/explore-sections`: what the character offers to do, in sections.
+    pub async fn get_explore_sections(&self) -> Result<ExploreSectionsScreen> {
+        self.get_screen_as("explore-sections", &[]).await
+    }
+
+    /// `POST /api/offers/impressions`: tells the server which offers were shown on screen.
+    pub async fn report_offer_impressions(&self, offer_ids: &[String]) -> Result<()> {
+        let body = json!({ "offer_ids": offer_ids });
+        self.request::<serde_json::Value>(
+            Method::POST,
+            "/api/offers/impressions",
+            RequestOptions::default().json(&body)?,
+        )
+        .await
+        .map(drop)
     }
 
     /// `GET /api/screens/message-search`: searches your messages for `query`.
@@ -829,7 +880,7 @@ impl PickleClient {
         options: RequestOptions,
         timeout: Option<Duration>,
     ) -> Result<Response> {
-        if options.auth != Auth::Bearer {
+        if !matches!(options.auth, Auth::Bearer | Auth::BearerOnly) {
             return self.execute(method, path, options, None, timeout).await;
         }
         let bearer = self.bearer_header().await?;
@@ -860,10 +911,9 @@ impl PickleClient {
         timeout: Option<Duration>,
     ) -> Result<Response> {
         let inner = &self.inner;
-        let mut headers = if options.auth == Auth::None {
-            inner.base_headers.clone()
-        } else {
-            inner.app_headers.clone()
+        let mut headers = match options.auth {
+            Auth::None | Auth::BearerOnly => inner.base_headers.clone(),
+            Auth::Bearer | Auth::App => inner.app_headers.clone(),
         };
         if let Some(bearer) = bearer {
             headers.insert(AUTHORIZATION, bearer);

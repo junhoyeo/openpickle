@@ -19,8 +19,8 @@ use base64::engine::general_purpose::STANDARD;
 use futures_util::StreamExt as _;
 use mock_server::{MockServer, Recorded, Reply};
 use openpickle_api::{
-    ClientOptions, ClientProfile, Credentials, Error, LogStoreListingsRequest, PermissionSnapshot,
-    PickleClient, PickleEvent, SendMessageOptions, SessionRequest,
+    ClientOptions, ClientProfile, Credentials, Error, LogStoreListingsRequest, MessageContext,
+    PermissionSnapshot, PickleClient, PickleEvent, SendMessageOptions, SessionRequest,
 };
 use serde_json::Value;
 
@@ -266,6 +266,20 @@ async fn call(client: &PickleClient, flow: &Flow, json: &Value) -> Option<Result
         ("GET", ["", "api", "sync"]) => done(client.sync().await),
         ("GET", ["", "api", "events"]) => return Some(drain_events(client).await),
         ("GET", ["", "api", "rooms", room, "history"]) => done(client.get_history(room).await),
+        ("GET", ["", "api", "rooms", room, "history", "page"]) => done(
+            client
+                .get_history_page(
+                    room,
+                    q("before_seq").parse().unwrap_or_default(),
+                    q("limit").parse().unwrap_or_default(),
+                )
+                .await,
+        ),
+        ("GET", ["", "api", "attachments", rest @ ..]) if rest.last() == Some(&"thumbnail") => {
+            // The segments are decoded already; the client encodes them again.
+            let path = rest[..rest.len() - 1].join("/");
+            done(client.get_attachment_thumbnail(&path).await)
+        }
         ("GET", ["", "api", "rooms", room, "history", "delta"]) => {
             let limit = q("limit").parse().ok();
             done(
@@ -278,6 +292,7 @@ async fn call(client: &PickleClient, flow: &Flow, json: &Value) -> Option<Result
             let options = SendMessageOptions {
                 client_msg_id: Some(s("client_msg_id")),
                 in_call: json["in_call"].as_bool().unwrap_or_default(),
+                context: json.get("context").map(from::<MessageContext>),
             };
             done(client.send_message(room, &s("text"), options).await)
         }
@@ -296,6 +311,14 @@ async fn call(client: &PickleClient, flow: &Flow, json: &Value) -> Option<Result
                     .await,
             )
         }
+        ("GET", ["", "api", "screens", "explore-sections"]) => {
+            done(client.get_explore_sections().await)
+        }
+        ("POST", ["", "api", "offers", "impressions"]) => done(
+            client
+                .report_offer_impressions(&from::<Vec<String>>(&json["offer_ids"]))
+                .await,
+        ),
         ("GET", ["", "api", "screens", "message-search"]) => {
             done(client.search_messages(&q("query")).await)
         }

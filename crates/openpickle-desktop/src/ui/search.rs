@@ -377,6 +377,31 @@ mod tests {
         cx.simulate_keystrokes("down down down down up enter");
         assert_eq!(*opened.borrow(), [2]);
 
+        // Thirty results do not fit the window; the list scrolls, and the first row is then
+        // another result.
+        cx.simulate_resize(gpui::size(gpui::px(440.), gpui::px(900.)));
+        view.update(cx, |view, cx| {
+            let thirty = (1..=30).map(result).collect();
+            view.found("비가", Ok(thirty), cx)
+        });
+        cx.run_until_parked();
+        let first_row = gpui::point(gpui::px(120.), gpui::px(75.));
+        cx.simulate_click(first_row, gpui::Modifiers::none());
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: gpui::point(gpui::px(220.), gpui::px(400.)),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-1500.))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        cx.simulate_click(first_row, gpui::Modifiers::none());
+        let opened_now = opened.borrow()[1..].to_vec();
+        assert_eq!(opened_now.len(), 2);
+        assert!(
+            opened_now[0] == 1 && opened_now[1] > 1,
+            "opened {opened_now:?}"
+        );
+
         // Emptying the field empties the screen without asking the server.
         view.update(cx, |view, cx| {
             view.input.update(cx, |input, cx| input.set_text("", cx));
