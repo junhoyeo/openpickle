@@ -513,14 +513,7 @@ async fn converse(
         pictures: PictureFetches::new(account_active),
         marked_read: 0,
     };
-    live.send(Update::Conversation {
-        room_id: live.conversation.room_id.clone(),
-        is_character: true,
-        can_send: true,
-        name: live.display_name(),
-        avatar: live.avatar_path(),
-        messages: live.conversation.messages(),
-    });
+    live.send_startup_conversation();
 
     let mut events: Option<EventStream> = None;
     let mut connect_at = Instant::now();
@@ -659,16 +652,19 @@ async fn converse(
     }
 }
 
-/// Reads one room's delta without assuming it is already visible. This lets room switching
-/// stage and validate the full target before publishing it to the UI.
-async fn catch_up_conversation(
+/// Reads one room's delta page by page. A visible conversation can publish each applied page,
+/// while a staged room switch can wait until the whole catch-up succeeds before publishing.
+async fn catch_up_conversation<F>(
     client: &PickleClient,
     conversation: &mut Conversation,
-) -> openpickle_api::Result<Vec<Message>> {
+    mut page_applied: F,
+) -> openpickle_api::Result<()>
+where
+    F: FnMut(Vec<Message>),
+{
     if conversation.room_id.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    let mut changed_messages = Vec::new();
     loop {
         let delta = client
             .get_history_delta(&conversation.room_id, conversation.synced, None)
@@ -689,12 +685,15 @@ async fn catch_up_conversation(
 
         let advanced = delta.next_after > conversation.synced;
         conversation.synced = delta.next_after.max(conversation.synced);
-        changed_messages.extend(conversation.apply(delta.items, delta.card_states));
+        let changed = conversation.apply(delta.items, delta.card_states);
+        if !changed.is_empty() {
+            page_applied(changed);
+        }
         if !delta.has_more || !advanced {
             break;
         }
     }
-    Ok(changed_messages)
+    Ok(())
 }
 
 /// How long to wait before opening the event stream again. The wait doubles with every
@@ -753,6 +752,19 @@ impl Live {
         self.updates.unbounded_send(update).ok();
     }
 
+    /// The disk can paint cached messages before the room roster has established membership,
+    /// but it cannot grant send access.
+    fn send_startup_conversation(&self) {
+        self.send(Update::Conversation {
+            room_id: self.conversation.room_id.clone(),
+            is_character: true,
+            can_send: false,
+            name: self.display_name(),
+            avatar: self.avatar_path(),
+            messages: self.conversation.messages(),
+        });
+    }
+
     fn display_name(&self) -> String {
         if self.identity.name.is_empty() {
             "Pickle".to_owned()
@@ -776,9 +788,9 @@ impl Live {
         Ok(events)
     }
 
-    /// Asks the server which room is the one with the character. When it is not the open one
-    /// (the first launch, or another account), opens it with what the disk has for it.
-    async fn find_room(&mut self) -> openpickle_api::Result<()> {
+    /// Refreshes the authoritative room roster without changing or republishing the visible
+    /// conversation. Room-opening uses this while its target is still staged.
+    async fn refresh_rooms(&mut self) -> openpickle_api::Result<Option<String>> {
         let rooms = self.client.sync().await?;
         let character_room = rooms
             .rooms
@@ -786,11 +798,19 @@ impl Live {
             .find(|room| room.kind == "character")
             .map(|room| room.room_id.clone());
         self.show_rooms(&rooms);
-        if let Some(character_room) = character_room {
+        if let Some(character_room) = &character_room {
             self.character_room = character_room.clone();
             // This cache is intentionally always the primary room. A launch must never reopen a
             // peer room before `sync` can validate that the current account may see it.
-            self.store.cache("room.json", &character_room).ok();
+            self.store.cache("room.json", character_room).ok();
+        }
+        Ok(character_room)
+    }
+
+    /// Asks the server which room is the one with the character. When it is not the open one
+    /// (the first launch, or another account), opens it with what the disk has for it.
+    async fn find_room(&mut self) -> openpickle_api::Result<()> {
+        if let Some(character_room) = self.refresh_rooms().await? {
             let wanted = self
                 .room_override
                 .as_ref()
@@ -801,8 +821,11 @@ impl Live {
             if wanted != self.conversation.room_id {
                 self.conversation = Conversation::load(&self.store, &wanted);
                 self.reset_room_state();
-                self.send_update_for(&wanted);
             }
+            // `sync` is the authority for membership and permissions. Publish it even when the
+            // cached room was already open, so startup cannot leave the composer disabled or
+            // accidentally preserve stale write access.
+            self.send_update_for(&wanted);
         }
         Ok(())
     }
@@ -810,13 +833,16 @@ impl Live {
     /// Reads `history/delta` from where the log ends, page by page.
     async fn catch_up(&mut self) -> openpickle_api::Result<()> {
         let room_id = self.conversation.room_id.clone();
-        let changed = catch_up_conversation(&self.client, &mut self.conversation).await?;
-        if !changed.is_empty() {
-            self.send(Update::Upsert {
-                room_id,
-                messages: changed,
-            });
-        }
+        let updates = self.updates.clone();
+        catch_up_conversation(&self.client, &mut self.conversation, |messages| {
+            updates
+                .unbounded_send(Update::Upsert {
+                    room_id: room_id.clone(),
+                    messages,
+                })
+                .ok();
+        })
+        .await?;
         self.mark_read().await;
         Ok(())
     }
@@ -1121,14 +1147,26 @@ impl Live {
     /// caught up before it replaces the visible conversation, so a failed request leaves the
     /// old conversation intact.
     async fn open_room(&mut self, requested: &str) -> Result<(), OpenRoomError> {
+        let mut refreshed = false;
         if self.last_rooms.is_empty() || self.character_room.is_empty() {
-            self.find_room().await.map_err(OpenRoomError::Session)?;
+            self.refresh_rooms().await.map_err(OpenRoomError::Session)?;
+            refreshed = true;
         }
-        let wanted = if requested.is_empty() {
+        let mut wanted = if requested.is_empty() {
             self.character_room.clone()
         } else {
             requested.to_owned()
         };
+        if (wanted.is_empty() || self.known_room(&wanted).is_none()) && !refreshed {
+            // A link can name a room created after the last event or reconnect. Refresh the
+            // authoritative roster once before deciding that the account cannot open it.
+            self.refresh_rooms().await.map_err(OpenRoomError::Session)?;
+            wanted = if requested.is_empty() {
+                self.character_room.clone()
+            } else {
+                requested.to_owned()
+            };
+        }
         if wanted.is_empty() || self.known_room(&wanted).is_none() {
             return Err(OpenRoomError::Visible(
                 "This chat room is not available for this account.".to_owned(),
@@ -1142,7 +1180,7 @@ impl Live {
         }
 
         let mut target = Conversation::load(&self.store, &wanted);
-        catch_up_conversation(&self.client, &mut target)
+        catch_up_conversation(&self.client, &mut target, |_| {})
             .await
             .map_err(OpenRoomError::Session)?;
 
@@ -1419,6 +1457,10 @@ mod tests {
         base_url: String,
         address: std::net::SocketAddr,
         requests: Arc<Mutex<Vec<String>>>,
+        rooms: Arc<Mutex<Vec<openpickle_api::Room>>>,
+        fail_sync_once: Arc<AtomicBool>,
+        two_page_history: Arc<AtomicBool>,
+        fail_after_once: Arc<Mutex<Option<i64>>>,
         active: Arc<AtomicBool>,
         thread: Option<thread::JoinHandle<()>>,
     }
@@ -1428,8 +1470,20 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             let requests = Arc::new(Mutex::new(Vec::new()));
+            let rooms = Arc::new(Mutex::new(vec![
+                fixture_room("primary", "character", false),
+                fixture_room("peer", "character_pair", false),
+                fixture_room("observer", "character_pair", true),
+            ]));
+            let fail_sync_once = Arc::new(AtomicBool::new(false));
+            let two_page_history = Arc::new(AtomicBool::new(false));
+            let fail_after_once = Arc::new(Mutex::new(None));
             let active = Arc::new(AtomicBool::new(true));
             let server_requests = requests.clone();
+            let server_rooms = rooms.clone();
+            let server_fail_sync_once = fail_sync_once.clone();
+            let server_two_page_history = two_page_history.clone();
+            let server_fail_after_once = fail_after_once.clone();
             let server_active = active.clone();
             let thread = thread::spawn(move || {
                 while let Ok((mut stream, _)) = listener.accept() {
@@ -1446,37 +1500,69 @@ mod tests {
                         .unwrap_or("/")
                         .to_owned();
                     server_requests.lock().unwrap().push(target.clone());
-                    let after = target
-                        .split('?')
-                        .nth(1)
-                        .and_then(|query| {
-                            query.split('&').find_map(|pair| {
-                                pair.strip_prefix("after_seq=")?.parse::<i64>().ok()
+                    let (status, body) = if target.starts_with("/api/sync") {
+                        if server_fail_sync_once.swap(false, Ordering::AcqRel) {
+                            ("500 Internal Server Error", "{}".to_owned())
+                        } else {
+                            (
+                                "200 OK",
+                                serde_json::json!({
+                                    "rooms": server_rooms.lock().unwrap().clone(),
+                                    "rev": 1,
+                                })
+                                .to_string(),
+                            )
+                        }
+                    } else {
+                        let after = target
+                            .split('?')
+                            .nth(1)
+                            .and_then(|query| {
+                                query.split('&').find_map(|pair| {
+                                    pair.strip_prefix("after_seq=")?.parse::<i64>().ok()
+                                })
                             })
-                        })
-                        .unwrap_or(0);
-                    let seq = after + 1;
-                    let body = serde_json::json!({
-                        "v": 1,
-                        "items": [{
-                            "role": "assistant",
-                            "id": format!("fixture-{seq}"),
-                            "text": "fixture",
-                            "at": 1.0,
-                            "seq": seq
-                        }],
-                        "reactions": [],
-                        "card_states": [],
-                        "next_after": seq,
-                        "has_more": false,
-                        "head_seq": seq,
-                        "log_epoch": "fixture",
-                        "projection_version": 1,
-                        "read_seq": 0
-                    })
-                    .to_string();
+                            .unwrap_or(0);
+                        let should_fail = {
+                            let mut fail_after = server_fail_after_once.lock().unwrap();
+                            if *fail_after == Some(after) {
+                                *fail_after = None;
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if should_fail {
+                            ("500 Internal Server Error", "{}".to_owned())
+                        } else {
+                            let seq = after + 1;
+                            (
+                                "200 OK",
+                                serde_json::json!({
+                                    "v": 1,
+                                    "items": [{
+                                        "role": "assistant",
+                                        "id": format!("fixture-{seq}"),
+                                        "text": "fixture",
+                                        "at": 1.0,
+                                        "seq": seq
+                                    }],
+                                    "reactions": [],
+                                    "card_states": [],
+                                    "next_after": seq,
+                                    "has_more": server_two_page_history.load(Ordering::Acquire)
+                                        && after == 0,
+                                    "head_seq": seq,
+                                    "log_epoch": "fixture",
+                                    "projection_version": 1,
+                                    "read_seq": 0
+                                })
+                                .to_string(),
+                            )
+                        }
+                    };
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                         body.len(),
                         body
                     );
@@ -1487,9 +1573,26 @@ mod tests {
                 base_url: format!("http://{address}"),
                 address,
                 requests,
+                rooms,
+                fail_sync_once,
+                two_page_history,
+                fail_after_once,
                 active,
                 thread: Some(thread),
             }
+        }
+
+        fn fail_next_sync(&self) {
+            self.fail_sync_once.store(true, Ordering::Release);
+        }
+
+        fn fail_second_history_page_once(&self) {
+            self.two_page_history.store(true, Ordering::Release);
+            *self.fail_after_once.lock().unwrap() = Some(1);
+        }
+
+        fn set_rooms(&self, rooms: Vec<openpickle_api::Room>) {
+            *self.rooms.lock().unwrap() = rooms;
         }
     }
 
@@ -1574,6 +1677,174 @@ mod tests {
 
     fn drain(received: &mut futures::channel::mpsc::UnboundedReceiver<Update>) {
         while received.try_recv().is_ok() {}
+    }
+
+    #[tokio::test]
+    async fn visible_catch_up_publishes_each_page_before_a_later_page_fails() {
+        let server = HistoryServer::start();
+        server.fail_second_history_page_once();
+        let (mut live, mut received) = fixture_live("partial-visible", &server);
+
+        assert!(live.catch_up().await.is_err());
+        assert_eq!(live.conversation.synced, 1);
+        assert!(matches!(
+            received.next().await,
+            Some(Update::Upsert { room_id, messages })
+                if room_id == "primary" && messages.iter().any(|message| message.seq == 1)
+        ));
+
+        live.catch_up().await.unwrap();
+        assert_eq!(live.conversation.synced, 2);
+        assert!(matches!(
+            received.next().await,
+            Some(Update::Upsert { room_id, messages })
+                if room_id == "primary" && messages.iter().any(|message| message.seq == 2)
+        ));
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|target| target.contains("after_seq=1"))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_staged_room_catch_up_keeps_the_visible_room_unpublished() {
+        let server = HistoryServer::start();
+        server.fail_second_history_page_once();
+        let (mut live, mut received) = fixture_live("partial-staged", &server);
+
+        assert!(matches!(
+            live.open_room("peer").await,
+            Err(OpenRoomError::Session(_))
+        ));
+        assert_eq!(live.conversation.room_id, "primary");
+        assert!(received.try_recv().is_err());
+
+        live.open_room("peer").await.unwrap();
+        assert_eq!(live.conversation.room_id, "peer");
+        assert!(matches!(
+            received.next().await,
+            Some(Update::Conversation { room_id, messages, .. })
+                if room_id == "peer"
+                    && messages.iter().any(|message| message.seq == 1)
+                    && messages.iter().any(|message| message.seq == 2)
+        ));
+    }
+
+    #[tokio::test]
+    async fn startup_waits_for_sync_before_granting_send_access() {
+        let server = HistoryServer::start();
+        let (mut empty, mut empty_updates) = fixture_live("startup-empty", &server);
+        empty.conversation = Conversation::default();
+        empty.character_room.clear();
+        empty.last_rooms.clear();
+
+        empty.send_startup_conversation();
+        assert!(matches!(
+            empty_updates.next().await,
+            Some(Update::Conversation { room_id, can_send: false, .. }) if room_id.is_empty()
+        ));
+        empty.find_room().await.unwrap();
+        assert_eq!(empty.conversation.room_id, "primary");
+        assert_eq!(
+            empty.send_block_reason(""),
+            Some("Not sent. This conversation is no longer open.")
+        );
+        assert!(matches!(empty_updates.next().await, Some(Update::Rooms(_))));
+        assert!(matches!(
+            empty_updates.next().await,
+            Some(Update::Conversation { room_id, can_send: true, .. }) if room_id == "primary"
+        ));
+
+        // A cached primary id is not enough to grant access either. The first successful sync
+        // must publish permissions even though it does not change the id.
+        let (mut cached, mut cached_updates) = fixture_live("startup-cached", &server);
+        cached.character_room.clear();
+        cached.last_rooms.clear();
+        cached.send_startup_conversation();
+        assert!(matches!(
+            cached_updates.next().await,
+            Some(Update::Conversation { room_id, can_send: false, .. }) if room_id == "primary"
+        ));
+        cached.find_room().await.unwrap();
+        assert!(matches!(
+            cached_updates.next().await,
+            Some(Update::Rooms(_))
+        ));
+        assert!(matches!(
+            cached_updates.next().await,
+            Some(Update::Conversation { room_id, can_send: true, .. }) if room_id == "primary"
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_startup_sync_does_not_grant_send_access() {
+        let server = HistoryServer::start();
+        server.fail_next_sync();
+        let (mut live, mut received) = fixture_live("startup-sync-failure", &server);
+        live.character_room.clear();
+        live.last_rooms.clear();
+
+        live.send_startup_conversation();
+        assert!(live.find_room().await.is_err());
+        assert!(matches!(
+            received.next().await,
+            Some(Update::Conversation {
+                can_send: false,
+                ..
+            })
+        ));
+        assert!(received.try_recv().is_err());
+        assert!(live.last_rooms.is_empty());
+    }
+
+    #[tokio::test]
+    async fn opening_an_unknown_target_refreshes_the_authoritative_roster_once() {
+        let server = HistoryServer::start();
+        let (mut live, mut received) = fixture_live("refresh-room", &server);
+        server.set_rooms(vec![
+            fixture_room("primary", "character", false),
+            fixture_room("peer", "character_pair", false),
+            fixture_room("new-peer", "character_pair", false),
+        ]);
+
+        live.open_room("new-peer").await.unwrap();
+        assert_eq!(live.conversation.room_id, "new-peer");
+        let conversations: Vec<String> = std::iter::from_fn(|| received.try_recv().ok())
+            .filter_map(|update| match update {
+                Update::Conversation { room_id, .. } => Some(room_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(conversations, vec!["new-peer".to_owned()]);
+        assert!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|target| target.starts_with("/api/sync"))
+        );
+
+        drain(&mut received);
+        live.open_room_and_report("forged".to_owned())
+            .await
+            .unwrap();
+        assert_eq!(live.conversation.room_id, "new-peer");
+        let mut rejected = false;
+        let mut conversation_emitted = false;
+        while let Ok(update) = received.try_recv() {
+            match update {
+                Update::RoomOpenFailed { room_id, .. } if room_id == "forged" => rejected = true,
+                Update::Conversation { .. } => conversation_emitted = true,
+                _ => {}
+            }
+        }
+        assert!(rejected);
+        assert!(!conversation_emitted);
     }
 
     #[tokio::test]
@@ -1682,10 +1953,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(live.conversation.room_id, "primary");
-        assert!(matches!(
-            received.next().await,
-            Some(Update::RoomOpenFailed { room_id, .. }) if room_id == "unknown"
-        ));
+        let mut rejected = false;
+        while let Ok(update) = received.try_recv() {
+            if matches!(update, Update::RoomOpenFailed { room_id, .. } if room_id == "unknown") {
+                rejected = true;
+            }
+        }
+        assert!(rejected);
 
         let requests = server.requests.lock().unwrap();
         assert!(
