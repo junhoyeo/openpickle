@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use gpui::{App, AppContext, Application, KeyBinding, Menu, MenuItem, actions};
 use openpickle_desktop::{app::Shell, assets::Assets, backend, ui};
 

@@ -25,6 +25,9 @@ pub const CARD: u32 = 0x1b1d22;
 pub const SHEET: u32 = 0x33363f;
 
 /// The system font; Hangul falls back to the system's Korean face.
+#[cfg(target_os = "windows")]
+pub const FONT: &str = "Segoe UI";
+#[cfg(not(target_os = "windows"))]
 pub const FONT: &str = ".SystemUIFont";
 
 pub fn color(hex: u32) -> Hsla {

@@ -18,7 +18,7 @@ pub mod wrap;
 use gpui::{
     App, Bounds, ClickEvent, Div, FontWeight, ImageSource, KeyBinding, ObjectFit, Pixels,
     SharedString, Stateful, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
-    img, linear_color_stop, linear_gradient, point, prelude::*, px, size, svg,
+    img, linear_color_stop, linear_gradient, prelude::*, px, size, svg,
 };
 
 use crate::theme;
@@ -59,7 +59,8 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
-/// A window the size of the design frame, with the traffic lights drawn over the content.
+/// A window the size of the design frame. macOS draws its traffic lights over the content;
+/// other platforms keep their native title bar so its window controls remain reachable.
 pub fn window_options(cx: &App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -68,12 +69,26 @@ pub fn window_options(cx: &App) -> WindowOptions {
             cx,
         ))),
         window_min_size: Some(size(px(380.), px(560.))),
-        titlebar: Some(TitlebarOptions {
-            title: Some("Pickle".into()),
-            appears_transparent: true,
-            traffic_light_position: Some(point(px(16.), px(16.))),
-        }),
+        titlebar: Some(titlebar_options()),
         ..Default::default()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn titlebar_options() -> TitlebarOptions {
+    TitlebarOptions {
+        title: Some("Pickle".into()),
+        appears_transparent: true,
+        traffic_light_position: Some(gpui::point(px(16.), px(16.))),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn titlebar_options() -> TitlebarOptions {
+    TitlebarOptions {
+        title: Some("Pickle".into()),
+        appears_transparent: false,
+        traffic_light_position: None,
     }
 }
 

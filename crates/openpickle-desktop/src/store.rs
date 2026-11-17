@@ -205,6 +205,12 @@ mod tests {
         };
         store.save_session(&session).unwrap();
         assert_eq!(store.session(), Some(session.clone()));
+        let replacement = Session {
+            login_session_token: "ls_next".into(),
+            device_id: "device".into(),
+        };
+        store.save_session(&replacement).unwrap();
+        assert_eq!(store.session(), Some(replacement));
         assert!(!format!("{session:?}").contains("ls_test"));
     }
 
