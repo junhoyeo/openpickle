@@ -59,6 +59,9 @@ const routes: [method: string, path: RegExp, call: Call][] = [
   ["POST", /^\/api\/rooms\/([^/]+)\/messages$/, (c, _f, j, [room]) =>
     c.sendMessage(room!, j.text, { clientMsgId: j.client_msg_id, inCall: j.in_call, context: j.context })],
   ["PUT", /^\/api\/rooms\/([^/]+)\/read$/, (c, _f, j, [room]) => c.markRead(room!, j.seq)],
+  ["GET", /^\/api\/phone-calls\/([^/]+)$/, (c, _f, _j, [callId]) => c.getPhoneCall(callId!)],
+  ["POST", /^\/api\/actions$/, (c, _f, j) =>
+    c.endPhoneCall(j.payload.call_id, { actionId: j.action_id, inCall: j.in_call })],
   ["GET", /^\/api\/attachments\/(.+)\/thumbnail$/, (c, _f, _j, [path]) => c.getAttachmentThumbnail(path!)],
   ["GET", /^\/api\/character$/, (c) => c.getCharacter()],
   ["GET", /^\/api\/profile$/, (c, f) => c.getProfile(new URLSearchParams(f.query).get("region")!)],
@@ -155,10 +158,16 @@ function compare(flow: Flow, sent: Sent | undefined): string[] {
   if (!sent) return ["no request was sent"];
   const problems: string[] = [];
   if (sent.method !== flow.method) problems.push(`method ${sent.method} != ${flow.method}`);
-  if (sent.path !== flow.path) problems.push(`path ${sent.path} != ${flow.path}`);
-  if (sent.query !== flow.query) problems.push(`query "${sent.query}" != "${flow.query}"`);
+  if (sent.path !== flow.path) problems.push("path differs");
+  if (sent.query !== flow.query) problems.push("query string differs");
   const parse = (text: string) => (text === "" ? undefined : JSON.parse(text));
-  if (!isDeepStrictEqual(parse(sent.body), parse(flow.body))) problems.push(`body ${sent.body} != ${flow.body}`);
+  const ours = parse(sent.body);
+  const recorded = parse(flow.body);
+  if (!isDeepStrictEqual(ours, recorded)) {
+    const keys = (value: unknown) =>
+      value && typeof value === "object" && !Array.isArray(value) ? Object.keys(value).join(",") : typeof value;
+    problems.push(`JSON body differs (keys sent: ${keys(ours)}; recorded: ${keys(recorded)})`);
+  }
   for (const [name, value] of flow.headers) {
     if (TRANSPORT_HEADERS.has(name)) continue;
     const ours = sent.headers.get(name);
@@ -185,6 +194,7 @@ for (const flow of flows) {
   const route = routes.find(([method, path]) => method === flow.method && path.test(flow.path));
   const label = `${flow.method} ${flow.path
     .replace(/\/rooms\/[^/]+/, "/rooms/{room}")
+    .replace(/\/phone-calls\/[^/]+/, "/phone-calls/{call_id}")
     .replace(/\/nodes\/[^/]{43}/, "/nodes/{node}")
     .replace(/^\/api\/attachments\/.+\/thumbnail$/, "/api/attachments/{path}/thumbnail")}`;
   if (!route) {

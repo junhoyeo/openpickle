@@ -21,6 +21,7 @@ const USAGE = `usage: PICKLE_SESSION_FILE=<file> pickle <command>
   sync                         rooms with cursors and unread counts
   history <room> [after_seq]   room history after a sequence number (default 0)
   send <room> <text>           send a message; <room> may be "character"
+  phone-call <id>              read a phone call's current status and transcript
   search <query>               messages containing <query>, newest first, one per line:
                                seq, date, label and the snippet with matches in [brackets]
   explore [area]               Explore sections and their offers: title, call to action and
@@ -119,6 +120,12 @@ switch (command) {
     const [room, ...words] = args;
     if (!room || words.length === 0) throw new Error("send <room> <text>");
     print(await pickle.sendMessage(await resolveRoom(room), words.join(" ")));
+    break;
+  }
+  case "phone-call": {
+    const [callId, ...rest] = args;
+    if (!callId || rest.length !== 0) throw new Error("phone-call <id>");
+    print(await pickle.getPhoneCall(callId));
     break;
   }
   case "search": {

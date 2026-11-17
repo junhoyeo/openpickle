@@ -19,8 +19,9 @@ use base64::engine::general_purpose::STANDARD;
 use futures_util::StreamExt as _;
 use mock_server::{MockServer, Recorded, Reply};
 use openpickle_api::{
-    ClientOptions, ClientProfile, Credentials, Error, LogStoreListingsRequest, MessageContext,
-    PermissionSnapshot, PickleClient, PickleEvent, SendMessageOptions, SessionRequest,
+    ClientOptions, ClientProfile, Credentials, EndPhoneCallOptions, Error, LogStoreListingsRequest,
+    MessageContext, PermissionSnapshot, PickleClient, PickleEvent, SendMessageOptions,
+    SessionRequest,
 };
 use serde_json::Value;
 
@@ -148,14 +149,18 @@ fn decode_segment(segment: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// The endpoint label: path with room and node ids replaced.
+/// The endpoint label: path with private resource ids replaced.
 fn label(flow: &Flow) -> String {
+    if flow.path.starts_with("/api/attachments/") && flow.path.ends_with("/thumbnail") {
+        return format!("{} /api/attachments/{{path}}/thumbnail", flow.method);
+    }
     let segments: Vec<&str> = flow.path.split('/').collect();
     let mut out = Vec::with_capacity(segments.len());
     for (i, segment) in segments.iter().enumerate() {
         let previous = i.checked_sub(1).map(|p| segments[p]);
         out.push(match previous {
             Some("rooms") => "{room}",
+            Some("phone-calls") => "{call_id}",
             Some("nodes") if segment.len() == 43 => "{node}",
             _ => segment,
         });
@@ -301,6 +306,21 @@ async fn call(client: &PickleClient, flow: &Flow, json: &Value) -> Option<Result
                 .mark_read(room, json["seq"].as_i64().unwrap_or_default())
                 .await,
         ),
+        ("GET", ["", "api", "phone-calls", call_id]) => done(client.get_phone_call(call_id).await),
+        ("POST", ["", "api", "actions"]) if json["kind"] == "end_phone_call" => {
+            let options = EndPhoneCallOptions {
+                action_id: json["action_id"].as_str().map(str::to_owned),
+                in_call: json["in_call"].as_bool().unwrap_or_default(),
+            };
+            done(
+                client
+                    .end_phone_call(
+                        json["payload"]["call_id"].as_str().unwrap_or_default(),
+                        options,
+                    )
+                    .await,
+            )
+        }
         ("GET", ["", "api", "character"]) => done(client.get_character().await),
         ("GET", ["", "api", "profile"]) => done(client.get_profile(Some(&q("region"))).await),
         ("GET", ["", "api", "social", "snapshot"]) => {

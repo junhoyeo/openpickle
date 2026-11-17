@@ -635,6 +635,49 @@ pub struct SendMessageResponse {
     pub client_msg_id: String,
 }
 
+// ---- Phone calls ----
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PhoneCallLine {
+    pub id: String,
+    pub line_id: String,
+    /// `me`, `them`, …
+    pub speaker: String,
+    pub text: String,
+    /// Keypad input represented by this line, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<String>,
+    pub joins_previous: bool,
+    pub joins_next: bool,
+}
+
+/// `GET /api/phone-calls/{call_id}`: call state and the transcript collected so far.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PhoneCallTranscript {
+    /// `phone_call`
+    pub kind: String,
+    pub call_id: String,
+    pub title: String,
+    pub subtitle_lead: String,
+    pub counterpart_label: String,
+    pub subtitle_tail: String,
+    pub started_label: String,
+    pub live: bool,
+    pub hangup_requested: bool,
+    pub footer: String,
+    pub lines: Vec<PhoneCallLine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_epoch_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_at_epoch_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_epoch_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+}
+
 // ---- Social ----
 
 /// Scope names of `GET /api/social/snapshot`, in the order the app sends them.
@@ -745,14 +788,25 @@ pub struct HandoffItem {
     pub title: String,
     /// `done`, `canceled`, `running`, `planned`, …
     pub state: String,
-    pub subtitle: String,
+    /// Present on completed and older entries; active entries may use the log and phone fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
     pub requested_at_epoch_ms: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at_epoch_ms: Option<f64>,
-    pub result_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_text: Option<String>,
     pub time_text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_log_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_log_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phone_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phone_status_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phone_answered_at_epoch_ms: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -768,6 +822,8 @@ pub struct HandoffsScreen {
     pub kind: String,
     pub items: Vec<HandoffItem>,
     pub handoff_estimate_pct: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_subtitle: Option<String>,
     pub active_items: Vec<HandoffItem>,
     pub recent_items: Vec<HandoffItem>,
     pub active_count: i64,

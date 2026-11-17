@@ -1,10 +1,10 @@
 # @openpickle/client
 
 A typed TypeScript client for the Pickle character API (`https://character-api-prod.picklemem.com`),
-the backend of the Pickle iOS app. It was built from six Proxyman captures of the iOS app
-(version 1.1.19, build 202611071128) taken on 2026-11-16 and 2026-11-17, 36 endpoints in all. A
-full history export and login session refreshes were run against the live API; phone sign-in has
-only been replayed against its capture. The client covers 32 endpoints. It has no runtime dependencies and
+the backend of the Pickle iOS app. It was built from seven Proxyman captures of the iOS app
+(version 1.1.19, build 202611071128) taken on 2026-11-16 and 2026-11-17, 39 endpoints in all. A
+full history export and login session refreshes were run against the live API; phone sign-in and
+phone-call methods have only been replayed against captures. The client covers 34 endpoints. It has no runtime dependencies and
 uses `fetch`. It runs on Bun, and on Node versions that load TypeScript directly (tested on
 Node 26); older Node needs a bundler.
 
@@ -108,6 +108,8 @@ All of these were in the captures. `scripts/verify-capture.ts` checks each one a
 | GET | `/api/attachments/{path}/thumbnail` | `getAttachmentThumbnail(path)` | A JPEG preview of a photo or PDF in a message. Returns `{ bytes, contentType }`. |
 | POST | `/api/rooms/{room}/messages` | `sendMessage(room, text, { clientMsgId?, inCall?, context? })` | Returns `{ status, responder, seq: null }`. The reply arrives on `events()`. `context` marks a message sent from an [Explore](#explore) offer. |
 | PUT | `/api/rooms/{room}/read` | `markRead(room, seq)` | Moves this device's read cursor. |
+| GET | `/api/phone-calls/{call_id}` | `getPhoneCall(callId)` | Current call state and transcript. The id is encoded as one path segment. |
+| POST | `/api/actions` | `endPhoneCall(callId, { actionId?, inCall? })` | Sends only the captured `end_phone_call` action. Reuse `actionId` for a retry. |
 | GET | `/api/character` | `getCharacter()` | Look, level, XP, energy, jelly. |
 | GET | `/api/profile?region=` | `getProfile(region?)` | Your profile, including phone and birthday. |
 | GET | `/api/social/snapshot?scopes=` | `getSocialSnapshot(scopes?)` | Friends, requests, blocked, invite, activity. Each scope has its own status. |
@@ -128,6 +130,22 @@ All of these were in the captures. `scripts/verify-capture.ts` checks each one a
 
 `request(method, path, options)` and `send(...)` call any other path with the same headers and
 error handling.
+
+## Phone calls
+
+`getPhoneCall(callId)` returns the current `phone_call` state and the transcript collected so far.
+A line's `speaker` is `me` or `them`; `keys` appears on keypad lines. Start, answer, end, duration,
+and outcome fields are optional because the server adds them as the call moves through its
+lifecycle. A live response may later set `hangup_requested` while the end action is being handled.
+
+Ending is always explicit. `endPhoneCall()` sends `{ action_id, in_call, payload: { call_id },
+kind: "end_phone_call" }`. It creates a UUID when `actionId` is omitted. Pass the same `actionId`
+when retrying the same user action. The CLI exposes only the read-only `phone-call <id>` command;
+it does not expose call-ending mutation. Native callers must own confirmation, fresh-call
+verification, and stable retry state before using the library method.
+
+No phone call was created, read, or ended live while implementing this support. The capture was
+replayed only against local in-memory clients and localhost mock servers.
 
 ### Left out on purpose
 
@@ -153,9 +171,11 @@ error handling.
   and it is served at `/api/profile`, so the pattern does not hold for every kind.
   `getScreen(kind)` returns `unknown` for these; `getUiDefinitions().samples[kind]` shows the
   expected shape.
-- **Actions.** Buttons in the server-driven UI run native `system_action`s (`friend_request_send`,
-  `request_handoff`, `save_character_settings`, and about 100 more). Their endpoints live in the
-  app binary and were not exercised in the capture.
+- **Other actions.** The seventh capture exercised only `kind: "end_phone_call"`. The client does
+  not expose a generic action method and does not guess contracts for other native actions.
+- **Phone dialing and audio.** No direct dial endpoint or live audio transport was captured.
+  `getPhoneCall()` reads status/transcript data, and `endPhoneCall()` ends an existing call; these
+  methods are not a dialer or a microphone/audio client.
 - **Credential writes.** `/api/secure/vault/*`, `/api/secure/connections/*`, `/api/secure/sealing`
   and the rest of the end-to-end credential protocol. The app runs that protocol in a signed
   JavaScript program shipped in `getUiDefinitions().secure_program.source`.
@@ -338,7 +358,9 @@ changes as they happen. Reconnecting is up to the caller. The server suggests a 
 | `event` | `data.kind` | Payload |
 | --- | --- | --- |
 | `chat` | `user` | Your message as stored: `id` (= `client_msg_id`), `text`, `seq`, `at` |
-| `chat` | `assistant` | A character reply; `text` wraps each chat bubble in `<bubble>…</bubble>` |
+| `chat` | `assistant` | A stored character reply; `text` wraps each chat bubble in `<bubble>…</bubble>` |
+| `chat` | `assistant_partial` | A partial reply before the server assigns its room sequence number |
+| `chat` | `subagent` | A stored subagent result with its `title` and `path` |
 | `chat` | `pending` | `on`: whether the character is working on a turn |
 | `chat` | `responder` | `state`: `chat_turn_started` / `chat_turn_finished` |
 | `chat` | `activity` | `state`: `thinking` (with `typing`) / `tool` (with `label`) |
@@ -363,6 +385,7 @@ bun src/cli.ts login +821012345678  # texts a code, asks for it, writes the sess
 
 bun src/cli.ts sync
 bun src/cli.ts send character "안녕"
+bun src/cli.ts phone-call synthetic-call-id       # read status and transcript only
 bun src/cli.ts search 점심         # one result per line: seq, date, label, snippet with [matches]
 bun src/cli.ts explore travel       # Explore offers by section: title, call to action, how many asked
 bun src/cli.ts attachments character  # photos and files, newest first: date, kind, name, size, path
@@ -373,6 +396,10 @@ bun src/cli.ts screen handoffs
 bun src/cli.ts get /api/secure/transfers
 bun src/cli.ts token                # claims and seconds left of PICKLE_TOKEN
 ```
+
+Never point `PICKLE_SESSION_FILE` at the desktop app's own login-session file or share that file
+with another process. Refresh tokens rotate on use, so sharing one chain can sign out the other
+client. Give this CLI its own login session file.
 
 ## Verification
 
