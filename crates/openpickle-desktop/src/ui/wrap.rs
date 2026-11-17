@@ -23,11 +23,12 @@ pub fn keep_words(text: &str, wrap_width: Pixels, window: &Window) -> SharedStri
     break_body(text, wrap_width - px(1.), false, window)
 }
 
-/// Breaks text of `size` the way the phone app's own text does: between words, and also
-/// between a number and the Hangul after it, so "안내는 2번." may end a line with the "2". Such
-/// a break adds a newline, which moves the byte offsets after it: this is for text without
-/// styled ranges. A line may fill the width to the last pixel, so the text must be drawn
-/// without wrapping of its own.
+/// Breaks text of `size` the way the phone app's own text was seen to: between words, and
+/// inside a word where Hangul meets a Latin letter or a digit, so "안내는 2번." may end a line
+/// with the "2". Only the last word of a paragraph was never broken there. Such a break adds a
+/// newline, which moves the byte offsets after it: this is for text without styled ranges. A
+/// line may fill the width to the last pixel, so the text must be drawn without wrapping of
+/// its own.
 pub fn keep_hangul(text: &str, size: Pixels, wrap_width: Pixels, window: &Window) -> SharedString {
     break_body(text, wrap_width * (theme::BODY / size), true, window)
 }
@@ -69,8 +70,8 @@ pub fn keep_words_at(
     keep_words(text, wrap_width * (theme::BODY / size) * 0.98, window)
 }
 
-/// Fills each line with words up to `wrap_width`. With `scripts`, a word may also be broken
-/// between a number and the Hangul after it.
+/// Fills each line with words up to `wrap_width`. With `scripts`, a word that does not fit may
+/// leave its start on the line, see [`script_break`].
 fn break_lines(
     text: &str,
     wrap_width: f32,
@@ -83,54 +84,64 @@ fn break_lines(
             out.push('\n');
         }
         let mut line = 0.;
-        for (index, word) in paragraph.split(' ').enumerate() {
-            for (part_index, part) in parts(word, scripts).into_iter().enumerate() {
-                let width: f32 = part.chars().map(&mut width_of).sum();
-                // Only the first part of a word has the space before it.
-                let space = if index > 0 && part_index == 0 {
-                    width_of(' ')
-                } else {
-                    0.
-                };
-                if index > 0 || part_index > 0 {
-                    // A word wider than the whole line gets a line to itself; GPUI then
-                    // breaks it wherever it has to.
-                    if line + space + width > wrap_width || line > wrap_width {
-                        out.push('\n');
-                        line = 0.;
-                    } else if part_index == 0 {
+        let mut words = paragraph.split(' ').enumerate().peekable();
+        while let Some((index, word)) = words.next() {
+            let word_width: f32 = word.chars().map(&mut width_of).sum();
+            if index > 0 {
+                let space = width_of(' ');
+                // A word wider than the whole line gets a line to itself; GPUI then breaks it
+                // wherever it has to.
+                if line + space + word_width > wrap_width || line > wrap_width {
+                    let room = wrap_width - line - space;
+                    // The last word of a paragraph stays whole.
+                    let at = (scripts && words.peek().is_some())
+                        .then(|| script_break(word, room, &mut width_of))
+                        .flatten();
+                    if let Some(at) = at {
                         out.push(' ');
-                        line += space;
+                        out.push_str(&word[..at]);
+                        out.push('\n');
+                        out.push_str(&word[at..]);
+                        line = word[at..].chars().map(&mut width_of).sum();
+                        continue;
                     }
+                    out.push('\n');
+                    line = 0.;
+                } else {
+                    out.push(' ');
+                    line += space;
                 }
-                out.push_str(part);
-                line += width;
             }
+            out.push_str(word);
+            line += word_width;
         }
     }
     out
 }
 
-/// The pieces of a word a line may end after: the word itself, or with `scripts` what stands
-/// before and after each place where a digit is followed by Hangul.
-fn parts(word: &str, scripts: bool) -> Vec<&str> {
-    if !scripts {
-        return vec![word];
-    }
-    let mut parts = Vec::new();
-    let mut start = 0;
-    let mut before = None;
+/// Where the phone app breaks a word that does not fit in `room`: at the last place in it
+/// where Hangul meets a Latin letter or a digit and what stands before fits ("통지는 2" /
+/// "번.", "최근 AB" / "마트를"). A word without such a place stays whole.
+fn script_break(word: &str, room: f32, mut width_of: impl FnMut(char) -> f32) -> Option<usize> {
+    let hangul = |c: char| matches!(c, '\u{ac00}'..='\u{d7a3}');
+    let mut width = 0.;
+    let mut found = None;
+    let mut before: Option<char> = None;
     for (at, c) in word.char_indices() {
-        if before.is_some_and(|before: char| before.is_ascii_digit())
-            && matches!(c, '\u{ac00}'..='\u{d7a3}')
+        if let Some(before) = before
+            && before.is_alphanumeric()
+            && c.is_alphanumeric()
+            && hangul(before) != hangul(c)
         {
-            parts.push(&word[start..at]);
-            start = at;
+            found = Some(at);
+        }
+        width += width_of(c);
+        if width > room {
+            break;
         }
         before = Some(c);
     }
-    parts.push(&word[start..]);
-    parts
+    found
 }
 
 #[cfg(test)]
@@ -143,13 +154,18 @@ mod tests {
     }
 
     #[test]
-    fn a_line_of_a_call_may_end_between_a_number_and_its_hangul() {
+    fn a_line_of_a_call_may_end_inside_a_word_where_the_scripts_meet() {
         let wrap = |text: &str, width: f32| break_lines(text, width, |_| 10., true);
-        // "2번." is one word, but the phone app ends the line after its digit.
+        // After the digit, or after the Latin letters, also when more of the word would fit.
         assert_eq!(wrap("안내는 2번. 다음", 50.), "안내는 2\n번. 다음");
-        // Hangul is not broken inside a word, nor a word where Latin letters meet Hangul.
+        assert_eq!(wrap("최근 AB마트를 찾는", 50.), "최근 AB\n마트를\n찾는");
+        assert_eq!(
+            wrap("도우미는 AB마트로 간다", 80.),
+            "도우미는 AB\n마트로 간다"
+        );
+        // The last word of a paragraph stays whole, and so does a word of one script.
+        assert_eq!(wrap("도우미, AB마트입니다.", 80.), "도우미,\nAB마트입니다.");
         assert_eq!(wrap("가나다 라마바사", 60.), "가나다\n라마바사");
-        assert_eq!(wrap("도우미, AB마트입니다.", 60.), "도우미,\nAB마트입니다.");
         // Spaces are kept as they were, also two in a row.
         assert_eq!(wrap("가  나", 100.), "가  나");
     }
