@@ -18,7 +18,7 @@ use crate::{
     protocol::{Command, Update},
     theme,
     ui::{
-        Identity, OpenArchive, OpenChat, OpenExplore, OpenFriends, Pictures, Tab,
+        Identity, OpenArchive, OpenChat, OpenExplore, OpenFriends, OpenProfile, Pictures, Tab,
         archive::{ArchiveEvent, ArchiveView},
         attachment::{AttachmentEvent, AttachmentView},
         chat::{ChatEvent, ChatView},
@@ -27,6 +27,7 @@ use crate::{
         friends::{FriendsEvent, FriendsView},
         invite::{InviteEvent, InviteView},
         login::{LoginEvent, LoginView},
+        profile::{ProfileEvent, ProfileView},
         search::{SearchEvent, SearchView},
     },
 };
@@ -63,6 +64,7 @@ pub struct Shell {
     explore: Option<Entity<ExploreView>>,
     friends: Option<Entity<FriendsView>>,
     archive: Option<Entity<ArchiveView>>,
+    profile: Option<Entity<ProfileView>>,
     over: Option<Over>,
     /// The search screen. It is kept when it closes, so that opening it again shows the same
     /// search: a result is opened to read around it, and then usually the next one.
@@ -122,6 +124,7 @@ impl Shell {
             explore: None,
             friends: None,
             archive: None,
+            profile: None,
             over: None,
             search: None,
             identity: Identity::default(),
@@ -344,6 +347,11 @@ impl Shell {
                     friends.update(cx, |friends, cx| friends.set_social(social, cx));
                 }
             }
+            Update::Profile(data) => {
+                if let Some(profile) = &self.profile {
+                    profile.update(cx, |profile, cx| profile.set_profile(data, cx));
+                }
+            }
             Update::Explore(explore) => {
                 if let Some(view) = &self.explore {
                     view.update(cx, |view, cx| view.set_explore(explore, cx));
@@ -385,6 +393,7 @@ impl Shell {
         self.explore = None;
         self.friends = None;
         self.archive = None;
+        self.profile = None;
         self.over = None;
         self.search = None;
         self.social = None;
@@ -440,6 +449,9 @@ impl Shell {
         }
         if let Some(archive) = &self.archive {
             archive.update(cx, |archive, cx| archive.set_identity(identity.clone(), cx));
+        }
+        if let Some(profile) = &self.profile {
+            profile.update(cx, |profile, cx| profile.set_identity(identity.clone(), cx));
         }
     }
 
@@ -575,7 +587,37 @@ impl Shell {
                 }
                 self.commands.send(Command::LoadArchive).ok();
             }
-            Tab::Profile => return,
+            Tab::Profile => {
+                if self.profile.is_none() {
+                    let (identity, pictures) = (self.identity.clone(), self.pictures.clone());
+                    let profile = cx.new(|cx| ProfileView::new(identity, pictures, cx));
+                    self._section_events.push(cx.subscribe_in(
+                        &profile,
+                        window,
+                        |this, _, event, window, cx| match event {
+                            ProfileEvent::Menu => this.open_drawer(window, cx),
+                            ProfileEvent::Invite => this.open_invite(window, cx),
+                            ProfileEvent::Open(tab) => this.open_tab(*tab, window, cx),
+                            ProfileEvent::Reload => {
+                                this.commands.send(Command::LoadProfile).ok();
+                            }
+                            ProfileEvent::Link(target) => {
+                                // These are fixed destinations in the captured Profile definitions.
+                                if matches!(
+                                    target.as_str(),
+                                    "https://pickle.com/privacy?view=app"
+                                        | "https://pickle.com/help?view=app"
+                                        | "mailto:contact@pickle.com"
+                                ) {
+                                    cx.open_url(target);
+                                }
+                            }
+                        },
+                    ));
+                    self.profile = Some(profile);
+                }
+                self.commands.send(Command::LoadProfile).ok();
+            }
         }
         self.tab = tab;
         self.report_reading(window);
@@ -601,6 +643,7 @@ impl Shell {
             Tab::Explore => self.explore.clone().map(AnyView::from),
             Tab::Friends => self.friends.clone().map(AnyView::from),
             Tab::Archive => self.archive.clone().map(AnyView::from),
+            Tab::Profile => self.profile.clone().map(AnyView::from),
             _ => Some(chat.clone().into()),
         }
     }
@@ -612,11 +655,18 @@ impl Shell {
         let Screen::Chat(chat) = &self.screen else {
             return;
         };
-        let focus = match (self.tab, &self.explore, &self.friends, &self.archive) {
-            (Tab::Explore, Some(explore), _, _) => explore.focus_handle(cx),
-            (Tab::Friends, _, Some(friends), _) => friends.focus_handle(cx),
-            (Tab::Archive, _, _, Some(archive)) => archive.focus_handle(cx),
-            _ => chat.focus_handle(cx),
+        let focus = if self.tab == Tab::Profile {
+            self.profile
+                .as_ref()
+                .map(|profile| profile.focus_handle(cx))
+                .unwrap_or_else(|| chat.focus_handle(cx))
+        } else {
+            match (self.tab, &self.explore, &self.friends, &self.archive) {
+                (Tab::Explore, Some(explore), _, _) => explore.focus_handle(cx),
+                (Tab::Friends, _, Some(friends), _) => friends.focus_handle(cx),
+                (Tab::Archive, _, _, Some(archive)) => archive.focus_handle(cx),
+                _ => chat.focus_handle(cx),
+            }
         };
         window.focus(&focus);
         self.report_reading(window);
@@ -893,6 +943,9 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|this, _: &OpenArchive, window, cx| {
                 this.open_tab(Tab::Archive, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenProfile, window, cx| {
+                this.open_tab(Tab::Profile, window, cx)
             }));
         match &self.screen {
             Screen::Starting => screen,
@@ -1553,5 +1606,54 @@ mod tests {
                 .any(|command| matches!(command, Command::Active(true))),
             "the new room can be read once its snapshot is visible"
         );
+    }
+
+    #[gpui::test]
+    fn profile_is_a_read_only_section_loaded_on_demand(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::ui::bind_keys);
+        let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, received) = futures::channel::mpsc::unbounded();
+        updates
+            .unbounded_send(Update::Conversation {
+                room_id: "primary".into(),
+                is_character: true,
+                can_send: true,
+                name: "Pickle".into(),
+                avatar: None,
+                messages: vec![],
+            })
+            .unwrap();
+        let (shell, cx) = cx.add_window_view(|window, cx| {
+            window.activate_window();
+            Shell::new(commands, received, window, cx)
+        });
+        while sent.try_recv().is_ok() {}
+        cx.simulate_keystrokes("cmd-5");
+        let commands = std::iter::from_fn(|| sent.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, Command::LoadProfile))
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, Command::Active(true)))
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, Command::Send { .. }))
+        );
+        shell.read_with(cx, |shell, _| assert_eq!(shell.tab, Tab::Profile));
+        updates
+            .unbounded_send(Update::Profile(Ok(crate::profile::ProfileData {
+                display_name: "Sample account".into(),
+                ..Default::default()
+            })))
+            .unwrap();
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-1");
+        shell.read_with(cx, |shell, _| assert_eq!(shell.tab, Tab::Chat));
     }
 }

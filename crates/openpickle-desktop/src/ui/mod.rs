@@ -7,6 +7,7 @@ pub mod friends;
 pub mod input;
 pub mod invite;
 pub mod login;
+pub mod profile;
 pub mod rows;
 pub mod search;
 pub mod select;
@@ -30,7 +31,8 @@ actions!(
         OpenChat,
         OpenExplore,
         OpenFriends,
-        OpenArchive
+        OpenArchive,
+        OpenProfile
     ]
 );
 
@@ -48,6 +50,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-2", OpenExplore, None),
         KeyBinding::new("cmd-3", OpenFriends, None),
         KeyBinding::new("cmd-4", OpenArchive, None),
+        KeyBinding::new("cmd-5", OpenProfile, None),
     ]);
 }
 
@@ -91,8 +94,7 @@ fn icon(name: &'static str, size: f32, color: u32) -> impl IntoElement {
         .text_color(theme::color(color))
 }
 
-/// The sections of the app. The tab bar leads to four of them and the menu to Friends as
-/// well. All but Profile exist.
+/// The sections of the app. Friends is reached through the menu; the other four are tabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
     Chat,
@@ -170,6 +172,7 @@ fn tab_header(
     avatar: Option<ImageSource>,
     on_menu: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_invite: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    show_invite: bool,
 ) -> impl IntoElement {
     let picture = div()
         .size(px(58.))
@@ -238,15 +241,17 @@ fn tab_header(
                             .child(name),
                     ),
                 )
-                .child(
-                    chrome("invite")
-                        .w(px(74.))
-                        .h(px(42.))
-                        .rounded_full()
-                        .cursor_pointer()
-                        .on_click(on_invite)
-                        .child("Invite"),
-                ),
+                .child(div().w(px(74.)).when(show_invite, |slot| {
+                    slot.child(
+                        chrome("invite")
+                            .w(px(74.))
+                            .h(px(42.))
+                            .rounded_full()
+                            .cursor_pointer()
+                            .on_click(on_invite)
+                            .child("Invite"),
+                    )
+                })),
         )
 }
 
@@ -261,7 +266,7 @@ fn header_cover() -> impl IntoElement {
         .occlude()
 }
 
-/// The pill with the four tabs. All but Profile can be chosen.
+/// The pill with the four tabs.
 fn tab_bar(
     selected: Tab,
     on_select: impl Fn(&Tab, &mut Window, &mut App) + 'static,
@@ -281,7 +286,6 @@ fn tab_bar(
         .p(px(4.))
         .children(tabs.map(|(tab, name, chosen_name)| {
             let chosen = tab == selected;
-            let exists = tab != Tab::Profile;
             let on_select = on_select.clone();
             div()
                 .id(name)
@@ -302,7 +306,7 @@ fn tab_bar(
                     23.,
                     theme::TEXT,
                 ))
-                .when(exists && !chosen, |element| {
+                .when(!chosen, |element| {
                     element
                         .cursor_pointer()
                         .on_click(move |_, window, cx| on_select(&tab, window, cx))

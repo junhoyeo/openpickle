@@ -407,6 +407,7 @@ impl Render for ArchiveView {
                 self.identity.avatar.clone(),
                 cx.listener(|_, _, _, cx| cx.emit(ArchiveEvent::Menu)),
                 cx.listener(|_, _, _, cx| cx.emit(ArchiveEvent::Invite)),
+                true,
             ))
             .child(bar)
     }

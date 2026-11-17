@@ -596,6 +596,7 @@ impl Render for ChatView {
                 self.avatar.clone(),
                 cx.listener(|_, _, _, cx| cx.emit(ChatEvent::Menu)),
                 cx.listener(|_, _, _, cx| cx.emit(ChatEvent::Invite)),
+                true,
             ))
             .when(!self.at_latest, |screen| screen.child(to_latest))
             .child(self.bottom_bar(cx))

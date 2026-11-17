@@ -37,6 +37,37 @@ fn person(name: &str, note: &str) -> Person {
     }
 }
 
+/// Made-up profile values, never copied from an account or a capture.
+fn sample_profile() -> openpickle_desktop::profile::ProfileData {
+    use openpickle_desktop::profile::{
+        ConnectionPreview, ConnectionSummary, ProfileData, TicketCounts, UsageSnapshot,
+    };
+    ProfileData {
+        display_name: "Sample account".into(),
+        usage: Some(UsageSnapshot {
+            allowance: 100,
+            remaining: 70,
+            reset_at: Some((chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339()),
+            period: Some("day".into()),
+            ticket_auto_use: false,
+            ticket_order: Some("half_first".into()),
+            tickets: TicketCounts {
+                full: Some(2),
+                half: Some(1),
+            },
+        }),
+        connections: Some(ConnectionSummary {
+            enabled_count: Some(1),
+            enabled: vec![ConnectionPreview {
+                source: "calendar".into(),
+                label: "Calendar".into(),
+                initial: Some("C".into()),
+            }],
+        }),
+        ..ProfileData::default()
+    }
+}
+
 /// Made-up friends and a made-up invite link.
 fn sample_social() -> Social {
     let names = [
@@ -408,6 +439,7 @@ fn main() {
                                 query,
                             },
                             Command::LoadSocial => Update::Social(Ok(sample_social())),
+                            Command::LoadProfile => Update::Profile(Ok(sample_profile())),
                             Command::LoadExplore => Update::Explore(Ok(sample_explore())),
                             Command::LoadArchive => Update::Archive {
                                 room_id: "primary".into(),

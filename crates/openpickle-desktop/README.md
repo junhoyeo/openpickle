@@ -30,6 +30,10 @@ cargo run -p openpickle-desktop --example gallery -- app   # the whole window: m
   area's chip lists that area's offers by rank. An offer opens a sheet with its steps, and
   Start sends the offer's text to the chat with the offer's id. Offers that stay on screen are
   reported to the server, as the app does.
+- **My Pickle** (the fourth tab, Cmd-5): account name, daily usage, reset time, full/half reset
+  ticket holdings and server-reported connection count. The Usage card opens a scrollable
+  detail page. Credits/plan events update the displayed snapshot as they arrive.
+  Usage percentages and tickets come from the server, not the reference screenshots.
 - **Friends** (in the menu, or Cmd-3): who asked to be friends, and your friends, with a search
   field from ten friends on.
 - **Invite** (the header button): your invite link with Copy link, how many invites are left,
@@ -44,8 +48,7 @@ cargo run -p openpickle-desktop --example gallery -- app   # the whole window: m
   selection is read from the conversation, not from the rows on screen, so Select All copies all
   of it.
 
-Not built: the Profile tab, the menu's 3D World and My Pickle, the microphone and voice calls
-(all drawn, none active); opening a picture full size, saving or sharing a file, the + that
+Not built: the menu's 3D World, the microphone and voice calls (all drawn, none active); opening a picture full size, saving or sharing a file, the + that
 makes documents; website preview cards; reactions; answering a request card. No capture shows the requests for deleting an offer, adding a friend,
 answering a friend request or a friend's own page, so those are left out, as are the contacts
 list, sharing the invite through other apps and the Korean roulette promotion. The texts of the
@@ -64,6 +67,20 @@ new screens are English readings of the app's string keys; the strings were not 
 - **Original-file opening, downloading and sharing are not implemented.** The captures
   show only the thumbnail endpoint, not an original-file download route. Open the
   original in the Pickle phone app until that route has been captured.
+
+## Profile data and limits
+
+Profile loads the captured account, session-bootstrap and connection-catalog routes. Only a
+small `profile-view.json` snapshot is cached; the bootstrap token and session response are
+never persisted in it. Usage continues to update from the existing event stream.
+
+Reset-ticket use/buy, auto-use edits, account edits, payment methods, notification/language/
+appearance settings and the mobile widget are visibly unavailable on desktop. No mutation
+endpoints for these controls were supplied. Ticket history is also unavailable: its sample
+layout is in the UI definitions, but none of the supplied captures includes a history request
+or history payload. OpenPickle does not invent a request or turn missing history into an empty
+history. Connected counts describe the server catalog and do not include device-only mobile
+permissions such as address-book access.
 
 ## Packaging
 
