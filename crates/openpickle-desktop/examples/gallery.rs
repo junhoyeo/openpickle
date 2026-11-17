@@ -80,7 +80,7 @@ fn sample_phone_call(call_id: &str, live: bool) -> openpickle_api::PhoneCallTran
     });
     if !live {
         call["ended_at_epoch_ms"] = (now - 500.).into();
-        call["duration_s"] = 96.into();
+        call["duration_s"] = 95.into();
     }
     serde_json::from_value(call).unwrap()
 }

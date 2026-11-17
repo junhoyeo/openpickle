@@ -116,13 +116,18 @@ pub fn now_ms() -> f64 {
         .map_or(0., |since| since.as_millis() as f64)
 }
 
-/// How long a call lasted, as `1:36`: what the server counted once it ended, the time since
-/// the answer while it is live. A call nobody answered has no duration.
+/// How long a call took, as `1:36`. The phone app's card counts from the start of the call,
+/// the dialing included, to its end, or to now while it is live; the server's `duration_s`
+/// counts from the answer and is a few seconds less. It serves a call whose times are missing.
 pub fn duration_label(call: &PhoneCallTranscript, now_ms: f64) -> Option<String> {
-    let seconds = match call.duration_s {
-        Some(seconds) => seconds,
-        None if call.live => ((now_ms - call.answered_at_epoch_ms?) / 1000.) as i64,
-        None => return None,
+    let until = match call.ended_at_epoch_ms {
+        Some(ended) => Some(ended),
+        None if call.live => Some(now_ms),
+        None => None,
+    };
+    let seconds = match (call.started_at_epoch_ms, until) {
+        (Some(started), Some(until)) => ((until - started) / 1000.) as i64,
+        _ => call.duration_s?,
     }
     .max(0);
     let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
@@ -153,20 +158,25 @@ mod tests {
     }
 
     #[test]
-    fn an_ended_call_lasted_what_the_server_counted() {
-        let ended = call(json!({"duration_s": 96, "answered_at_epoch_ms": 1000.0}));
+    fn an_ended_call_took_the_time_from_its_start_to_its_end() {
+        // Answered three seconds after the start: the server's count is that much shorter.
+        let ended = call(json!({
+            "started_at_epoch_ms": 1_000.0, "answered_at_epoch_ms": 4_100.0,
+            "ended_at_epoch_ms": 97_400.0, "duration_s": 93,
+        }));
         assert_eq!(duration_label(&ended, 9_999_000.).as_deref(), Some("1:36"));
+        // Without the times, the server's count is what there is.
         let long = call(json!({"duration_s": 3725}));
         assert_eq!(duration_label(&long, 0.).as_deref(), Some("1:02:05"));
     }
 
     #[test]
-    fn a_live_call_counts_from_its_answer_and_an_unanswered_one_has_no_duration() {
-        let live = call(json!({"live": true, "answered_at_epoch_ms": 10_000.0}));
+    fn a_live_call_counts_from_its_start_and_one_without_times_has_no_duration() {
+        let live = call(json!({"live": true, "started_at_epoch_ms": 10_000.0}));
         assert_eq!(duration_label(&live, 75_900.).as_deref(), Some("1:05"));
-        let ringing = call(json!({"live": true}));
-        assert_eq!(duration_label(&ringing, 75_900.), None);
-        let missed = call(json!({"live": false}));
+        let unknown = call(json!({"live": true}));
+        assert_eq!(duration_label(&unknown, 75_900.), None);
+        let missed = call(json!({"live": false, "started_at_epoch_ms": 10_000.0}));
         assert_eq!(duration_label(&missed, 75_900.), None);
     }
 }
