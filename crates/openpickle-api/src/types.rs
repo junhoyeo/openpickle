@@ -816,6 +816,51 @@ pub struct HandoffSection {
     pub items: Vec<HandoffItem>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HandoffPlanBlock {
+    /// `prose` in the captured response; other block types remain readable.
+    pub r#type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HandoffLogEntry {
+    /// `report`, `page`, `shell`, …; the server may add kinds without a client update.
+    pub r#type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HandoffLogNode {
+    /// `report`, `start`, `page`, `shell`, `web`, `browser`, …
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// `GET /api/screens/handoff?name=`: one task's plan and progress log.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HandoffScreen {
+    pub kind: String,
+    pub state: String,
+    pub title: String,
+    pub requested_at_epoch_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_log_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_log_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_estimate_pct: Option<f64>,
+    #[serde(default)]
+    pub plan_blocks: Vec<HandoffPlanBlock>,
+    #[serde(default)]
+    pub log_entries: Vec<HandoffLogEntry>,
+    #[serde(default)]
+    pub log_nodes: Vec<HandoffLogNode>,
+}
+
 /// `GET /api/screens/handoffs`: tasks and phone calls the character ran.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HandoffsScreen {

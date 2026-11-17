@@ -748,6 +748,11 @@ impl PickleClient {
         self.get_screen_as("handoffs", &[]).await
     }
 
+    /// `GET /api/screens/handoff?name=`: one task's plan and progress log.
+    pub async fn get_handoff(&self, name: &str) -> Result<HandoffScreen> {
+        self.get_screen_as("handoff", &[("name", name)]).await
+    }
+
     /// `GET /api/screens/extra-conversations`.
     pub async fn get_extra_conversations(&self) -> Result<ExtraConversationsScreen> {
         self.get_screen_as("extra-conversations", &[]).await

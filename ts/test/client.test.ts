@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { PickleApiError, PickleClient, decodeAccessToken } from "../src/client.ts";
 import type {
   ExploreSectionsScreen,
+  HandoffScreen,
   HistoryPage,
   MessageSearchScreen,
   Offer,
@@ -193,6 +194,33 @@ test("getHistoryPage asks for messages before a sequence number, limit first", a
     "/api/rooms/room-1/history/page?limit=250&before_seq=7",
   ]);
   expect(calls[0]!.init.method).toBe("GET");
+});
+
+test("getHandoff reads progress with open node kinds and encodes the name", async () => {
+  const body: HandoffScreen = {
+    kind: "handoff",
+    state: "running",
+    title: "🧭 Plan a day trip",
+    requested_at_epoch_ms: 1_700_000_000_000,
+    latest_log_text: "Comparing routes",
+    latest_log_kind: "web",
+    handoff_estimate_pct: 50,
+    plan_blocks: [{ type: "prose", markdown: "## Plan\nCompare two routes." }],
+    log_entries: [],
+    log_nodes: [
+      { kind: "future_kind", text: "Checking an option" },
+      { kind: "report", text: "A useful result" },
+    ],
+  };
+  const { calls, fetch } = recorder(200, JSON.stringify(body));
+  const pickle = new PickleClient({ accessToken: "synthetic-token", fetch });
+
+  expect(await pickle.getHandoff("day trip/서울?")).toEqual(body);
+  expect(calls[0]!.url).toBe(
+    `${pickle.baseUrl}/api/screens/handoff?name=day%20trip%2F%EC%84%9C%EC%9A%B8%3F`,
+  );
+  expect(calls[0]!.init.method).toBe("GET");
+  expect(calls[0]!.init.body).toBeUndefined();
 });
 
 test("getPhoneCall reads live, ending, and completed transcript shapes and encodes the id as one segment", async () => {

@@ -5,6 +5,7 @@ import type {
   EnclaveNode,
   EndPhoneCallOptions,
   ExploreSectionsScreen,
+  HandoffScreen,
   HistoryDelta,
   HistoryPage,
   HistoryWindow,
@@ -418,6 +419,11 @@ export class PickleClient {
    */
   searchMessages(query: string): Promise<MessageSearchScreen> {
     return this.request("GET", "/api/screens/message-search", { query: { query } });
+  }
+
+  /** `GET /api/screens/handoff?name=`: one task's plan and progress log. */
+  getHandoff(name: string): Promise<HandoffScreen> {
+    return this.request("GET", "/api/screens/handoff", { query: { name } });
   }
 
   // ---- Explore ----
