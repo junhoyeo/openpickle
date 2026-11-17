@@ -752,8 +752,10 @@ impl Shell {
 
     /// Keep the old conversation until the backend has opened the target successfully.
     fn open_room(&mut self, room_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_tab(Tab::Chat, window, cx);
+        // Closing the drawer reports visibility; mark the switch first so the previous
+        // room is never briefly acknowledged as read while it is being left.
         self.opening_room = Some(room_id.to_owned());
+        self.open_tab(Tab::Chat, window, cx);
         if let Screen::Chat(chat) = &self.screen {
             chat.update(cx, |chat, cx| chat.set_can_send(false, cx));
         }
@@ -1480,5 +1482,76 @@ mod tests {
                 .expect("the composer was still writable");
             assert!(shown.parts.iter().any(|part| matches!(part, Part::Task(_))));
         });
+    }
+
+    #[gpui::test]
+    fn choosing_a_room_from_the_drawer_never_marks_the_hidden_chat_read(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::ui::bind_keys);
+        let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, received) = futures::channel::mpsc::unbounded();
+        updates
+            .unbounded_send(Update::Conversation {
+                room_id: "primary".into(),
+                is_character: true,
+                can_send: true,
+                name: "Pickle".into(),
+                avatar: None,
+                messages: vec![message("old", 1)],
+            })
+            .unwrap();
+        let (shell, cx) = cx.add_window_view(|window, cx| {
+            window.activate_window();
+            Shell::new(commands, received, window, cx)
+        });
+        shell.update_in(cx, |shell, window, cx| shell.open_drawer(window, cx));
+        updates
+            .unbounded_send(Update::Upsert {
+                room_id: "primary".into(),
+                messages: vec![message("arrived-behind-drawer", 2)],
+            })
+            .unwrap();
+        cx.run_until_parked();
+        while sent.try_recv().is_ok() {}
+        let drawer = shell.read_with(cx, |shell, _| match &shell.over {
+            Some(Over::Drawer(drawer)) => drawer.clone(),
+            _ => panic!("drawer is open"),
+        });
+        drawer.update(cx, |_, cx| cx.emit(DrawerEvent::Room("peer".into())));
+        cx.run_until_parked();
+        let commands = std::iter::from_fn(|| sent.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, Command::OpenRoom(room) if room == "peer"))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, Command::Active(false)))
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, Command::Active(true))),
+            "closing the drawer during a switch must not acknowledge the old room"
+        );
+        updates
+            .unbounded_send(Update::Conversation {
+                room_id: "peer".into(),
+                is_character: false,
+                can_send: false,
+                name: "Sample room".into(),
+                avatar: None,
+                messages: vec![],
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            std::iter::from_fn(|| sent.try_recv().ok())
+                .any(|command| matches!(command, Command::Active(true))),
+            "the new room can be read once its snapshot is visible"
+        );
     }
 }
