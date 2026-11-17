@@ -1,5 +1,6 @@
 //! `phone-demo float` shows a synthetic live transcript and confirmation controls. It has no
-//! backend or action subscriber and cannot place or end a real call.
+//! backend or action subscriber and cannot place or end a real call. `ended` shows the call
+//! after it ended and `call=<file>` the transcript in that JSON file.
 //!
 //! Opens the chat screen with made-up messages that have the same structure as the Figma frames,
 //! to compare the two side by side: `cargo run -p openpickle-desktop --example gallery`.
@@ -40,20 +41,47 @@ fn person(name: &str, note: &str) -> Person {
     }
 }
 
-/// Fake phone data used only by the offline native gallery.
+/// Fake phone data used only by the offline native gallery: a made-up call to a library's
+/// answering system. `call=<file>` shows the transcript in that JSON file instead.
 fn sample_phone_call(call_id: &str, live: bool) -> openpickle_api::PhoneCallTranscript {
-    serde_json::from_value(serde_json::json!({
-        "kind":"phone_call", "call_id":call_id, "title":"Library opening hours",
-        "subtitle_lead":"Pickle is speaking with ", "counterpart_label":"the library", "subtitle_tail":"",
-        "started_label":"Today", "live":live, "hangup_requested":false,
-        "footer":"Call in progress", "started_at_epoch_ms":chrono::Utc::now().timestamp_millis() as f64,
-        "lines":[
-            {"id":"l1","line_id":"1","speaker":"them","text":"Hello, how can I help?","joins_previous":false,"joins_next":false},
-            {"id":"l2","line_id":"2","speaker":"me","text":"Could you tell me your opening hours for Saturday?","joins_previous":false,"joins_next":false},
-            {"id":"l3","line_id":"3","speaker":"them","text":"We open at ten and close at six.","joins_previous":false,"joins_next":false},
-            {"id":"l4","line_id":"4","speaker":"me","text":"Thank you. Is the reading room open too?","joins_previous":false,"joins_next":false}
-        ]
-    })).unwrap()
+    if let Some(path) = std::env::args().find_map(|arg| arg.strip_prefix("call=").map(String::from))
+    {
+        let mut call: openpickle_api::PhoneCallTranscript =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        call.call_id = call_id.into();
+        return call;
+    }
+    let line = |id: u32, speaker: &str, text: &str, keys: Option<&str>, joins: (bool, bool)| {
+        serde_json::json!({
+            "id": format!("l{id}"), "line_id": id.to_string(), "speaker": speaker, "text": text,
+            "keys": keys, "joins_previous": joins.0, "joins_next": joins.1,
+        })
+    };
+    let now = chrono::Utc::now().timestamp_millis() as f64;
+    let mut call = serde_json::json!({
+        "kind": "phone_call", "call_id": call_id, "title": "도서관 자동 응답 안내",
+        "subtitle_lead": "Pickle\u{2019}s call with ", "counterpart_label": "02-000-0000",
+        "subtitle_tail": "", "started_label": "Today 1:36 PM", "live": live,
+        "hangup_requested": false,
+        "footer": if live { "Pickle is on the call" } else { "Call ended · Today 1:38 PM" },
+        "started_at_epoch_ms": now - 100_000., "answered_at_epoch_ms": now - 96_000.,
+        "lines": [
+            line(1, "me", "여보세요?", None, (false, false)),
+            line(2, "them", "안녕하세요, 샘플 시립 도서관입니다.", None, (false, true)),
+            line(3, "them", "운영 시간 안내는 1번, 대출 연장은 2번, 직원 연결은 0번.", None, (true, true)),
+            line(4, "them", "열람실 좌석 안내는 3번, 행사 신청은 4번을 눌러 주십시오. For English, press 6.", None, (true, true)),
+            line(5, "them", "다시 듣기는 9번을 눌러 주십시오.", None, (true, false)),
+            line(6, "me", "1", Some("1"), (false, false)),
+            line(7, "them", "평일은 오전 9시부터 오후 10시까지, 주말은 오후 6시까지 운영합니다.", None, (false, false)),
+            line(8, "me", "감사합니다. 필요한 내용을 모두 확인했어요. 좋은 하루 보내세요.", None, (false, false)),
+            line(9, "them", "이용해 주셔서 감사합니다. 다른 안내가 필요하시면 별표를 눌러 주십시오.", None, (false, false)),
+        ],
+    });
+    if !live {
+        call["ended_at_epoch_ms"] = (now - 500.).into();
+        call["duration_s"] = 96.into();
+    }
+    serde_json::from_value(call).unwrap()
 }
 
 /// Made-up profile values, never copied from an account or a capture.
@@ -423,6 +451,8 @@ fn main() {
     let login = std::env::args().any(|arg| arg == "login");
     let whole_app = std::env::args().any(|arg| arg == "app");
     let phone_demo = std::env::args().any(|arg| arg == "phone-demo");
+    // A call is live in the samples unless `ended` says otherwise.
+    let live_call = !std::env::args().any(|arg| arg == "ended");
     let float = std::env::args().any(|arg| arg == "float");
     let steps: Vec<String> = std::env::args().filter(|arg| arg.contains(':')).collect();
     let started = std::time::Instant::now();
@@ -463,7 +493,7 @@ fn main() {
                     view.update(cx, |view, cx| {
                         view.set_call(
                             "sample-call",
-                            Ok(sample_phone_call("sample-call", true)),
+                            Ok(sample_phone_call("sample-call", live_call)),
                             cx,
                         )
                     });
@@ -507,7 +537,7 @@ fn main() {
                                 },
                             ])),
                             Command::WatchPhoneCall(Some(call_id)) => Update::PhoneCall {
-                                result: Ok(sample_phone_call(&call_id, true)),
+                                result: Ok(sample_phone_call(&call_id, live_call)),
                                 call_id,
                             },
                             Command::WatchPhoneCall(None) => continue,

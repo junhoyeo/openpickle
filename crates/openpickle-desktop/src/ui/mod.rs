@@ -44,6 +44,7 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-c", input::Copy, Some("Chat")),
         KeyBinding::new("cmd-a", input::SelectAll, Some("Chat")),
+        KeyBinding::new("cmd-c", input::Copy, Some("Phone")),
         KeyBinding::new("cmd-f", Find, None),
         KeyBinding::new("escape", Cancel, None),
         KeyBinding::new("up", Previous, None),

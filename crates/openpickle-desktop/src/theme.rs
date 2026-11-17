@@ -16,6 +16,8 @@ pub const LINK: u32 = 0x82a8f8;
 pub const MINE: u32 = 0x9de68d;
 pub const ON_MINE: u32 = 0x000000;
 pub const DANGER: u32 = 0xff6b6b;
+/// The End call control of a phone call.
+pub const CALL_END: u32 = 0xf96e6e;
 /// Cards on the page, and sheets that rise over it.
 pub const CARD: u32 = 0x1b1d22;
 pub const SHEET: u32 = 0x33363f;

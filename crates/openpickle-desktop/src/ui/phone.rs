@@ -6,7 +6,8 @@
 
 use gpui::{
     App, ClipboardItem, Context, Div, EventEmitter, FocusHandle, Focusable, FontWeight,
-    ListAlignment, ListState, SharedString, Stateful, Window, div, list, prelude::*, px,
+    HighlightStyle, ImageSource, ListAlignment, ListOffset, ListState, Pixels, SharedString,
+    Stateful, StyledText, Window, div, linear_color_stop, linear_gradient, list, prelude::*, px,
 };
 use openpickle_api::{PhoneCallLine, PhoneCallTranscript};
 use uuid::Uuid;
@@ -14,8 +15,18 @@ use uuid::Uuid;
 use crate::{
     phone::CallSummary,
     theme,
-    ui::{Cancel, Identity, chrome, face, icon},
+    ui::{Cancel, Identity, chrome, face, icon, input, wrap::keep_hangul},
 };
+
+/// The top of the header's row of controls. The phone app puts it 6 pt under its status bar;
+/// here that is the height of the window's title bar.
+const HEADER_TOP: f32 = 44.;
+/// The header ends 18 pt under its 44 pt row.
+const HEADER_HEIGHT: f32 = HEADER_TOP + 44. + 18.;
+/// The footer's text stands this far above the window's edge.
+const FOOTER_BOTTOM: f32 = 24.;
+/// What the End call button adds to the footer: its 42 pt and the 12 pt above it.
+const END_BUTTON_ROOM: f32 = 54.;
 
 pub enum PhoneEvent {
     Close,
@@ -60,7 +71,6 @@ pub struct PhoneView {
     /// False once the reader scrolls up; new lines then do not pull the list to the bottom.
     at_latest: bool,
     end: EndState,
-    copied: bool,
     focus: FocusHandle,
 }
 
@@ -69,11 +79,12 @@ impl EventEmitter<PhoneEvent> for PhoneView {}
 impl PhoneView {
     pub fn new(identity: Identity, initial_call: Option<String>, cx: &mut Context<Self>) -> Self {
         let selected = initial_call.filter(|id| !id.trim().is_empty());
-        let lines = ListState::new(0, ListAlignment::Bottom, px(600.));
+        // A short call starts under the header; a long one is shown from its end.
+        let lines = ListState::new(0, ListAlignment::Top, px(600.));
         let view = cx.entity().downgrade();
         lines.set_scroll_handler(move |event, _, cx| {
             view.update(cx, |this, cx| {
-                let at_latest = !event.is_scrolled;
+                let at_latest = event.visible_range.end >= event.count;
                 if this.at_latest != at_latest {
                     this.at_latest = at_latest;
                     cx.notify();
@@ -92,7 +103,6 @@ impl PhoneView {
             lines,
             at_latest: true,
             end: EndState::Idle,
-            copied: false,
             focus: cx.focus_handle(),
         }
     }
@@ -137,6 +147,12 @@ impl PhoneView {
                     self.lines
                         .splice(unchanged..old_count, new_count - unchanged);
                 }
+                if self.at_latest {
+                    self.lines.scroll_to(ListOffset {
+                        item_ix: new_count,
+                        offset_in_item: px(0.),
+                    });
+                }
                 // A successful end request remains authoritative while the server still says
                 // the call is live. A later stale live snapshot must not re-enable End call.
                 if !call.live
@@ -147,7 +163,6 @@ impl PhoneView {
                 }
                 self.call = Some(call);
                 self.call_failed = None;
-                self.copied = false;
             }
             Ok(_) => return,
             Err(reason) => self.call_failed = Some(reason.into()),
@@ -198,7 +213,6 @@ impl PhoneView {
         self.call = None;
         self.call_failed = None;
         self.end = EndState::Idle;
-        self.copied = false;
         self.at_latest = true;
         cx.emit(PhoneEvent::Open(call_id));
         cx.notify();
@@ -213,7 +227,6 @@ impl PhoneView {
         self.call = None;
         self.call_failed = None;
         self.end = EndState::Idle;
-        self.copied = false;
         self.at_latest = true;
         cx.emit(PhoneEvent::Back);
         cx.notify();
@@ -317,8 +330,6 @@ impl PhoneView {
             .collect::<Vec<_>>()
             .join("\n");
         cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.copied = true;
-        cx.notify();
     }
 
     fn calls_screen(&self, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -512,26 +523,42 @@ impl PhoneView {
         let content = if let Some(call) = call {
             let items = list(
                 self.lines.clone(),
-                cx.processor(|this, index: usize, _window, cx| {
+                cx.processor(|this, index: usize, window, _| {
                     let call = this.call.as_ref().expect("list exists only for a call");
-                    if index == 0 {
+                    let item = if index == 0 {
                         div()
                             .w_full()
-                            .pb(px(4.))
                             .text_align(gpui::TextAlign::Center)
-                            .text_size(px(12.))
-                            .line_height(px(16.))
+                            .text_size(px(12. * TRACKED))
+                            .line_height(px(14.5))
                             .text_color(theme::color(theme::TEXT_FAINT))
                             .child(call.started_label.clone())
-                            .into_any_element()
                     } else {
-                        transcript_line(&call.lines[index - 1], &this.identity, cx)
-                            .into_any_element()
-                    }
+                        transcript_line(
+                            &call.lines[index - 1],
+                            this.identity.avatar.clone(),
+                            1.,
+                            1.,
+                            window,
+                        )
+                    };
+                    // The lines keep to the design column of a wider window.
+                    div()
+                        .w_full()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w_full()
+                                .max_w(theme::COLUMN_MAX)
+                                .px(px(16.))
+                                .child(item),
+                        )
+                        .into_any_element()
                 }),
             )
             .size_full()
-            .pt(px(114.))
+            .pt(px(HEADER_HEIGHT + 16.))
             .pb(detail_bottom_padding(call, &self.end));
             div().size_full().child(items)
         } else if let Some(reason) = &self.call_failed {
@@ -577,111 +604,100 @@ impl PhoneView {
         call: Option<&PhoneCallTranscript>,
         cx: &mut Context<Self>,
     ) -> Div {
+        // "Pickle's call with 02-000-0000": the server words it, and only the other side
+        // stands out.
         let subtitle = call.map(|call| {
-            format!(
+            let lead = call.subtitle_lead.len();
+            let counterpart = lead..lead + call.counterpart_label.len();
+            let text = format!(
                 "{}{}{}",
                 call.subtitle_lead, call.counterpart_label, call.subtitle_tail
-            )
+            );
+            StyledText::new(text).with_highlights([(
+                counterpart,
+                HighlightStyle {
+                    color: Some(theme::color(theme::TEXT)),
+                    ..Default::default()
+                },
+            )])
         });
         div()
             .absolute()
             .top_0()
             .left_0()
             .right_0()
-            .h(px(105.))
-            .occlude()
-            .bg(theme::color(theme::PAGE))
-            .flex()
-            .justify_center()
+            .h(px(HEADER_HEIGHT))
+            .child(backdrop(px(HEADER_TOP + 11.), px(HEADER_HEIGHT)))
             .child(
                 div()
-                    .w_full()
-                    .max_w(theme::COLUMN_MAX)
-                    .px(px(16.))
-                    .pt(px(45.))
+                    .absolute()
+                    .top(px(HEADER_TOP))
+                    .left_0()
+                    .right_0()
+                    .h(px(44.))
                     .flex()
-                    .items_center()
-                    .child(
-                        div().w(px(62.)).child(
-                            chrome("phone-back")
-                                .size(px(38.))
-                                .rounded_full()
-                                .cursor_pointer()
-                                .child(icon("chevron-left", 21., theme::TEXT))
-                                .on_click(cx.listener(|this, _, _, cx| this.back(cx))),
-                        ),
-                    )
+                    .justify_center()
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
+                            .relative()
+                            .size_full()
+                            .max_w(theme::COLUMN_MAX)
+                            .px(px(72.))
                             .flex()
                             .flex_col()
                             .items_center()
                             .gap(px(3.))
                             .child(
                                 div()
-                                    .w_full()
-                                    .text_align(gpui::TextAlign::Center)
-                                    .text_size(px(16.))
-                                    .line_height(px(20.))
+                                    .max_w_full()
+                                    .text_size(px(16. * TRACKED))
+                                    .line_height(px(21.))
                                     .truncate()
                                     .child(title),
                             )
                             .children(subtitle.map(|subtitle| {
                                 div()
-                                    .w_full()
+                                    .max_w_full()
+                                    .pr(px(2.))
                                     .flex()
                                     .items_center()
-                                    .justify_center()
-                                    .gap(px(4.))
+                                    .gap(px(3.))
                                     .child(face(self.identity.avatar.clone(), 20.))
                                     .child(
                                         div()
                                             .min_w_0()
-                                            .text_size(px(13.))
-                                            .line_height(px(17.))
+                                            .text_size(px(13. * TRACKED))
+                                            .line_height(px(20.))
                                             .text_color(theme::color(theme::TEXT_MUTED))
                                             .truncate()
                                             .child(subtitle),
                                     )
-                            })),
-                    )
-                    .child(div().w(px(62.)).flex().justify_end().children(
-                        call.filter(|call| !call.lines.is_empty()).map(|_| {
-                            chrome("copy-phone-transcript")
-                                .h(px(34.))
-                                .px(px(10.))
-                                .rounded_full()
-                                .cursor_pointer()
-                                .text_size(px(12.))
-                                .child(if self.copied { "Copied" } else { "Copy" })
-                                .on_click(cx.listener(|this, _, _, cx| this.copy_transcript(cx)))
-                        }),
-                    )),
+                            }))
+                            .child(
+                                chrome("phone-back")
+                                    .absolute()
+                                    .top_0()
+                                    .left(px(16.))
+                                    .size(px(44.))
+                                    .rounded_full()
+                                    .cursor_pointer()
+                                    .child(icon("chevron-left", 24., theme::TEXT))
+                                    .on_click(cx.listener(|this, _, _, cx| this.back(cx))),
+                            ),
+                    ),
             )
     }
 
     fn detail_footer(&self, call: &PhoneCallTranscript, cx: &mut Context<Self>) -> Div {
-        let mut footer = div()
-            .absolute()
-            .bottom_0()
-            .left_0()
-            .right_0()
-            .occlude()
-            .bg(theme::color(theme::PAGE))
-            .flex()
-            .justify_center();
         let mut inner = div()
             .w_full()
             .max_w(theme::COLUMN_MAX)
-            .px(px(16.))
-            .pt(px(11.))
-            .pb(px(22.))
+            .px(px(12.))
+            .pb(px(FOOTER_BOTTOM))
             .flex()
             .flex_col()
             .items_center()
-            .gap(px(9.));
+            .gap(px(12.));
         if let Some(reason) = &self.call_failed {
             let selected = self.selected.clone().unwrap_or_default();
             inner = inner.child(
@@ -710,8 +726,8 @@ impl PhoneView {
             div()
                 .w_full()
                 .text_align(gpui::TextAlign::Center)
-                .text_size(px(14.))
-                .line_height(px(19.))
+                .text_size(px(15. * TRACKED))
+                .line_height(px(18.))
                 .text_color(theme::color(theme::TEXT_FAINT))
                 .truncate()
                 .child(call.footer.clone()),
@@ -720,12 +736,14 @@ impl PhoneView {
             EndState::Idle if call.live && !call.hangup_requested => inner.child(
                 chrome("end-phone-call")
                     .h(px(42.))
-                    .px(px(15.))
+                    .pl(px(14.))
+                    .pr(px(16.))
                     .rounded_full()
                     .cursor_pointer()
-                    .gap(px(7.))
-                    .text_color(theme::color(theme::DANGER))
-                    .child(icon("phone-off", 18., theme::DANGER))
+                    .gap(px(6.))
+                    .text_size(px(15. * TRACKED))
+                    .text_color(theme::color(theme::CALL_END))
+                    .child(icon("phone-off", 18., theme::CALL_END))
                     .child("End call")
                     .on_click(cx.listener(|this, _, _, cx| this.show_end_confirmation(cx))),
             ),
@@ -775,8 +793,23 @@ impl PhoneView {
             ),
             EndState::Confirm { .. } | EndState::Idle => inner,
         };
-        footer = footer.child(inner);
-        footer
+        // The page covers the transcript up to the footer's text and fades out above it.
+        div()
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .flex()
+            .flex_col()
+            .child(fade(px(28.), true))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .bg(theme::alpha(theme::PAGE, BACKDROP))
+                    .child(inner),
+            )
     }
 
     fn end_dialog(&self, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -884,6 +917,8 @@ impl Render for PhoneView {
             .text_size(theme::BODY)
             .line_height(theme::BODY_LINE)
             .on_action(cx.listener(|this, _: &Cancel, _, cx| this.cancel(cx)))
+            // The phone app has no control for it; here Cmd-C copies the open transcript.
+            .on_action(cx.listener(|this, _: &input::Copy, _, cx| this.copy_transcript(cx)))
             .child(if self.selected.is_some() {
                 self.detail_screen(cx).into_any_element()
             } else {
@@ -892,73 +927,137 @@ impl Render for PhoneView {
     }
 }
 
-fn transcript_line(line: &PhoneCallLine, identity: &Identity, _: &App) -> Div {
+/// The phone app sets its text tighter than the font's own spacing, which GPUI cannot do.
+/// Labels drawn this much smaller are as wide as they are there.
+pub(super) const TRACKED: f32 = 0.96;
+/// The sizes at which the two sides' lines of a call are as wide as the phone app's 16 and
+/// 15, so that they break at the same words.
+const THEIR_TEXT: f32 = 15.5;
+const MY_TEXT: f32 = 14.8;
+
+/// How much of the page the backdrop of the header and of the footer keeps where it is solid.
+const BACKDROP: f32 = 0.8;
+
+/// The backdrop of the header: the page down to `solid`, fading out by `height`.
+fn backdrop(solid: Pixels, height: Pixels) -> Div {
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .h(height)
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .w_full()
+                .h(solid)
+                .flex_none()
+                .bg(theme::alpha(theme::PAGE, BACKDROP)),
+        )
+        .child(fade(height - solid, false))
+}
+
+/// The edge of a backdrop: the page fading out downward, or upward for a footer. The three
+/// steps are the stops of the phone app's backdrop.
+fn fade(height: Pixels, upward: bool) -> Div {
+    let stops = [(0., BACKDROP), (0.213, 0.695), (0.591, 0.442), (1., 0.)];
+    let mut steps: Vec<Div> = stops
+        .windows(2)
+        .map(|pair| {
+            let ((from, solid), (to, clear)) = (pair[0], pair[1]);
+            let (top, bottom) = if upward {
+                (clear, solid)
+            } else {
+                (solid, clear)
+            };
+            div().w_full().h(height * (to - from)).bg(linear_gradient(
+                180.,
+                linear_color_stop(theme::alpha(theme::PAGE, top), 0.),
+                linear_color_stop(theme::alpha(theme::PAGE, bottom), 1.),
+            ))
+        })
+        .collect();
+    if upward {
+        steps.reverse();
+    }
+    div().w_full().flex_none().flex().flex_col().children(steps)
+}
+
+/// One line of a call. `scale` shrinks every measure of the transcript screen and `text_scale`
+/// its text: the phone card of the chat shows the same lines smaller.
+pub(super) fn transcript_line(
+    line: &PhoneCallLine,
+    avatar: Option<ImageSource>,
+    scale: f32,
+    text_scale: f32,
+    window: &Window,
+) -> Div {
+    let scaled = |measure: f32| px(measure * scale);
     let mine = line.speaker == "me";
-    let above = if line.joins_previous {
-        theme::JOINED_RADIUS
+    let keypad = line.keys.as_deref().is_some_and(|keys| !keys.is_empty());
+    let round = if mine { 19. } else { 20. };
+    let above = scaled(if line.joins_previous { 5. } else { round });
+    let below = scaled(if line.joins_next { 5. } else { round });
+    let (size, height) = if mine {
+        (MY_TEXT, 22.)
     } else {
-        theme::BUBBLE_RADIUS
+        (THEIR_TEXT, 20.)
     };
-    let below = if line.joins_next {
-        theme::JOINED_RADIUS
-    } else {
-        theme::BUBBLE_RADIUS
-    };
+    // A bubble is at most 260 wide: its padding, the icon, the gap, and the text. The phone
+    // app fills a line to the very edge; one point more lets the same line through here.
+    let room = scaled(260. - 24. - 21. - 2. + 1.);
     let bubble = div()
-        .max_w(px(300.))
-        .px(px(12.))
-        .py(px(9.))
+        .max_w(scaled(260.))
+        .px(scaled(12.))
+        .pt(scaled(9.))
+        .pb(scaled(11.))
         .flex()
         .items_start()
-        .gap(px(5.))
+        .gap(scaled(2.))
         .bg(theme::color(theme::SURFACE))
-        .when(mine, |bubble| {
-            bubble
-                .rounded_tl(theme::BUBBLE_RADIUS)
-                .rounded_tr(theme::BUBBLE_RADIUS)
-                .rounded_bl(below)
-                .rounded_br(above)
-        })
-        .when(!mine, |bubble| {
-            bubble
-                .rounded_tl(above)
-                .rounded_tr(below)
-                .rounded_bl(theme::BUBBLE_RADIUS)
-                .rounded_br(theme::BUBBLE_RADIUS)
-        })
-        .child(icon(
-            if line.keys.as_deref().is_some_and(|keys| !keys.is_empty()) {
-                "grid-3x3"
-            } else {
-                "audio-lines"
-            },
-            17.,
-            theme::TEXT_FAINT,
-        ))
+        .rounded(scaled(round))
+        // The corners toward the avatar's side close up between the lines of one turn.
+        .when(mine, |bubble| bubble.rounded_tr(above).rounded_br(below))
+        .when(!mine, |bubble| bubble.rounded_tl(above).rounded_bl(below))
+        .child(
+            div()
+                .size(scaled(21.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(if keypad {
+                    icon("keypad", 15. * scale, theme::TEXT_FAINT)
+                } else {
+                    icon("audio-lines", 17. * scale, theme::TEXT_FAINT)
+                }),
+        )
         .child(
             div()
                 .min_w_0()
-                .text_size(if mine { px(15.) } else { px(16.) })
-                .line_height(if mine { px(22.) } else { px(20.) })
-                .child(line.text.clone()),
+                .text_size(px(size * text_scale))
+                .line_height(scaled(height))
+                // The lines are broken already, each to the full width.
+                .whitespace_nowrap()
+                .child(keep_hangul(&line.text, px(size * text_scale), room, window)),
         );
     let row = div()
         .w_full()
-        .px(px(16.))
-        .pt(if line.joins_previous {
-            theme::JOINED_GAP
-        } else {
-            theme::GROUP_GAP
-        })
+        .pt(scaled(if line.joins_previous { 2. } else { 12. }))
         .flex()
         .items_end()
-        .gap(px(12.));
+        .gap(scaled(12.));
     if mine {
-        row.justify_end().child(bubble).child(if line.joins_next {
-            div().size(px(28.))
-        } else {
-            div().child(face(identity.avatar.clone(), 28.))
-        })
+        // Only the last line of a turn carries the picture; the others keep its room.
+        row.justify_end().child(bubble).child(
+            div()
+                .size(scaled(28.))
+                .flex_none()
+                .when(!line.joins_next, |slot| {
+                    slot.child(face(avatar, 28. * scale))
+                }),
+        )
     } else {
         row.justify_start().child(bubble)
     }
@@ -988,7 +1087,8 @@ fn same_line(a: &PhoneCallLine, b: &PhoneCallLine) -> bool {
 
 fn detail_bottom_padding(call: &PhoneCallTranscript, end: &EndState) -> gpui::Pixels {
     let has_control = (call.live && !call.hangup_requested) || !matches!(end, EndState::Idle);
-    if has_control { px(142.) } else { px(94.) }
+    // The footer's text and the fade above it take 46 over the bottom margin.
+    px(FOOTER_BOTTOM + 46. + if has_control { END_BUTTON_ROOM } else { 0. })
 }
 
 fn nonempty(value: &str) -> Option<&str> {
