@@ -24,6 +24,8 @@ servers the iOS app does, with your own account.
   with documents listed by name, kind and size.
 - **Explore.** The second tab lists what your Pickle offers to do for you, in sections and by
   area. An offer shows how it would go about it, and Start asks for it in the chat.
+- **Phone calls.** Browse calls placed by Pickle, read their live transcripts and request an
+  end only after confirmation. Opening the call list does not dial a number.
 - **My Pickle.** The fourth tab shows account, usage, reset-ticket holdings and connected-service
   information. The usage card opens the detailed, read-only Usage screen.
 - **Friends and invites.** The menu leads to your friends, and Invite to your invite link, how
@@ -44,7 +46,7 @@ servers the iOS app does, with your own account.
   <img src="docs/screenshots/sign-in.png" alt="Sign-in with a phone number" height="380" />
 </p>
 
-Not built yet: editing account/settings, spending or buying tickets, voice calls, opening a picture full size, saving or sharing a
+Not built yet: editing account/settings, spending or buying tickets, direct microphone voice chat with Pickle, opening a picture full size, saving or sharing a
 file, link previews,
 reactions, answering a request card, and
 everything that changes your friends: adding one, answering a request, a friend's own page.
@@ -91,10 +93,10 @@ the chat screen with made-up messages. GPUI's own start-up is about 67 ms of tha
 
 ## How it was built
 
-The API is not documented. It was read off three [Proxyman](https://proxyman.com) captures of the
-iOS app: 30 endpoints, of which the clients cover 27. Each client is checked by replaying every
-captured request through it and comparing what it sends with what the app sent: method, path, raw
-query string, JSON body and headers.
+The API is not documented. It was read off seven [Proxyman](https://proxyman.com) captures of the
+iOS app. Each client is checked by replaying the captured requests it covers and comparing
+what it sends with what the app sent: method, path, raw query string, JSON body and headers.
+The verifier reports uncovered routes separately instead of treating them as passing.
 
 ```sh
 cargo run -p openpickle-api --example verify_capture -- <capture.proxymanlogv2>
@@ -109,7 +111,7 @@ The notes on the API (endpoints, phone sign-in, login sessions, the event stream
 | Path | What it is |
 | --- | --- |
 | [`crates/openpickle-desktop`](crates/openpickle-desktop/README.md) | The desktop app: GPUI views, a backend thread for the network and the disk, the macOS packaging. |
-| `crates/openpickle-api` | The Rust client for the Pickle character API: all 27 endpoints, phone sign-in, login session refresh, the typed event stream. |
+| `crates/openpickle-api` | The Rust client for the captured Pickle API: phone sign-in, login session refresh, typed event stream, message search, attachments and phone-call transcripts/actions. |
 | [`ts/`](ts/README.md) | The TypeScript client the Rust one was ported from, a small CLI, and the API notes. |
 
 ## Chat links and attachment previews

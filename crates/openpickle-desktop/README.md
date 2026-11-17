@@ -30,6 +30,8 @@ cargo run -p openpickle-desktop --example gallery -- app   # the whole window: m
   area's chip lists that area's offers by rank. An offer opens a sheet with its steps, and
   Start sends the offer's text to the chat with the offer's id. Offers that stay on screen are
   reported to the server, as the app does.
+- **Phone calls**: live/completed calls placed by Pickle, with transcript, status, copy and
+  explicit end-call confirmation. Open from the composer phone button, menu, or Cmd-Shift-P.
 - **My Pickle** (the fourth tab, Cmd-5): account name, daily usage, reset time, full/half reset
   ticket holdings and server-reported connection count. The Usage card opens a scrollable
   detail page. Credits/plan events update the displayed snapshot as they arrive.
@@ -48,7 +50,7 @@ cargo run -p openpickle-desktop --example gallery -- app   # the whole window: m
   selection is read from the conversation, not from the rows on screen, so Select All copies all
   of it.
 
-Not built: the menu's 3D World, the microphone and voice calls (all drawn, none active); opening a picture full size, saving or sharing a file, the + that
+Not built: the menu's 3D World and direct microphone voice chat with Pickle; opening a picture full size, saving or sharing a file, the + that
 makes documents; website preview cards; reactions; answering a request card. No capture shows the requests for deleting an offer, adding a friend,
 answering a friend request or a friend's own page, so those are left out, as are the contacts
 list, sharing the invite through other apps and the Korean roulette promotion. The texts of the
@@ -81,6 +83,23 @@ layout is in the UI definitions, but none of the supplied captures includes a hi
 or history payload. OpenPickle does not invent a request or turn missing history into an empty
 history. Connected counts describe the server catalog and do not include device-only mobile
 permissions such as address-book access.
+
+
+## Phone-call history and live transcripts
+
+The phone button beside an empty composer, the menu's Phone calls row, or Cmd-Shift-P
+opens calls placed by Pickle. This is not microphone chat with Pickle and does not dial a
+number. A call can be opened from the list or the drawer's recent-call entries.
+
+Only the opened call is refreshed, every four seconds while its server state remains live.
+Closing the view or returning to the list stops that refresh and never ends the call.
+Ending a live call requires the explicit confirmation dialog. The same action id is reused
+when retrying a failed end request; a pending request cannot be submitted twice. All call
+responses are matched to their call id before updating the visible view.
+
+API contracts were observed in the supplied capture: GET /api/phone-calls/{id} and
+POST /api/actions with kind=end_phone_call. No dialer, microphone transport, full recording
+download, or unsupported action endpoint is inferred from these routes.
 
 ## Packaging
 
