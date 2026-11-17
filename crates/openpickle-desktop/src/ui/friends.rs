@@ -362,6 +362,7 @@ impl Render for FriendsView {
                 self.identity.avatar.clone(),
                 cx.listener(|_, _, _, cx| cx.emit(FriendsEvent::Menu)),
                 cx.listener(|_, _, _, cx| cx.emit(FriendsEvent::Invite)),
+                true,
             ))
             .child(bar)
     }

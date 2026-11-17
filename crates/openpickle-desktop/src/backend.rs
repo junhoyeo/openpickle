@@ -31,6 +31,7 @@ use tokio::{
 use crate::{
     convert,
     model::{Attachment, Message},
+    profile::ProfileData,
     protocol::{Command, Update},
     store::{Session, Store},
 };
@@ -217,6 +218,7 @@ async fn sign_in(
             | Command::OpenRoom(_)
             | Command::LoadSocial
             | Command::LoadExplore
+            | Command::LoadProfile
             | Command::OffersShown(_)
             | Command::LoadArchive
             | Command::LoadAttachments(_)
@@ -422,6 +424,7 @@ struct Live {
     updates: Updates<Update>,
     conversation: Conversation,
     identity: Identity,
+    profile: Option<ProfileData>,
     /// Whether the window is in front; only then does reading count as "seen".
     active: bool,
     /// Whether the history on this computer reaches back to the first message.
@@ -502,6 +505,7 @@ async fn converse(
         updates: updates.clone(),
         conversation,
         identity,
+        profile: None,
         // The window says when it comes to the front.
         active: false,
         history_complete: false,
@@ -571,6 +575,16 @@ async fn converse(
                         }
                         Err(error) if session_is_gone(&error) => return Ended::SignedOut,
                         Err(error) => live.send(Update::Social(Err(explain(&error)))),
+                    }
+                }
+                Some(Command::LoadProfile) => {
+                    if let Some(cached) = live.cached_once::<ProfileData>("profile-view.json") {
+                        live.profile = Some(cached.clone());
+                        live.send(Update::Profile(Ok(cached)));
+                    }
+                    if let Err(error) = live.load_profile().await {
+                        if session_is_gone(&error) { return Ended::SignedOut; }
+                        live.send(Update::Profile(Err(explain(&error))));
                     }
                 }
                 Some(Command::LoadExplore) => {
@@ -882,6 +896,16 @@ impl Live {
 
     async fn handle(&mut self, event: PickleEvent) -> openpickle_api::Result<()> {
         match event {
+            PickleEvent::Usage(usage) => {
+                if let Some(data) = &mut self.profile {
+                    let before = data.clone();
+                    if data.apply_usage_event(&usage) && *data != before {
+                        let changed = data.clone();
+                        self.store.cache("profile-view.json", &changed).ok();
+                        self.send(Update::Profile(Ok(changed)));
+                    }
+                }
+            }
             PickleEvent::Chat(ChatEvent::User {
                 role,
                 id,
@@ -1082,6 +1106,33 @@ impl Live {
             .insert(name)
             .then(|| self.store.cached(name))
             .flatten()
+    }
+
+    /// Reads only the captured profile/bootstrap/catalog routes. Session tokens and the
+    /// rest of the bootstrap response never enter the UI protocol or disk cache.
+    async fn load_profile(&mut self) -> openpickle_api::Result<()> {
+        let (account, session, catalog) = tokio::join!(
+            self.client.get_profile(None),
+            self.client.start_session(),
+            self.client.get_screen("connection-catalog", &[]),
+        );
+        let account = account?;
+        let mut data = ProfileData::from_profile(&account);
+        let session = session?;
+        data.apply_session(&session);
+        drop(session);
+        match catalog {
+            Ok(catalog) => {
+                data.set_connections_json(&catalog).ok();
+            }
+            Err(error) if session_is_gone(&error) => return Err(error),
+            Err(_) => {} // Unknown connection count, not zero.
+        }
+        // The supplied captures contain no ticket-history endpoint. Leave it unavailable.
+        self.store.cache("profile-view.json", &data).ok();
+        self.profile = Some(data.clone());
+        self.send(Update::Profile(Ok(data)));
+        Ok(())
     }
 
     fn show_social(&mut self, snapshot: &SocialSnapshot) {
@@ -1658,6 +1709,7 @@ mod tests {
             updates,
             conversation: Conversation::load(&store, "primary"),
             identity: Identity::default(),
+            profile: None,
             active: false,
             history_complete: false,
             character_room: "primary".to_owned(),

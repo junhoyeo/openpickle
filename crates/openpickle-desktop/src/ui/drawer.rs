@@ -151,7 +151,11 @@ impl Render for DrawerView {
                 Some(DrawerEvent::Open(Tab::Archive)),
             ))
             .child(row("globe", "3D World", None))
-            .child(row("user-round", "My Pickle", None))
+            .child(row(
+                "user-round",
+                "My Pickle",
+                Some(DrawerEvent::Open(Tab::Profile)),
+            ))
             .when(!self.rooms.is_empty(), |menu| {
                 menu.child(
                     div()

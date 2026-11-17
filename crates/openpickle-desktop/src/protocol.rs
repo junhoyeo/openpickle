@@ -1,6 +1,7 @@
 //! What the UI and the backend say to each other. The backend owns the network and the disk and
 //! runs on its own thread; the UI only ever sees these messages.
 
+use crate::profile::ProfileData;
 use std::path::PathBuf;
 
 use crate::model::{Attachment, Explore, Message, RoomInfo, SearchResult, Social};
@@ -24,6 +25,8 @@ pub enum Command {
     LoadSocial,
     /// Read the Explore tab's offers, in the same two steps.
     LoadExplore,
+    /// Load the account profile and read-only usage snapshot.
+    LoadProfile,
     /// These offers were on screen.
     OffersShown(Vec<String>),
     /// List the pictures and files of the conversation, reading back to its first message.
@@ -86,6 +89,8 @@ pub enum Update {
     Social(Result<Social, String>),
     /// The Explore tab's offers, or why they could not be read.
     Explore(Result<Explore, String>),
+    /// Cache-safe profile and usage fields, never the complete session response.
+    Profile(Result<ProfileData, String>),
     /// Pictures that are on disk now, by their key.
     Pictures(Vec<(String, PathBuf)>),
     /// The chat rooms other than the character's, newest activity first.

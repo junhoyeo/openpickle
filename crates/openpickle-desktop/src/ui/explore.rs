@@ -788,6 +788,7 @@ impl Render for ExploreView {
                 self.identity.avatar.clone(),
                 cx.listener(|_, _, _, cx| cx.emit(ExploreEvent::Menu)),
                 cx.listener(|_, _, _, cx| cx.emit(ExploreEvent::Invite)),
+                true,
             ))
             .child(bar)
             .children(
