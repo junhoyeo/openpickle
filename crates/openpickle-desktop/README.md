@@ -5,7 +5,8 @@ A native desktop app for chatting with your Pickle. It is written in Rust and dr
 
 ```sh
 cargo run --release -p openpickle-desktop            # the app
-./crates/openpickle-desktop/macos/package.sh         # OpenPickle.app and a disk image
+./crates/openpickle-desktop/macos/package.sh         # a DMG for this Mac
+./crates/openpickle-desktop/windows/package.ps1      # a Windows x86-64 zip (in PowerShell)
 cargo run -p openpickle-desktop --example gallery    # the chat screen with made-up messages
 cargo run -p openpickle-desktop --example gallery -- login
 cargo run -p openpickle-desktop --example gallery -- app   # the whole window: menu, search
@@ -106,9 +107,15 @@ download, or unsupported action endpoint is inferred from these routes.
 
 ## Packaging
 
-`macos/package.sh` builds `OpenPickle.app` and a disk image into `target/macos/`. It uses only
-macOS's own tools (`sips`, `iconutil`, `codesign`, `hdiutil`). The app is signed ad hoc; see the
-[root README](../../README.md#get-it) for what that means.
+`macos/package.sh` builds `OpenPickle.app` and a disk image into `target/macos/`. Pass
+`aarch64-apple-darwin` or `x86_64-apple-darwin` to choose an architecture; with no argument it
+builds for the host. It uses macOS's own tools (`sips`, `iconutil`, `codesign`, `hdiutil`) and
+signs the app ad hoc.
+
+`windows/package.ps1` builds the MSVC release binary and writes a zip containing
+`OpenPickle.exe` and its install note into `target/windows/`. Windows uses its native title bar
+and Segoe UI, with the system font fallback for Korean text. See the
+[root README](../../README.md#get-it) for the unsigned-app first-launch steps on both platforms.
 
 ## Why it is fast
 
@@ -126,7 +133,8 @@ runs each; GPUI's own start-up is about 67 ms of that).
 ## Where things live
 
 Everything is under the user's application-support directory
-(`~/Library/Application Support/openpickle` on macOS), readable by you only:
+(`~/Library/Application Support/openpickle` on macOS, readable by you only, or
+`%APPDATA%\openpickle` on Windows, inside your user profile):
 
 - `session.json`: the login session. Its refresh token is single-use and
   replaced on every refresh, so the file is written atomically and only one instance of the app

@@ -16,8 +16,8 @@ servers the iOS app does, with your own account.
 
 ## What it does
 
-- **Chat with your Pickle from your Mac.** Bubbles, cards, timestamps and the composer follow the
-  iOS chat screen. Korean lines break between words, and the text field supports Korean input.
+- **Chat with your Pickle from your desktop.** Bubbles, cards, timestamps and the composer follow
+  the iOS chat screen. Korean lines break between words, and the text field supports Korean input.
 - **Live.** Your message, the character's replies and what it is doing right now ("Searching
   Web…") arrive over the server's event stream as they happen.
 - **Archive.** The third tab holds every picture and file of the conversation, grouped by day,
@@ -75,17 +75,29 @@ python3 skills/pickle-sessions/scripts/pickle-sessions search "dinner" --since 2
 
 ## Get it
 
-```sh
-# A disk image with OpenPickle.app (Apple Silicon):
-./crates/openpickle-desktop/macos/package.sh      # writes target/macos/OpenPickle-<version>-arm64.dmg
+Each draft release has three downloads:
 
-# Or run it from source:
+- `OpenPickle-<version>-arm64.dmg` for Apple Silicon Macs;
+- `OpenPickle-<version>-x86_64.dmg` for Intel Macs;
+- `OpenPickle-<version>-windows-x86_64.zip` for 64-bit Windows 10 and 11.
+
+On macOS, drag OpenPickle to Applications. The app is ad hoc signed and is not notarized. On its
+first launch, Control-click OpenPickle in Finder, choose **Open**, then confirm **Open**. If macOS
+still blocks it, use **System Settings > Privacy & Security > Open Anyway**.
+
+On Windows, extract the zip and run `OpenPickle.exe`. The app is not code-signed. If SmartScreen
+blocks it, choose **More info > Run anyway** after verifying that you trust the download.
+
+To build or run it from source:
+
+```sh
+# Build a DMG for this Mac, or pass aarch64-apple-darwin / x86_64-apple-darwin.
+./crates/openpickle-desktop/macos/package.sh
+
 cargo run --release -p openpickle-desktop
 ```
 
-The app is signed ad hoc, which is enough for the Mac that built it. Another Mac refuses it until
-it is signed with a Developer ID and notarized. Building needs a recent stable Rust (1.98 was
-used) and Xcode.
+Building needs a recent stable Rust (1.98 was used). macOS packaging also needs Xcode.
 
 ## Speed
 
@@ -140,7 +152,8 @@ The notes on the API (endpoints, phone sign-in, login sessions, the event stream
 ## Your data
 
 - The app stores a login session and a copy of your conversation under
-  `~/Library/Application Support/openpickle`, readable by you only. Signing out removes both.
+  `~/Library/Application Support/openpickle` on macOS, readable by you only, or
+  `%APPDATA%\openpickle` on Windows, inside your user profile. Signing out removes both.
 - The login session holds a single-use refresh token that changes on every refresh. Only one
   copy of the app may run, and the session file should not be copied to another tool.
 - Captures, exported messages and session files hold bearer tokens and personal data. In this
