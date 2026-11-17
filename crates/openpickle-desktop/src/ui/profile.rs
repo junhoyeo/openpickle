@@ -491,6 +491,7 @@ fn reset_ticket_card(tickets: &TicketCounts) -> Div {
             div()
                 .flex()
                 .items_center()
+                .gap(px(8.))
                 .child(label("Reset tickets"))
                 .child(div().flex_1())
                 .child(ticket_holding(theme::LINK, count_text(tickets.full)))
