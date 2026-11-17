@@ -7,6 +7,7 @@ pub mod friends;
 pub mod input;
 pub mod invite;
 pub mod login;
+pub mod phone;
 pub mod profile;
 pub mod rows;
 pub mod search;
@@ -32,7 +33,8 @@ actions!(
         OpenExplore,
         OpenFriends,
         OpenArchive,
-        OpenProfile
+        OpenProfile,
+        OpenPhoneCalls
     ]
 );
 
@@ -51,6 +53,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-3", OpenFriends, None),
         KeyBinding::new("cmd-4", OpenArchive, None),
         KeyBinding::new("cmd-5", OpenProfile, None),
+        KeyBinding::new("cmd-shift-p", OpenPhoneCalls, None),
     ]);
 }
 

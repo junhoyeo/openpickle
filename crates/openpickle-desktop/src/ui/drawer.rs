@@ -7,6 +7,7 @@ use gpui::{
 
 use crate::{
     model::RoomInfo,
+    phone::CallSummary,
     theme,
     ui::{Cancel, Pictures, Tab, chrome, face, icon},
 };
@@ -15,6 +16,8 @@ use crate::{
 pub enum DrawerEvent {
     Search,
     Friends,
+    PhoneCalls,
+    Phone(String),
     Open(Tab),
     /// Show this other chat room.
     Room(String),
@@ -26,6 +29,7 @@ pub struct DrawerView {
     selected: Tab,
     /// The other chat rooms, newest first.
     rooms: Vec<RoomInfo>,
+    calls: Vec<CallSummary>,
     pictures: Entity<Pictures>,
     _pictures: Subscription,
     /// Holds the keyboard while the menu is open, so that Escape closes it.
@@ -40,10 +44,16 @@ impl DrawerView {
         Self {
             selected,
             rooms: Vec::new(),
+            calls: Vec::new(),
             pictures,
             _pictures: changed,
             focus: cx.focus_handle(),
         }
+    }
+
+    pub fn set_calls(&mut self, calls: Vec<CallSummary>, cx: &mut Context<Self>) {
+        self.calls = calls;
+        cx.notify();
     }
 
     pub fn set_rooms(&mut self, rooms: Vec<RoomInfo>, cx: &mut Context<Self>) {
@@ -140,6 +150,7 @@ impl Render for DrawerView {
                 Some(DrawerEvent::Open(Tab::Chat)),
             ))
             .child(row("users-round", "Friends", Some(DrawerEvent::Friends)))
+            .child(row("phone", "Phone calls", Some(DrawerEvent::PhoneCalls)))
             .child(row(
                 "compass",
                 "Explore",
@@ -194,6 +205,54 @@ impl Render for DrawerView {
                         )
                 }))
             });
+        let panel = panel.when(!self.calls.is_empty(), |panel| {
+            panel
+                .child(
+                    div()
+                        .flex_none()
+                        .px(px(12.))
+                        .pt(px(18.))
+                        .pb(px(4.))
+                        .text_size(px(13.))
+                        .text_color(theme::color(theme::TEXT_FAINT))
+                        .child("Recent phone calls"),
+                )
+                .children(self.calls.iter().map(|call| {
+                    let call_id = call.id.clone();
+                    div()
+                        .id(SharedString::from(format!("call-{call_id}")))
+                        .flex_none()
+                        .min_h(px(50.))
+                        .px(px(14.))
+                        .py(px(8.))
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .rounded(px(17.))
+                        .cursor_pointer()
+                        .hover(|row| row.bg(theme::alpha(0xffffff, 0.05)))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(DrawerEvent::Phone(call_id.clone()))
+                        }))
+                        .child(icon("phone", 18., theme::TEXT_MUTED))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .child(div().truncate().child(call.title.clone()))
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(theme::color(theme::TEXT_FAINT))
+                                        .truncate()
+                                        .child(call.subtitle.clone()),
+                                ),
+                        )
+                }))
+        });
         // A press beside the panel closes it.
         div()
             .absolute()

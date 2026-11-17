@@ -43,6 +43,8 @@ pub enum ChatEvent {
     Invite,
     /// Another tab was chosen in the tab bar.
     Open(Tab),
+    /// Browse calls placed by Pickle. This is not a microphone or dial action.
+    PhoneCalls,
     /// A markdown link or a room/file card was activated.
     Link(String),
     /// Thumbnails for attachments newly shown in the conversation.
@@ -417,7 +419,10 @@ impl ChatView {
                     this.send(&input, cx);
                 }))
         } else {
-            action.child(icon("phone", 17., theme::CHROME))
+            action
+                .cursor_pointer()
+                .child(icon("phone", 17., theme::CHROME))
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(ChatEvent::PhoneCalls)))
         };
         let composer = chrome("composer")
             .w_full()

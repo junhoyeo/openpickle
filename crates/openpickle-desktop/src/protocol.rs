@@ -1,7 +1,9 @@
 //! What the UI and the backend say to each other. The backend owns the network and the disk and
 //! runs on its own thread; the UI only ever sees these messages.
 
+use crate::phone::CallSummary;
 use crate::profile::ProfileData;
+use openpickle_api::PhoneCallTranscript;
 use std::path::PathBuf;
 
 use crate::model::{Attachment, Explore, Message, RoomInfo, SearchResult, Social};
@@ -27,6 +29,14 @@ pub enum Command {
     LoadExplore,
     /// Load the account profile and read-only usage snapshot.
     LoadProfile,
+    /// List calls placed by Pickle; this does not start a call.
+    LoadPhoneCalls,
+    /// Resolve a captured subagent handoff path through the fresh authorized handoff list.
+    ResolvePhoneTask(String),
+    /// Open/refresh one transcript, or stop watching when None. Closing never hangs up.
+    WatchPhoneCall(Option<String>),
+    /// Explicitly confirmed request to end the currently watched live call.
+    EndPhoneCall { call_id: String, action_id: String },
     /// These offers were on screen.
     OffersShown(Vec<String>),
     /// List the pictures and files of the conversation, reading back to its first message.
@@ -91,6 +101,22 @@ pub enum Update {
     Explore(Result<Explore, String>),
     /// Cache-safe profile and usage fields, never the complete session response.
     Profile(Result<ProfileData, String>),
+    /// Phone-call summaries for the list and drawer.
+    PhoneCalls(Result<Vec<CallSummary>, String>),
+    PhoneTask {
+        path: String,
+        result: Result<String, String>,
+    },
+    /// A snapshot or failure of the requested call, never an unscoped update.
+    PhoneCall {
+        call_id: String,
+        result: Result<PhoneCallTranscript, String>,
+    },
+    /// The confirmed end request completed or failed.
+    PhoneCallEnded {
+        call_id: String,
+        result: Result<(), String>,
+    },
     /// Pictures that are on disk now, by their key.
     Pictures(Vec<(String, PathBuf)>),
     /// The chat rooms other than the character's, newest activity first.

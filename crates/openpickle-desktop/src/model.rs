@@ -170,6 +170,11 @@ pub enum Part {
     Request(Arc<Request>),
     /// A task the character started (a phone call, a purchase).
     Task(Arc<str>),
+    /// A subagent handoff whose call transcript can be resolved from the handoff list.
+    PhoneTask {
+        title: Arc<str>,
+        path: String,
+    },
     /// Pictures and files the message carries.
     Files(Arc<Files>),
     /// A link that opens another chat room.
@@ -223,6 +228,7 @@ impl Row {
             RowKind::Activity(_) => Vec::new(),
             RowKind::Part(Part::Bubble(text)) => vec![&text.text],
             RowKind::Part(Part::Task(title)) => vec![&**title],
+            RowKind::Part(Part::PhoneTask { title, .. }) => vec![&**title],
             RowKind::Part(Part::Card(card)) => {
                 let mut texts: Vec<&str> = card
                     .title

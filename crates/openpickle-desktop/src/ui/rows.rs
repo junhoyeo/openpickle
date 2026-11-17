@@ -118,6 +118,30 @@ pub fn render_row(cx: &RowContext) -> AnyElement {
                     })
                     .child(plain(title, cx))
                     .into_any_element(),
+                Part::PhoneTask { title, path } => {
+                    let target = format!("handoff:{path}");
+                    let on_link = cx.on_link.clone();
+                    let selection = cx.selection.clone();
+                    div()
+                        .id(("phone-task", cx.index))
+                        .px(px(14.))
+                        .py(px(11.))
+                        .max_w(relative(THEIRS_MAX))
+                        .rounded(theme::BUBBLE_RADIUS)
+                        .bg(theme::color(theme::SURFACE))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .cursor_pointer()
+                        .on_click(move |_, window, cx| {
+                            if selection.borrow().is_empty() {
+                                on_link(&target, window, cx);
+                            }
+                        })
+                        .child(super::icon("phone", 17., theme::TEXT_MUTED))
+                        .child(plain(title, cx))
+                        .into_any_element()
+                }
                 Part::Files(files) => {
                     let room = cx.content_width
                         * if row.side == Side::Mine {

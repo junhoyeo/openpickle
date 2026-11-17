@@ -1,3 +1,6 @@
+//! `phone-demo float` shows a synthetic live transcript and confirmation controls. It has no
+//! backend or action subscriber and cannot place or end a real call.
+//!
 //! Opens the chat screen with made-up messages that have the same structure as the Figma frames,
 //! to compare the two side by side: `cargo run -p openpickle-desktop --example gallery`.
 //! Pass `login` to see the sign-in screen instead, or `app` to run the whole window on these
@@ -35,6 +38,22 @@ fn person(name: &str, note: &str) -> Person {
         picture: String::new(),
         note: note.into(),
     }
+}
+
+/// Fake phone data used only by the offline native gallery.
+fn sample_phone_call(call_id: &str, live: bool) -> openpickle_api::PhoneCallTranscript {
+    serde_json::from_value(serde_json::json!({
+        "kind":"phone_call", "call_id":call_id, "title":"Library opening hours",
+        "subtitle_lead":"Pickle is speaking with ", "counterpart_label":"the library", "subtitle_tail":"",
+        "started_label":"Today", "live":live, "hangup_requested":false,
+        "footer":"Call in progress", "started_at_epoch_ms":chrono::Utc::now().timestamp_millis() as f64,
+        "lines":[
+            {"id":"l1","line_id":"1","speaker":"them","text":"Hello, how can I help?","joins_previous":false,"joins_next":false},
+            {"id":"l2","line_id":"2","speaker":"me","text":"Could you tell me your opening hours for Saturday?","joins_previous":false,"joins_next":false},
+            {"id":"l3","line_id":"3","speaker":"them","text":"We open at ten and close at six.","joins_previous":false,"joins_next":false},
+            {"id":"l4","line_id":"4","speaker":"me","text":"Thank you. Is the reading room open too?","joins_previous":false,"joins_next":false}
+        ]
+    })).unwrap()
 }
 
 /// Made-up profile values, never copied from an account or a capture.
@@ -403,6 +422,7 @@ fn main() {
     }
     let login = std::env::args().any(|arg| arg == "login");
     let whole_app = std::env::args().any(|arg| arg == "app");
+    let phone_demo = std::env::args().any(|arg| arg == "phone-demo");
     let float = std::env::args().any(|arg| arg == "float");
     let steps: Vec<String> = std::env::args().filter(|arg| arg.contains(':')).collect();
     let started = std::time::Instant::now();
@@ -414,6 +434,39 @@ fn main() {
             if login {
                 cx.open_window(ui::window_options(cx), |window, cx| {
                     let view = cx.new(LoginView::new);
+                    window.focus(&view.focus_handle(cx));
+                    view
+                })
+                .unwrap();
+            } else if phone_demo {
+                let options = if float {
+                    WindowOptions {
+                        kind: WindowKind::PopUp,
+                        focus: false,
+                        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                            point(px(1280.), px(140.)),
+                            size(px(440.), px(900.)),
+                        ))),
+                        ..Default::default()
+                    }
+                } else {
+                    ui::window_options(cx)
+                };
+                cx.open_window(options, |window, cx| {
+                    let view = cx.new(|cx| {
+                        ui::phone::PhoneView::new(
+                            ui::Identity::default(),
+                            Some("sample-call".into()),
+                            cx,
+                        )
+                    });
+                    view.update(cx, |view, cx| {
+                        view.set_call(
+                            "sample-call",
+                            Ok(sample_phone_call("sample-call", true)),
+                            cx,
+                        )
+                    });
                     window.focus(&view.focus_handle(cx));
                     view
                 })
@@ -440,6 +493,28 @@ fn main() {
                             },
                             Command::LoadSocial => Update::Social(Ok(sample_social())),
                             Command::LoadProfile => Update::Profile(Ok(sample_profile())),
+                            Command::ResolvePhoneTask(path) => Update::PhoneTask {
+                                path,
+                                result: Ok("sample-call".into()),
+                            },
+                            Command::LoadPhoneCalls => Update::PhoneCalls(Ok(vec![
+                                openpickle_desktop::phone::CallSummary {
+                                    id: "sample-call".into(),
+                                    title: "Library opening hours".into(),
+                                    subtitle: "Pickle's phone call".into(),
+                                    state: "running".into(),
+                                    at: "Today".into(),
+                                },
+                            ])),
+                            Command::WatchPhoneCall(Some(call_id)) => Update::PhoneCall {
+                                result: Ok(sample_phone_call(&call_id, true)),
+                                call_id,
+                            },
+                            Command::WatchPhoneCall(None) => continue,
+                            Command::EndPhoneCall { call_id, .. } => Update::PhoneCallEnded {
+                                call_id,
+                                result: Ok(()),
+                            },
                             Command::LoadExplore => Update::Explore(Ok(sample_explore())),
                             Command::LoadArchive => Update::Archive {
                                 room_id: "primary".into(),
