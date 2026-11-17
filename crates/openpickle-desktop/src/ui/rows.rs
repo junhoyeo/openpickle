@@ -113,23 +113,22 @@ pub fn render_row(cx: &RowContext) -> AnyElement {
                 Side::Mine => line.justify_end(),
                 Side::Theirs => line.justify_start(),
             };
-            let surface = shaped(row, matches!(part, Part::Bubble(_) | Part::Task(_)));
+            // A task is a phone card only once it is known to have a call. Until then, and for
+            // every task that is not a call, it is the note of a started task.
+            let call = match part {
+                Part::PhoneTask { path, .. } => cx.phone_cards.and_then(|cards| cards.get(path)),
+                _ => None,
+            };
+            let is_note = matches!(part, Part::Task(_))
+                || (matches!(part, Part::PhoneTask { .. }) && call.is_none());
+            let surface = shaped(row, matches!(part, Part::Bubble(_)) || is_note);
             let content: AnyElement = match part {
-                Part::PhoneTask { title, path } => phone_card(surface, title, path, cx),
+                Part::PhoneTask { title, path } => match call {
+                    Some(call) => phone_card(surface, call, path, cx),
+                    None => task_note(surface, title, cx),
+                },
                 Part::Bubble(rich) => bubble(surface, rich, cx).into_any_element(),
-                // A note, not speech: a started task, attachments, a failed send.
-                Part::Task(title) => surface
-                    .px(px(14.))
-                    .py(px(11.))
-                    .max_w(relative(THEIRS_MAX))
-                    .when(row.side == Side::Theirs, |note| {
-                        note.text_color(theme::color(theme::TEXT_MUTED))
-                    })
-                    .when(row.side == Side::Mine, |note| {
-                        note.text_color(theme::alpha(theme::ON_MINE, 0.6))
-                    })
-                    .child(plain(title, cx))
-                    .into_any_element(),
+                Part::Task(title) => task_note(surface, title, cx),
                 Part::Files(files) => {
                     let room = cx.content_width
                         * if row.side == Side::Mine {
@@ -338,22 +337,31 @@ const CARD_TEXT_SCALE: f32 = 0.742;
 /// A card shows the end of the call: no more lines than can fill its window.
 const CARD_TRANSCRIPT_LINES: usize = 6;
 
+/// A note, not speech: a task the character started, a failed send.
+fn task_note(surface: Div, title: &str, cx: &RowContext) -> AnyElement {
+    surface
+        .px(px(14.))
+        .py(px(11.))
+        .max_w(relative(THEIRS_MAX))
+        .when(cx.row.side == Side::Theirs, |note| {
+            note.text_color(theme::color(theme::TEXT_MUTED))
+        })
+        .when(cx.row.side == Side::Mine, |note| {
+            note.text_color(theme::alpha(theme::ON_MINE, 0.6))
+        })
+        .child(plain(title, cx))
+        .into_any_element()
+}
+
 /// A call Pickle placed: its name, the other side and how long it lasted, over the end of its
-/// transcript. Until the call has been read the card has the task's title alone.
-fn phone_card(surface: Div, title: &str, path: &str, cx: &RowContext) -> AnyElement {
-    let call = cx.phone_cards.and_then(|cards| cards.get(path));
+/// transcript.
+fn phone_card(surface: Div, call: &PhoneCallTranscript, path: &str, cx: &RowContext) -> AnyElement {
     let target = format!("handoff:{path}");
     let on_link = cx.on_link.clone();
     let selection = cx.selection.clone();
-    // The task is titled "📞 name"; the card has its own phone icon.
-    let name = call.map_or_else(
-        || title.trim_start_matches('📞').trim_start().to_owned(),
-        |call| call.title.clone(),
-    );
-    let counterpart = call
-        .map(|call| call.counterpart_label.clone())
-        .filter(|label| !label.is_empty());
-    let duration = call.and_then(|call| phone::duration_label(call, phone::now_ms()));
+    let name = call.title.clone();
+    let counterpart = Some(call.counterpart_label.clone()).filter(|label| !label.is_empty());
+    let duration = phone::duration_label(call, phone::now_ms());
 
     let header = div()
         .w_full()
@@ -412,13 +420,10 @@ fn phone_card(surface: Div, title: &str, path: &str, cx: &RowContext) -> AnyElem
                 .child(duration)
         }));
 
-    let lines = call.map(|call| {
-        let from = call.lines.len().saturating_sub(CARD_TRANSCRIPT_LINES);
-        &call.lines[from..]
-    });
+    let lines = &call.lines[call.lines.len().saturating_sub(CARD_TRANSCRIPT_LINES)..];
     // The window on the transcript: its last lines stand at the bottom, the ones before them
     // run out under the top, where the page fades in over them.
-    let transcript = lines.filter(|lines| !lines.is_empty()).map(|lines| {
+    let transcript = (!lines.is_empty()).then(|| {
         div()
             .relative()
             .mx(px(4.))

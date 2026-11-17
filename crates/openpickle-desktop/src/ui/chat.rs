@@ -941,6 +941,10 @@ mod tests {
         view.update(cx, |view, cx| view.set_rows(rows(), cx));
         cx.run_until_parked();
         assert_eq!(*events.borrow(), ["load handoffs/sample-task"]);
+        // Until a call is known the task is a note like any other task: a click opens nothing.
+        let note = point(px(60.), HEIGHT - theme::BOTTOM_BAR_HEIGHT - px(35.));
+        cx.simulate_click(note, Modifiers::none());
+        assert_eq!(events.borrow().len(), 1);
 
         // The call arrives, a newer reading of it follows, and the card is drawn again.
         let call = |live: bool| -> PhoneCallTranscript {
