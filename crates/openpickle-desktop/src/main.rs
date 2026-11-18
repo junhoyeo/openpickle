@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use gpui::{App, AppContext, Application, KeyBinding, Menu, MenuItem, actions};
 use openpickle_desktop::{app::Shell, assets::Assets, backend, ui};
 
@@ -24,7 +26,7 @@ fn main() {
         .with_assets(Assets)
         .run(move |cx: &mut App| {
             ui::bind_keys(cx);
-            cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+            cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
             cx.on_action(|_: &Quit, cx| cx.quit());
             // Runs on every way out: the menu, the last window closing, the Dock, logging out.
             cx.on_app_quit(move |_| {

@@ -1,8 +1,11 @@
 #!/bin/bash
 # Builds OpenPickle.app and a disk image of it into target/macos/.
 #
-# The app is signed ad hoc, which is enough to run it on the Mac that built it. Another Mac
-# refuses it until it is signed with a Developer ID and notarized.
+# Pass a Rust target (aarch64-apple-darwin or x86_64-apple-darwin) to cross-build it.
+# Without an argument, the host target is used.
+#
+# The app is signed ad hoc. Another Mac may require an explicit first-launch approval because
+# the app is not signed with a Developer ID or notarized.
 set -euo pipefail
 
 cd "$(dirname "$0")/../../.."
@@ -10,13 +13,34 @@ macos=crates/openpickle-desktop/macos
 version=$(cargo pkgid -p openpickle-desktop | sed 's/.*[#@]//')
 out=target/macos
 app=$out/OpenPickle.app
-image=$out/OpenPickle-$version-$(uname -m).dmg
 
-cargo build --release -p openpickle-desktop
+target=${1:-}
+if [[ -z "$target" ]]; then
+    target=$(rustc -vV | sed -n 's/^host: //p')
+    build_target=()
+    binary=target/release/openpickle
+else
+    build_target=(--target "$target")
+    binary=target/$target/release/openpickle
+fi
 
-rm -rf "$out"
+case "$target" in
+    aarch64-apple-darwin) arch=arm64 ;;
+    x86_64-apple-darwin) arch=x86_64 ;;
+    *)
+        echo "unsupported macOS Rust target: $target" >&2
+        exit 2
+        ;;
+esac
+image=$out/OpenPickle-$version-$arch.dmg
+
+# macOS ships bash 3.2, where expanding an empty array is an error under `set -u`.
+cargo build --locked --release -p openpickle-desktop ${build_target[@]+"${build_target[@]}"}
+
+# Keep images made for another architecture when this script is invoked twice in one job.
+rm -rf "$app" "$out/AppIcon.iconset" "$out/image"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp target/release/openpickle "$app/Contents/MacOS/openpickle"
+cp "$binary" "$app/Contents/MacOS/openpickle"
 sed "s/__VERSION__/$version/g" "$macos/Info.plist" > "$app/Contents/Info.plist"
 
 # macOS wants the icon in ten sizes; all come from the one 1024 px picture.

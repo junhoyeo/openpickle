@@ -1,0 +1,4 @@
+# The Windows program carries the C runtime in itself. Linked the default way it asks for
+# VCRUNTIME140.dll, which Windows does not have until some other program installs it.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

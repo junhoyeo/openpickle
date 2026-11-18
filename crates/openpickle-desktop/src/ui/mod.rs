@@ -18,7 +18,7 @@ pub mod wrap;
 use gpui::{
     App, Bounds, ClickEvent, Div, FontWeight, ImageSource, KeyBinding, ObjectFit, Pixels,
     SharedString, Stateful, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
-    img, linear_color_stop, linear_gradient, point, prelude::*, px, size, svg,
+    img, linear_color_stop, linear_gradient, prelude::*, px, size, svg,
 };
 
 use crate::theme;
@@ -39,27 +39,29 @@ actions!(
     ]
 );
 
-/// Binds the keys of the text field and of the screens.
+/// Binds the keys of the text field and of the screens. `secondary` is the Command key on a
+/// Mac and the Control key elsewhere, so Copy is Cmd-C there and Ctrl-C on Windows.
 pub fn bind_keys(cx: &mut App) {
     input::bind_keys(cx);
     cx.bind_keys([
-        KeyBinding::new("cmd-c", input::Copy, Some("Chat")),
-        KeyBinding::new("cmd-a", input::SelectAll, Some("Chat")),
-        KeyBinding::new("cmd-c", input::Copy, Some("Phone")),
-        KeyBinding::new("cmd-f", Find, None),
+        KeyBinding::new("secondary-c", input::Copy, Some("Chat")),
+        KeyBinding::new("secondary-a", input::SelectAll, Some("Chat")),
+        KeyBinding::new("secondary-c", input::Copy, Some("Phone")),
+        KeyBinding::new("secondary-f", Find, None),
         KeyBinding::new("escape", Cancel, None),
         KeyBinding::new("up", Previous, None),
         KeyBinding::new("down", Next, None),
-        KeyBinding::new("cmd-1", OpenChat, None),
-        KeyBinding::new("cmd-2", OpenExplore, None),
-        KeyBinding::new("cmd-3", OpenFriends, None),
-        KeyBinding::new("cmd-4", OpenArchive, None),
-        KeyBinding::new("cmd-5", OpenProfile, None),
-        KeyBinding::new("cmd-shift-p", OpenPhoneCalls, None),
+        KeyBinding::new("secondary-1", OpenChat, None),
+        KeyBinding::new("secondary-2", OpenExplore, None),
+        KeyBinding::new("secondary-3", OpenFriends, None),
+        KeyBinding::new("secondary-4", OpenArchive, None),
+        KeyBinding::new("secondary-5", OpenProfile, None),
+        KeyBinding::new("secondary-shift-p", OpenPhoneCalls, None),
     ]);
 }
 
-/// A window the size of the design frame, with the traffic lights drawn over the content.
+/// A window the size of the design frame. macOS draws its traffic lights over the content;
+/// other platforms keep their native title bar so its window controls remain reachable.
 pub fn window_options(cx: &App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -68,12 +70,26 @@ pub fn window_options(cx: &App) -> WindowOptions {
             cx,
         ))),
         window_min_size: Some(size(px(380.), px(560.))),
-        titlebar: Some(TitlebarOptions {
-            title: Some("Pickle".into()),
-            appears_transparent: true,
-            traffic_light_position: Some(point(px(16.), px(16.))),
-        }),
+        titlebar: Some(titlebar_options()),
         ..Default::default()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn titlebar_options() -> TitlebarOptions {
+    TitlebarOptions {
+        title: Some("Pickle".into()),
+        appears_transparent: true,
+        traffic_light_position: Some(gpui::point(px(16.), px(16.))),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn titlebar_options() -> TitlebarOptions {
+    TitlebarOptions {
+        title: Some("Pickle".into()),
+        appears_transparent: false,
+        traffic_light_position: None,
     }
 }
 

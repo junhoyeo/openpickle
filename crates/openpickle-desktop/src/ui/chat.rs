@@ -767,18 +767,18 @@ mod tests {
         cx.simulate_mouse_move(from, MouseButton::Left, Modifiers::none());
         cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::none());
         cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
-        cx.simulate_keystrokes("cmd-c");
+        cx.simulate_keystrokes("secondary-c");
         assert_eq!(copied(cx).as_deref(), Some("첫 번째 말\n가운데\n마지막 말"));
 
         // Moving the pointer after the release changes nothing.
         cx.simulate_mouse_move(from, None, Modifiers::none());
-        cx.simulate_keystrokes("cmd-c");
+        cx.simulate_keystrokes("secondary-c");
         assert_eq!(copied(cx).as_deref(), Some("첫 번째 말\n가운데\n마지막 말"));
 
         // A press on empty space drops the selection, so there is nothing to copy.
         cx.write_to_clipboard(ClipboardItem::new_string("before".into()));
         cx.simulate_click(from, Modifiers::none());
-        cx.simulate_keystrokes("cmd-c");
+        cx.simulate_keystrokes("secondary-c");
         assert_eq!(copied(cx).as_deref(), Some("before"));
 
         // A press on the header is not a press in the conversation, so a drag from it
@@ -787,7 +787,7 @@ mod tests {
         cx.simulate_mouse_down(header, MouseButton::Left, Modifiers::none());
         cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::none());
         cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
-        cx.simulate_keystrokes("cmd-c");
+        cx.simulate_keystrokes("secondary-c");
         assert_eq!(copied(cx).as_deref(), Some("before"));
     }
 
@@ -827,12 +827,12 @@ mod tests {
         let (_, cx) = open(cx, &texts);
 
         // The composer is empty, so Select All means the conversation.
-        cx.simulate_keystrokes("cmd-a cmd-c");
+        cx.simulate_keystrokes("secondary-a secondary-c");
         assert_eq!(copied(cx), Some(texts.join("\n")));
 
         // With text in the composer it means that text, and the conversation lets go of its own.
         cx.simulate_input("hello");
-        cx.simulate_keystrokes("cmd-a cmd-c");
+        cx.simulate_keystrokes("secondary-a secondary-c");
         assert_eq!(copied(cx).as_deref(), Some("hello"));
     }
 
@@ -902,7 +902,7 @@ mod tests {
             *links.borrow(),
             ["attachment:attachments/2026-01-01/report.pdf"]
         );
-        cx.simulate_keystrokes("cmd-a cmd-c");
+        cx.simulate_keystrokes("secondary-a secondary-c");
         assert_eq!(
             copied(cx).as_deref(),
             Some("Sample report.pdf\nPDF · 4 pages")
@@ -926,7 +926,7 @@ mod tests {
                 .unwrap()
                 .starts_with("pickle://chat?room_id=")
         );
-        cx.simulate_keystrokes("cmd-a cmd-c");
+        cx.simulate_keystrokes("secondary-a secondary-c");
         assert_eq!(copied(cx).as_deref(), Some("Sample room"));
     }
 
