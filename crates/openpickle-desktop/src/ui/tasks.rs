@@ -360,7 +360,7 @@ impl TaskView {
                             div()
                                 .flex_1()
                                 .text_size(px(TEXT))
-                                .text_color(theme::alpha(theme::TEXT, 0.8))
+                                .opacity(0.8)
                                 .whitespace_nowrap()
                                 .child(fit(
                                     self.title(),
@@ -533,7 +533,8 @@ fn log_node(
                 .pb(px(if last { 2. } else { 16.5 }))
                 .text_size(px(TEXT))
                 .line_height(px(TEXT_LINE))
-                .text_color(theme::alpha(theme::TEXT, if report { 0.9 } else { 0.45 }))
+                // Opacity, not a paler color: an emoji in the text is dimmed with it.
+                .opacity(if report { 0.9 } else { 0.45 })
                 .whitespace_nowrap()
                 .child(keep_paths(text, px(TEXT), room, window)),
         );

@@ -242,7 +242,7 @@ fn tab_header_with_task(
                     .text_size(px(TASK_TITLE))
                     .line_height(px(18.))
                     .font_weight(FontWeight::NORMAL)
-                    .text_color(theme::alpha(theme::TEXT, 0.4))
+                    .opacity(0.4)
                     .child(task),
             ),
     };
