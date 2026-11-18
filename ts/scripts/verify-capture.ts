@@ -63,6 +63,7 @@ const routes: [method: string, path: RegExp, call: Call][] = [
   ["POST", /^\/api\/actions$/, (c, _f, j) =>
     c.endPhoneCall(j.payload.call_id, { actionId: j.action_id, inCall: j.in_call })],
   ["GET", /^\/api\/attachments\/(.+)\/thumbnail$/, (c, _f, _j, [path]) => c.getAttachmentThumbnail(path!)],
+  ["GET", /^\/api\/attachments\/(.+)$/, (c, _f, _j, [path]) => c.getAttachment(path!)],
   ["GET", /^\/api\/character$/, (c) => c.getCharacter()],
   ["GET", /^\/api\/profile$/, (c, f) => c.getProfile(new URLSearchParams(f.query).get("region")!)],
   ["GET", /^\/api\/social\/snapshot$/, (c, f) =>
@@ -197,7 +198,8 @@ for (const flow of flows) {
     .replace(/\/rooms\/[^/]+/, "/rooms/{room}")
     .replace(/\/phone-calls\/[^/]+/, "/phone-calls/{call_id}")
     .replace(/\/nodes\/[^/]{43}/, "/nodes/{node}")
-    .replace(/^\/api\/attachments\/.+\/thumbnail$/, "/api/attachments/{path}/thumbnail")}`;
+    .replace(/^\/api\/attachments\/.+\/thumbnail$/, "/api/attachments/{path}/thumbnail")
+    .replace(/^\/api\/attachments\/(?!\{path\}).+$/, "/api/attachments/{path}")}`;
   if (!route) {
     uncovered.set(label, (uncovered.get(label) ?? 0) + 1);
     continue;

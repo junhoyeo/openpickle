@@ -383,6 +383,20 @@ export class PickleClient {
     };
   }
 
+  /**
+   * `GET /api/attachments/{path}`: the attachment itself, the file as it was sent or as the
+   * character made it. `path` is the one its thumbnail is asked for with, and the app sends the
+   * same headers. The response names the file in `Content-Disposition`.
+   */
+  async getAttachment(path: string): Promise<{ bytes: Uint8Array; contentType: string }> {
+    const encoded = path.split("/").map(encodeURIComponent).join("/");
+    const response = await this.send("GET", `/api/attachments/${encoded}`, { auth: "token" });
+    return {
+      bytes: new Uint8Array(await response.arrayBuffer()),
+      contentType: response.headers.get("content-type") ?? "",
+    };
+  }
+
   // ---- Profile, character and social ----
 
   /** `GET /api/character`: your character's look, level, energy and jelly. */

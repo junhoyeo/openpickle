@@ -29,6 +29,10 @@ const BLOCKING_PARSE_THRESHOLD: usize = 256 * 1024;
 /// How long a request and its response may take together. The event stream is exempt.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the download of an attachment may take. A video of some hundred megabytes on a
+/// slow line needs minutes, where the 30 seconds of a call would cut it off.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// A refresh gets longer. Giving up on one that the server has already processed loses the new
 /// token, and with it the login session, so a slow answer is worth waiting for.
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(120);
@@ -558,10 +562,25 @@ impl PickleClient {
     /// `GET /api/attachments/{path}/thumbnail`: a JPEG of a message's attachment, a picture or
     /// a document's first page. `path` is as messages name it: `attachments/<day>/<file>`.
     pub async fn get_attachment_thumbnail(&self, path: &str) -> Result<bytes::Bytes> {
-        let encoded: Vec<String> = path.split('/').map(encode_component).collect();
-        let path = format!("/api/attachments/{}/thumbnail", encoded.join("/"));
+        let path = format!("{}/thumbnail", attachment_path(path));
         let options = RequestOptions::default().auth(Auth::BearerOnly);
         let response = self.send(Method::GET, &path, options).await?;
+        Ok(response.bytes().await?)
+    }
+
+    /// `GET /api/attachments/{path}`: the attachment itself, the file as it was sent or as the
+    /// character made it. `path` is as messages name it and ends in the file's name. A file
+    /// may be large, so the exchange gets more time than a call.
+    pub async fn get_attachment(&self, path: &str) -> Result<bytes::Bytes> {
+        let options = RequestOptions::default().auth(Auth::BearerOnly);
+        let response = self
+            .dispatch(
+                Method::GET,
+                &attachment_path(path),
+                options,
+                Some(DOWNLOAD_TIMEOUT),
+            )
+            .await?;
         Ok(response.bytes().await?)
     }
 
@@ -1164,6 +1183,13 @@ fn bearer_value(token: &str) -> Result<HeaderValue> {
 }
 
 /// `encodeURIComponent`: everything but `A-Z a-z 0-9 - _ . ! ~ * ' ( )` is percent-encoded.
+/// The request path of an attachment. Each part of the attachment's own path is encoded by
+/// itself; the slashes between them stay.
+fn attachment_path(path: &str) -> String {
+    let encoded: Vec<String> = path.split('/').map(encode_component).collect();
+    format!("/api/attachments/{}", encoded.join("/"))
+}
+
 fn encode_component(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     encode_into(&mut out, value, false);

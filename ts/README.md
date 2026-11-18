@@ -106,6 +106,7 @@ All of these were in the captures. `scripts/verify-capture.ts` checks each one a
 | GET | `/api/rooms/{room}/history/delta?after_seq=&limit=` | `getHistoryDelta(room, { afterSeq, limit })`, `history(room)` | Messages, reactions and card states after a sequence number, up to 500 per page. `history()` pages from the start. |
 | GET | `/api/rooms/{room}/history/page?limit=&before_seq=` | `getHistoryPage(room, { beforeSeq, limit })` | Up to 250 messages before a sequence number, with reactions and card states. See [History pages and attachments](#history-pages-and-attachments). |
 | GET | `/api/attachments/{path}/thumbnail` | `getAttachmentThumbnail(path)` | A JPEG preview of a photo or PDF in a message. Returns `{ bytes, contentType }`. |
+| GET | `/api/attachments/{path}` | `getAttachment(path)` | The attachment itself, the original file. Returns `{ bytes, contentType }`. |
 | POST | `/api/rooms/{room}/messages` | `sendMessage(room, text, { clientMsgId?, inCall?, context? })` | Returns `{ status, responder, seq: null }`. The reply arrives on `events()`. `context` marks a message sent from an [Explore](#explore) offer. |
 | PUT | `/api/rooms/{room}/read` | `markRead(room, seq)` | Moves this device's read cursor. |
 | GET | `/api/phone-calls/{call_id}` | `getPhoneCall(callId)` | Current call state and transcript. The id is encoded as one path segment. |
@@ -345,8 +346,13 @@ Korean file names, two of them with spaces. Across the pages, 7 messages had `at
 `file_meta` and `inline_files` with PDF, spreadsheet and text files.
 
 What it did not show: a thumbnail of a spreadsheet or text file, a thumbnail request that failed,
-the full-size attachment, a `limit` other than 250, and paging in a room other than your
-character's.
+a `limit` other than 250, and paging in a room other than your character's.
+
+`getAttachment(path)` calls `GET /api/attachments/{path}`, the same path without `/thumbnail`
+and with the same headers, and returns the file itself. A later capture showed it once, when a
+PDF was opened in the app: `200 application/pdf` with `Content-Length`, `Accept-Ranges: bytes`
+and `Content-Disposition: attachment; filename="…"`. Not seen: a file of another type, a range
+request, and a file large enough to need one.
 
 ## Events
 
@@ -390,6 +396,7 @@ bun src/cli.ts search 점심         # one result per line: seq, date, label, sn
 bun src/cli.ts explore travel       # Explore offers by section: title, call to action, how many asked
 bun src/cli.ts attachments character  # photos and files, newest first: date, kind, name, size, path
 bun src/cli.ts thumbnail "attachments/2026-01-02/scan 1.pdf" scan.jpg  # JPEG thumbnail of one
+bun src/cli.ts download "attachments/2026-01-02/scan 1.pdf" scan.pdf   # the file itself
 bun src/cli.ts export ./messages    # full history of every room, one JSON file per room
 bun src/cli.ts events               # one JSON object per line
 bun src/cli.ts screen handoffs

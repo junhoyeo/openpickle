@@ -316,3 +316,20 @@ test("getAttachmentThumbnail encodes each path segment and returns the JPEG", as
   expect((calls[0]!.init.headers as Record<string, string>).Authorization).toBe("Bearer t");
   expect(thumbnail).toEqual({ bytes: jpeg, contentType: "image/jpeg" });
 });
+
+test("getAttachment asks for the file itself, by the same path without a suffix", async () => {
+  const pdf = new TextEncoder().encode("%PDF-1.7 made-up bytes");
+  const calls: { url: string; init: RequestInit }[] = [];
+  const fetch = (async (url: string, init: RequestInit) => {
+    calls.push({ url, init });
+    return new Response(pdf, { headers: { "content-type": "application/pdf" } });
+  }) as unknown as typeof globalThis.fetch;
+  const pickle = new PickleClient({ accessToken: "t", fetch });
+  const file = await pickle.getAttachment("attachments/2026-01-02/여행 계획 v2.pdf");
+  expect(calls[0]!.url).toBe(
+    `${pickle.baseUrl}/api/attachments/attachments/2026-01-02/%EC%97%AC%ED%96%89%20%EA%B3%84%ED%9A%8D%20v2.pdf`,
+  );
+  expect(Object.keys(calls[0]!.init.headers as Record<string, string>)).not.toContain("X-Client-Version");
+  expect((calls[0]!.init.headers as Record<string, string>).Authorization).toBe("Bearer t");
+  expect(file).toEqual({ bytes: pdf, contentType: "application/pdf" });
+});
