@@ -1365,8 +1365,14 @@ impl Live {
                 Ok(_) if !account_active.load(Ordering::Acquire) => {
                     Err("The account was signed out before the download finished.".to_owned())
                 }
-                Ok(bytes) => save_download(&folder, &name, &bytes)
-                    .map_err(|error| format!("Could not save the file: {error}")),
+                // Writing a large file takes its time too, and the backend has one thread: the
+                // write goes to a thread of its own.
+                Ok(bytes) => {
+                    tokio::task::spawn_blocking(move || save_download(&folder, &name, &bytes))
+                        .await
+                        .unwrap_or_else(|stopped| Err(std::io::Error::other(stopped)))
+                        .map_err(|error| format!("Could not save the file: {error}"))
+                }
                 Err(error) => Err(explain(&error)),
             };
             updates
