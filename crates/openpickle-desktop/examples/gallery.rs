@@ -15,7 +15,7 @@
 //! window as a PNG, which needs no Screen Recording permission. `float` keeps the window above
 //! the others and leaves the keyboard focus where it is. For example:
 //!
-//!     gallery app float key:cmd-f type:취소표 wait:600 key:down key:enter shot:/tmp/found.png
+//!     gallery app float key:cmd-f type:빈자리 wait:600 key:down key:enter shot:/tmp/found.png
 
 use std::sync::Arc;
 
@@ -332,8 +332,8 @@ fn sample_explore() -> Explore {
             "travel",
             "travel",
             "ticket",
-            "취소표가 나오면 바로 잡아 드릴게요.",
-            "취소표 잡아줘",
+            "기차표 예매를 대신 해 드릴게요.",
+            "기차표 예매해줘",
         ),
         offer(
             "t2",
@@ -569,19 +569,19 @@ fn main() {
             1,
             200.,
             Side::Mine,
-            "내일 전시 취소표 나오면 바로 잡아줘. 그리고 그 회사 사업자 정보도 확인해줘",
+            "토요일 도예 수업 빈자리 나오면 신청해 줘. 그리고 그 공방 안내도 좀 찾아줘",
         ),
         message(
             2,
             199.,
             Side::Theirs,
-            "<bubble>네! 링크 바로 확인해서 깔끔하게 정리해 드릴게요!</bubble>\n<bubble>취소표는 촉박한 날짜를 피해서, **오늘 기준 최소 일주일 뒤** 관람분부터 낚아채도록 감시 조건 바로 수정해 뒀어요!\n\n대량 오픈런은 취소표와 달리 날짜 상관없이 원래대로 10분 전 대기 유지할게요. (혹시 오픈런 작업 자체를 아예 빼라는 뜻이었다면 바로 지워드릴게요!)</bubble>\n```card\n## 🏢 샘플 투자조합\n### 사업자등록정보 조회\n- **상호** 샘플 투자조합\n- **대표자** (주)샘플인베스트먼트\n- **사업자번호** 000-00-00000\n- **사업장 주소** 서울특별시 중구 세종대로 110\n- **과세유형** 고유번호가 부여된 단체 (세금계산서 발행 불가)\n- **사업유형** 기타 개인 (업력 1개월)\n- **납세자 상태** 계속사업자\n\n[조회 페이지 열기](https://example.com/business)\n```\n<bubble>인원 정보나 매출·영업이익 같은 재무제표는 아직 등록된 내역이 없는 신규 결성 조합이에요.</bubble>",
+            "<bubble>네! 공방 안내부터 찾아서 보기 좋게 정리해 드릴게요!</bubble>\n<bubble>수업은 이번 주는 건너뛰고, **다음 주 토요일 오전반**부터 빈자리가 나면 바로 신청하도록 맞춰 뒀어요!\n\n평일 저녁반은 따로 말씀이 없으셔서 지금처럼 알림만 켜 둘게요. (평일반은 아예 빼 달라는 뜻이었다면 바로 지워 드릴게요!)</bubble>\n```card\n## 🏺 샘플 도예 공방\n### 공방 안내\n- **이름** 샘플 도예 공방\n- **운영** 샘플 공방 협동조합\n- **문의** 02-000-0000\n- **주소** 서울특별시 중구 세종대로 110\n- **수업** 물레 체험과 손빚기 (한 번에 2시간)\n- **정원** 반마다 6명\n- **쉬는 날** 매주 월요일\n\n[안내 페이지 열기](https://example.com/studio)\n```\n<bubble>수강료와 재료비는 안내 페이지에 아직 올라와 있지 않아요. 올라오면 다시 알려 드릴게요.</bubble>",
         ),
         message(
             3,
             30.,
             Side::Theirs,
-            "<bubble>내일 오전 10시 《샘플 콘서트》 취소표 1매 잡았어요!\n\n휴대폰으로 방금 도착한 인증번호 4자리만 적어주시면 바로 확정할게요.</bubble>",
+            "<bubble>다음 주 토요일 오전 10시 《샘플 물레 체험》 한 자리 맡아 뒀어요!\n\n문자로 방금 온 확인 번호 4자리만 알려 주시면 바로 확정할게요.</bubble>",
         ),
     ];
     messages.push(Message {
@@ -596,14 +596,14 @@ fn main() {
             status: RequestStatus::Expired,
         }))],
     });
-    messages.push(message(5, 20., Side::Theirs, "<bubble>방금 건은 시간이 지나서 다시 매진으로 넘어갔어요! 취소표 감시는 계속 돌려둘게요.</bubble>"));
+    messages.push(message(5, 20., Side::Theirs, "<bubble>확인 시간이 지나서 그 자리는 다시 풀렸어요! 빈자리 알림은 계속 켜 둘게요.</bubble>"));
     messages.push(message(
         6,
         10.,
         Side::Mine,
         "The code card expired. Can you send a new code?",
     ));
-    messages.push(message(7, 9., Side::Theirs, "<bubble>지금 자리 남아있는지 바로 확인해 볼게요!</bubble>\n<bubble>공식 웹사이트 (프로그램 상세)\nhttps://example.com/\n\n직접 둘러보셔도 되고, 폼 입력 귀찮으시면 언제든 말씀해 주세요.</bubble>"));
+    messages.push(message(7, 9., Side::Theirs, "<bubble>남은 자리가 있는지 지금 다시 볼게요!</bubble>\n<bubble>공방 홈페이지 (수업 안내)\nhttps://example.com/\n\n직접 살펴보셔도 되고, 신청서 쓰기 번거로우시면 언제든 말씀해 주세요.</bubble>"));
     messages.push(message(8, 1., Side::Mine, "링크 부탁해"));
 
     if std::env::args().any(|arg| arg == "links") {
