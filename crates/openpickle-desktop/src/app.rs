@@ -220,7 +220,7 @@ impl Shell {
                     self.messages = self.pending.remove(&room_id).unwrap_or_default();
                     self.search = None;
                     self._search_events = None;
-                    self.over = None;
+                    self.set_over(None);
                     self._over_events = None;
                     if let Some(archive) = &self.archive {
                         archive.update(cx, |archive, cx| {
@@ -565,9 +565,6 @@ impl Shell {
         if !matches!(self.screen, Screen::Chat(_)) {
             return;
         }
-        if matches!(self.over, Some(Over::Phone(_))) {
-            self.commands.send(Command::WatchPhoneCall(None)).ok();
-        }
         match tab {
             Tab::Chat => {}
             Tab::Explore => {
@@ -715,12 +712,18 @@ impl Shell {
         }
     }
 
-    /// Closes what is open on top and gives the keyboard back to the section.
-    fn close_over(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Puts a view over the screen, or with `None` takes down the one that is there. The
+    /// backend stops reading for the view that goes: a call's transcript.
+    fn set_over(&mut self, over: Option<Over>) {
         if matches!(self.over, Some(Over::Phone(_))) {
             self.commands.send(Command::WatchPhoneCall(None)).ok();
         }
-        self.over = None;
+        self.over = over;
+    }
+
+    /// Closes what is open on top and gives the keyboard back to the section.
+    fn close_over(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_over(None);
         self.pending_phone_task = None;
         self._over_events = None;
         let Screen::Chat(chat) = &self.screen else {
@@ -771,7 +774,7 @@ impl Shell {
             }),
         );
         window.focus(&drawer.focus_handle(cx));
-        self.over = Some(Over::Drawer(drawer));
+        self.set_over(Some(Over::Drawer(drawer)));
         self.commands.send(Command::LoadPhoneCalls).ok();
         self.report_reading(window);
         cx.notify();
@@ -806,9 +809,6 @@ impl Shell {
 
     fn open_phone(&mut self, call_id: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         self.pending_phone_task = None;
-        if matches!(self.over, Some(Over::Phone(_))) {
-            self.commands.send(Command::WatchPhoneCall(None)).ok();
-        }
         let identity = self.identity.clone();
         let initial_call = call_id.clone();
         let view = cx.new(|cx| PhoneView::new(identity, initial_call, cx));
@@ -849,7 +849,7 @@ impl Shell {
                 }),
             );
         window.focus(&view.focus_handle(cx));
-        self.over = Some(Over::Phone(view));
+        self.set_over(Some(Over::Phone(view)));
         if let Some(call_id) = call_id {
             self.request_phone_call(&call_id, cx);
         }
@@ -868,7 +868,7 @@ impl Shell {
             |this, _, InviteEvent::Close, window, cx| this.close_over(window, cx),
         ));
         window.focus(&sheet.focus_handle(cx));
-        self.over = Some(Over::Invite(sheet));
+        self.set_over(Some(Over::Invite(sheet)));
         self.report_reading(window);
         self.commands.send(Command::LoadSocial).ok();
         cx.notify();
@@ -901,7 +901,7 @@ impl Shell {
         };
         window.focus(&search.focus_handle(cx));
         self._over_events = None;
-        self.over = Some(Over::Search);
+        self.set_over(Some(Over::Search));
         self.report_reading(window);
         cx.notify();
     }
@@ -954,7 +954,7 @@ impl Shell {
                         },
                     ));
                     window.focus(&preview.focus_handle(cx));
-                    self.over = Some(Over::Attachment(preview));
+                    self.set_over(Some(Over::Attachment(preview)));
                     self.commands.send(Command::PreviewAttachment(path)).ok();
                     self.report_reading(window);
                     cx.notify();
