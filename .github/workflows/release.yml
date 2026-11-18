@@ -7,6 +7,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/release.yml"
+      - ".cargo/config.toml"
       - "Cargo.lock"
       - "Cargo.toml"
       - "crates/**/Cargo.toml"
