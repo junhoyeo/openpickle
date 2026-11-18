@@ -7,7 +7,7 @@
 
 use std::{cell::RefCell, collections::HashMap};
 
-use gpui::{Pixels, SharedString, TextRun, Window, font, px};
+use gpui::{FontWeight, Pixels, SharedString, TextRun, Window, font, px};
 
 use crate::theme;
 
@@ -20,7 +20,18 @@ thread_local! {
 pub fn keep_words(text: &str, wrap_width: Pixels, window: &Window) -> SharedString {
     // One pixel of slack keeps rounding from pushing a full line over the edge, where GPUI
     // would break it again.
-    break_body(text, wrap_width - px(1.), false, window)
+    break_body(text, wrap_width - px(1.), Inside::Never, window)
+}
+
+/// Where a word that does not fit on the rest of its line may be broken.
+#[derive(Clone, Copy)]
+enum Inside {
+    /// Nowhere: the whole word goes to the next line.
+    Never,
+    /// Where Hangul meets a Latin letter or a digit, see [`script_break`].
+    Scripts,
+    /// After a "/" or a "-", see [`path_break`].
+    Paths,
 }
 
 /// Breaks text of `size` the way the phone app's own text was seen to: between words, and
@@ -30,10 +41,28 @@ pub fn keep_words(text: &str, wrap_width: Pixels, window: &Window) -> SharedStri
 /// line may fill the width to the last pixel, so the text must be drawn without wrapping of
 /// its own.
 pub fn keep_hangul(text: &str, size: Pixels, wrap_width: Pixels, window: &Window) -> SharedString {
-    break_body(text, wrap_width * (theme::BODY / size), true, window)
+    break_body(
+        text,
+        wrap_width * (theme::BODY / size),
+        Inside::Scripts,
+        window,
+    )
 }
 
-fn break_body(text: &str, wrap_width: Pixels, scripts: bool, window: &Window) -> SharedString {
+/// Breaks text of `size` the way the phone app breaks the lines of a task's log: between
+/// words, and inside a path or an address after a "/" or a "-", so that such a word fills the
+/// line it starts on instead of leaving it short. Like [`keep_hangul`], this is for text
+/// without styled ranges, drawn without wrapping of its own.
+pub fn keep_paths(text: &str, size: Pixels, wrap_width: Pixels, window: &Window) -> SharedString {
+    break_body(
+        text,
+        wrap_width * (theme::BODY / size),
+        Inside::Paths,
+        window,
+    )
+}
+
+fn break_body(text: &str, wrap_width: Pixels, inside: Inside, window: &Window) -> SharedString {
     WIDTHS.with_borrow_mut(|widths| {
         let width_of = |c: char| {
             *widths.entry(c).or_insert_with(|| {
@@ -55,8 +84,69 @@ fn break_body(text: &str, wrap_width: Pixels, scripts: bool, window: &Window) ->
                 )
             })
         };
-        break_lines(text, f32::from(wrap_width), width_of, scripts).into()
+        break_lines(text, f32::from(wrap_width), width_of, inside).into()
     })
+}
+
+/// Cuts one line of text to `width` the way the phone app does: after a character, with "…"
+/// in place of the rest and no space before it. Text that fits stays as it is. GPUI's own
+/// truncation needs a width that is known before layout, which a label next to others in a
+/// row does not have; there it clips the text in the middle of a letter instead.
+pub fn fit(
+    text: &str,
+    size: Pixels,
+    weight: FontWeight,
+    width: Pixels,
+    window: &Window,
+) -> SharedString {
+    cut_to_fit(text, f32::from(width), |text| {
+        f32::from(line_width(text, size, weight, window))
+    })
+    .into()
+}
+
+/// How wide one line of text is drawn at this size and weight.
+pub fn line_width(text: &str, size: Pixels, weight: FontWeight, window: &Window) -> Pixels {
+    let run = TextRun {
+        len: text.len(),
+        font: gpui::Font {
+            weight,
+            ..font(theme::FONT)
+        },
+        color: theme::color(theme::TEXT),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    window
+        .text_system()
+        .layout_line(text, size, &[run], None)
+        .width
+}
+
+fn cut_to_fit(text: &str, width: f32, mut measure: impl FnMut(&str) -> f32) -> String {
+    if measure(text) <= width {
+        return text.to_owned();
+    }
+    let cut = |chars: usize| {
+        let end = text
+            .char_indices()
+            .nth(chars)
+            .map_or(text.len(), |(at, _)| at);
+        format!("{}…", text[..end].trim_end())
+    };
+    // The longest start of the text that fits with its "…". Widths grow with the length, so
+    // the search halves the range.
+    let (mut fits, mut too_long) = (0, text.chars().count());
+    while too_long - fits > 1 {
+        let middle = (fits + too_long) / 2;
+        if measure(&cut(middle)) <= width {
+            fits = middle;
+        } else {
+            too_long = middle;
+        }
+    }
+    cut(fits)
 }
 
 /// [`keep_words`] for text of another size than the body's. Character widths grow with the
@@ -70,13 +160,13 @@ pub fn keep_words_at(
     keep_words(text, wrap_width * (theme::BODY / size) * 0.98, window)
 }
 
-/// Fills each line with words up to `wrap_width`. With `scripts`, a word that does not fit may
-/// leave its start on the line, see [`script_break`].
+/// Fills each line with words up to `wrap_width`. A word that does not fit may leave its
+/// start on the line, where `inside` allows a break.
 fn break_lines(
     text: &str,
     wrap_width: f32,
     mut width_of: impl FnMut(char) -> f32,
-    scripts: bool,
+    inside: Inside,
 ) -> String {
     let mut out = String::with_capacity(text.len());
     for (index, paragraph) in text.split('\n').enumerate() {
@@ -85,7 +175,7 @@ fn break_lines(
         }
         let mut line = 0.;
         let mut words = paragraph.split(' ').enumerate().peekable();
-        while let Some((index, word)) = words.next() {
+        while let Some((index, mut word)) = words.next() {
             let word_width: f32 = word.chars().map(&mut width_of).sum();
             if index > 0 {
                 let space = width_of(' ');
@@ -93,17 +183,18 @@ fn break_lines(
                 // wherever it has to.
                 if line + space + word_width > wrap_width || line > wrap_width {
                     let room = wrap_width - line - space;
-                    // The last word of a paragraph stays whole.
-                    let at = (scripts && words.peek().is_some())
-                        .then(|| script_break(word, room, &mut width_of))
-                        .flatten();
+                    let at = match inside {
+                        Inside::Never => None,
+                        // The last word of a paragraph stays whole.
+                        Inside::Scripts => words
+                            .peek()
+                            .and_then(|_| script_break(word, room, &mut width_of)),
+                        Inside::Paths => path_break(word, room, &mut width_of),
+                    };
                     if let Some(at) = at {
                         out.push(' ');
                         out.push_str(&word[..at]);
-                        out.push('\n');
-                        out.push_str(&word[at..]);
-                        line = word[at..].chars().map(&mut width_of).sum();
-                        continue;
+                        word = &word[at..];
                     }
                     out.push('\n');
                     line = 0.;
@@ -112,11 +203,39 @@ fn break_lines(
                     line += space;
                 }
             }
+            // A path longer than a whole line fills one line after the other.
+            while matches!(inside, Inside::Paths)
+                && line == 0.
+                && word.chars().map(&mut width_of).sum::<f32>() > wrap_width
+                && let Some(at) = path_break(word, wrap_width, &mut width_of)
+            {
+                out.push_str(&word[..at]);
+                out.push('\n');
+                word = &word[at..];
+            }
             out.push_str(word);
-            line += word_width;
+            line += word.chars().map(&mut width_of).sum::<f32>();
         }
     }
     out
+}
+
+/// Where a path or an address that does not fit in `room` is broken: after its last "/" or
+/// "-" that still fits ("Reading notes/2026-" / "plan/outline.md"). Two slashes stay together.
+fn path_break(word: &str, room: f32, mut width_of: impl FnMut(char) -> f32) -> Option<usize> {
+    let mut width = 0.;
+    let mut found = None;
+    for (at, c) in word.char_indices() {
+        width += width_of(c);
+        if width > room {
+            break;
+        }
+        let rest = &word[at + c.len_utf8()..];
+        if matches!(c, '/' | '-') && !rest.is_empty() && !rest.starts_with('/') {
+            found = Some(at + c.len_utf8());
+        }
+    }
+    found
 }
 
 /// Where the phone app breaks a word that does not fit in `room`: at the last place in it
@@ -146,16 +265,46 @@ fn script_break(word: &str, room: f32, mut width_of: impl FnMut(char) -> f32) ->
 
 #[cfg(test)]
 mod tests {
-    use super::break_lines;
+    use super::{Inside, break_lines, cut_to_fit};
+
+    #[test]
+    fn a_path_fills_the_line_it_starts_on_and_breaks_after_a_slash_or_a_hyphen() {
+        let wrap = |text: &str, width: f32| break_lines(text, width, |_| 10., Inside::Paths);
+        assert_eq!(
+            wrap("Reading notes/2026-plan/outline.md", 200.),
+            "Reading notes/2026-\nplan/outline.md"
+        );
+        // An address longer than a line goes on line after line, its "//" kept together.
+        assert_eq!(
+            wrap("Opening https://example.com/guides/first-steps/", 180.),
+            "Opening https://\nexample.com/\nguides/first-\nsteps/"
+        );
+        // Words without such a place break only at spaces.
+        assert_eq!(wrap("Search the history", 100.), "Search the\nhistory");
+    }
+
+    #[test]
+    fn a_line_that_does_not_fit_ends_in_an_ellipsis_after_its_last_whole_character() {
+        // Every character is 10 wide, the "…" too.
+        let fit = |text: &str, width: f32| {
+            cut_to_fit(text, width, |text| text.chars().count() as f32 * 10.)
+        };
+        assert_eq!(fit("기획서 작성", 60.), "기획서 작성");
+        assert_eq!(fit("기획서 작성", 50.), "기획서…");
+        assert_eq!(fit("Reading the guide", 90.), "Reading…");
+        assert_eq!(fit("Reading the guide", 120.), "Reading the…");
+        // Nothing fits: the ellipsis alone says that there was text.
+        assert_eq!(fit("기획서", 5.), "…");
+    }
 
     /// Every character is 10 wide.
     fn wrap(text: &str, width: f32) -> String {
-        break_lines(text, width, |_| 10., false)
+        break_lines(text, width, |_| 10., Inside::Never)
     }
 
     #[test]
     fn a_line_of_a_call_may_end_inside_a_word_where_the_scripts_meet() {
-        let wrap = |text: &str, width: f32| break_lines(text, width, |_| 10., true);
+        let wrap = |text: &str, width: f32| break_lines(text, width, |_| 10., Inside::Scripts);
         // After the digit, or after the Latin letters, also when more of the word would fit.
         assert_eq!(wrap("안내는 2번. 다음", 50.), "안내는 2\n번. 다음");
         assert_eq!(wrap("최근 AB마트를 찾는", 50.), "최근 AB\n마트를\n찾는");
