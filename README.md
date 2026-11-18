@@ -145,3 +145,11 @@ The notes on the API (endpoints, phone sign-in, login sessions, the event stream
   copy of the app may run, and the session file should not be copied to another tool.
 - Captures, exported messages and session files hold bearer tokens and personal data. In this
   repository they belong in `.capture/`, which git ignores.
+
+## License
+
+OpenPickle is released under the [MIT License](LICENSE). The icons are from
+[Lucide](https://lucide.dev) under the ISC License; its notice is in
+[`crates/openpickle-desktop/assets/icons/LICENSE`](crates/openpickle-desktop/assets/icons/LICENSE).
+
+OpenPickle is an unofficial client. Pickle does not make, endorse or support it.
