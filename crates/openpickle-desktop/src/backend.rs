@@ -222,7 +222,8 @@ async fn sign_in(
             | Command::LoadProfile
             | Command::LoadPhoneCalls
             | Command::ResolvePhoneTask(_)
-            | Command::LoadPhoneCard(_)
+            | Command::LoadHandoffCard(_)
+            | Command::WatchHandoff(_)
             | Command::WatchPhoneCall(_)
             | Command::EndPhoneCall { .. }
             | Command::OffersShown(_)
@@ -440,18 +441,24 @@ fn valid_call_id(id: &str) -> bool {
     !id.trim().is_empty() && !id.chars().any(char::is_control)
 }
 
-/// What the handoff list says about the call of a task.
-enum TaskCall {
+fn valid_handoff_path(path: &str) -> bool {
+    matches!(
+        crate::content::LinkTarget::parse(&format!("handoff:{path}")),
+        Some(crate::content::LinkTarget::PhoneTask(_))
+    )
+}
+
+/// What the handoff list has about a task in the chat.
+enum TaskCard {
+    /// The task placed this call.
     Call(String),
-    /// The task has not finished: it may still place its call.
-    Running,
-    /// The task finished without a call.
-    NoCall,
-    /// The list does not have the task.
+    /// The task is not a call, or has not placed its call yet.
+    Task(Box<openpickle_api::HandoffItem>),
+    /// The list does not have the task: it has only just started, or it is long past.
     Unlisted,
 }
 
-fn task_call(handoffs: &openpickle_api::HandoffsScreen, path: &str) -> TaskCall {
+fn task_card(handoffs: &openpickle_api::HandoffsScreen, path: &str) -> TaskCard {
     let item = handoffs
         .active_items
         .iter()
@@ -459,21 +466,26 @@ fn task_call(handoffs: &openpickle_api::HandoffsScreen, path: &str) -> TaskCall 
         .chain(&handoffs.items)
         .find(|item| format!("handoffs/{}", item.name) == path);
     match item {
-        None => TaskCall::Unlisted,
+        None => TaskCard::Unlisted,
         Some(item) => match item.phone_call_id.clone().filter(|id| valid_call_id(id)) {
-            Some(call_id) => TaskCall::Call(call_id),
-            None if item.finished_at_epoch_ms.is_none() => TaskCall::Running,
-            None => TaskCall::NoCall,
+            Some(call_id) => TaskCard::Call(call_id),
+            None => TaskCard::Task(Box::new(item.clone())),
         },
     }
 }
 
 /// The call of the task at this handoff path, when the list has that task and it has a call.
 fn task_call_id(handoffs: &openpickle_api::HandoffsScreen, path: &str) -> Option<String> {
-    match task_call(handoffs, path) {
-        TaskCall::Call(call_id) => Some(call_id),
+    match task_card(handoffs, path) {
+        TaskCard::Call(call_id) => Some(call_id),
         _ => None,
     }
+}
+
+/// The task whose progress is open, and when it is read again.
+struct HandoffWatch {
+    path: String,
+    next_refresh: Option<Instant>,
 }
 
 struct PhoneWatch {
@@ -503,14 +515,15 @@ impl PhoneWatch {
     }
 }
 
-/// The phone cards of the chat: which tasks show a call that is still live, and so is read
-/// again, and the handoff list the cards drawn together were found in.
+/// The cards of the tasks in the chat: which of them show a call that is still live or a task
+/// that still runs, and so are read again, and the handoff list the cards drawn together were
+/// found in.
 #[derive(Default)]
-struct PhoneCards {
+struct HandoffCards {
     /// Handoff path and call id of each live call a card shows.
     live: Vec<(String, String)>,
-    /// Tasks whose card was drawn before they had a call, and until when one that the handoff
-    /// list does not have is still asked about.
+    /// Tasks that still run or that the handoff list does not have yet, and until when a task
+    /// it does not have is still asked about.
     waiting: Vec<(String, Instant)>,
     next_refresh: Option<Instant>,
     handoffs: Option<(Instant, openpickle_api::HandoffsScreen)>,
@@ -529,8 +542,9 @@ struct Live {
     conversation: Conversation,
     identity: Identity,
     profile: Option<ProfileData>,
+    handoff_watch: Option<HandoffWatch>,
     phone_watch: Option<PhoneWatch>,
-    phone_cards: PhoneCards,
+    handoff_cards: HandoffCards,
     /// Whether the window is in front; only then does reading count as "seen".
     active: bool,
     /// Whether the history on this computer reaches back to the first message.
@@ -612,8 +626,9 @@ async fn converse(
         conversation,
         identity,
         profile: None,
+        handoff_watch: None,
         phone_watch: None,
-        phone_cards: PhoneCards::default(),
+        handoff_cards: HandoffCards::default(),
         // The window says when it comes to the front.
         active: false,
         history_complete: false,
@@ -636,8 +651,16 @@ async fn converse(
             .phone_watch
             .as_ref()
             .and_then(|watch| watch.next_refresh);
-        let cards_deadline = live.phone_cards.next_refresh;
-        let phone_deadline = watch_deadline.into_iter().chain(cards_deadline).min();
+        let cards_deadline = live.handoff_cards.next_refresh;
+        let handoff_deadline = live
+            .handoff_watch
+            .as_ref()
+            .and_then(|watch| watch.next_refresh);
+        let phone_deadline = watch_deadline
+            .into_iter()
+            .chain(cards_deadline)
+            .chain(handoff_deadline)
+            .min();
         tokio::select! {
             command = commands.recv() => match command {
                 None | Some(Command::Quit) => return Ended::Closed,
@@ -695,9 +718,20 @@ async fn converse(
                     if let Err(error) = live.resolve_phone_task(path).await
                         && session_is_gone(&error) { return Ended::SignedOut; }
                 }
-                Some(Command::LoadPhoneCard(path)) => {
-                    if let Err(error) = live.load_phone_card(path).await
+                Some(Command::LoadHandoffCard(path)) => {
+                    if let Err(error) = live.load_handoff_card(path).await
                         && session_is_gone(&error) { return Ended::SignedOut; }
+                }
+                Some(Command::WatchHandoff(path)) => {
+                    live.handoff_watch = path.map(|path| HandoffWatch {
+                        path,
+                        next_refresh: None,
+                    });
+                    if live.handoff_watch.is_some()
+                        && let Err(error) = live.refresh_handoff().await
+                        && session_is_gone(&error) {
+                        return Ended::SignedOut;
+                    }
                 }
                 Some(Command::LoadPhoneCalls) => {
                     if let Some(cached) = live.cached_once::<Vec<CallSummary>>("phone-calls.json") {
@@ -799,7 +833,12 @@ async fn converse(
                     return Ended::SignedOut;
                 }
                 if cards_deadline.is_some_and(|at| at <= now)
-                    && let Err(error) = live.refresh_phone_cards().await
+                    && let Err(error) = live.refresh_handoff_cards().await
+                    && session_is_gone(&error) {
+                    return Ended::SignedOut;
+                }
+                if handoff_deadline.is_some_and(|at| at <= now)
+                    && let Err(error) = live.refresh_handoff().await
                     && session_is_gone(&error) {
                     return Ended::SignedOut;
                 }
@@ -1326,48 +1365,56 @@ impl Live {
         }
     }
 
-    /// Reads the call of a phone task for its card. A task that has not placed its call yet is
-    /// asked about again until it has one or ends without. A task that finished without a call
-    /// gets no card: it stays a title that opens nothing more.
-    async fn load_phone_card(&mut self, path: String) -> openpickle_api::Result<()> {
-        if !matches!(
-            crate::content::LinkTarget::parse(&format!("handoff:{path}")),
-            Some(crate::content::LinkTarget::PhoneTask(_))
-        ) {
+    /// Reads what the handoff list has about a task in the chat: its call, for a phone card, or
+    /// the task itself. A task that still runs is read again, because its card shows what it
+    /// is doing and because it may yet place a call. So is one the list does not have yet.
+    async fn load_handoff_card(&mut self, path: String) -> openpickle_api::Result<()> {
+        if !valid_handoff_path(&path) {
             return Ok(());
         }
         let fresh = self
-            .phone_cards
+            .handoff_cards
             .handoffs
             .as_ref()
             .is_some_and(|(read_at, _)| read_at.elapsed() < CARD_HANDOFFS_FRESH);
         if !fresh {
             let handoffs = self.client.get_handoffs().await?;
-            self.phone_cards.handoffs = Some((Instant::now(), handoffs));
+            self.handoff_cards.handoffs = Some((Instant::now(), handoffs));
         }
-        let call = self
-            .phone_cards
+        let card = self
+            .handoff_cards
             .handoffs
             .as_ref()
-            .map_or(TaskCall::Unlisted, |(_, handoffs)| {
-                task_call(handoffs, &path)
+            .map_or(TaskCard::Unlisted, |(_, handoffs)| {
+                task_card(handoffs, &path)
             });
-        match call {
-            TaskCall::Call(call_id) => self.read_phone_card(path, call_id).await,
-            TaskCall::NoCall => Ok(()),
-            TaskCall::Running | TaskCall::Unlisted => {
-                let cards = &mut self.phone_cards;
-                if !cards.waiting.iter().any(|(waiting, _)| *waiting == path) {
-                    cards
-                        .waiting
-                        .push((path, Instant::now() + CARD_UNLISTED_WAIT));
-                }
+        let again = match card {
+            TaskCard::Call(call_id) => return self.read_phone_card(path, call_id).await,
+            TaskCard::Task(task) => self.show_task_card(&path, *task),
+            TaskCard::Unlisted => true,
+        };
+        if again {
+            let cards = &mut self.handoff_cards;
+            if !cards.waiting.iter().any(|(waiting, _)| *waiting == path) {
                 cards
-                    .next_refresh
-                    .get_or_insert_with(|| Instant::now() + PHONE_REFRESH);
-                Ok(())
+                    .waiting
+                    .push((path, Instant::now() + CARD_UNLISTED_WAIT));
             }
+            cards
+                .next_refresh
+                .get_or_insert_with(|| Instant::now() + PHONE_REFRESH);
         }
+        Ok(())
+    }
+
+    /// Shows a task that is not a call in its card, and says whether the task still runs.
+    fn show_task_card(&mut self, path: &str, task: openpickle_api::HandoffItem) -> bool {
+        let running = task.state == "running";
+        self.send(Update::HandoffCard {
+            path: path.to_owned(),
+            card: crate::protocol::HandoffCard::Task(task),
+        });
+        running
     }
 
     async fn read_phone_card(
@@ -1379,7 +1426,7 @@ impl Live {
         if call.call_id != call_id {
             return Ok(());
         }
-        let cards = &mut self.phone_cards;
+        let cards = &mut self.handoff_cards;
         cards.live.retain(|(shown, _)| *shown != path);
         if call.live {
             cards.live.push((path.clone(), call_id));
@@ -1387,23 +1434,26 @@ impl Live {
                 .next_refresh
                 .get_or_insert_with(|| Instant::now() + PHONE_REFRESH);
         }
-        self.send(Update::PhoneCard { path, call });
+        self.send(Update::HandoffCard {
+            path,
+            card: crate::protocol::HandoffCard::Phone(call),
+        });
         Ok(())
     }
 
-    /// Reads the live calls of the cards again, and asks the handoff list about the tasks
-    /// that had no call yet. A card whose call ended is read no more.
-    async fn refresh_phone_cards(&mut self) -> openpickle_api::Result<()> {
-        self.phone_cards.next_refresh = None;
-        for (path, call_id) in std::mem::take(&mut self.phone_cards.live) {
+    /// Reads the live calls of the cards again, and asks the handoff list about the tasks that
+    /// still run or are not listed yet. A card whose call or task ended is read no more.
+    async fn refresh_handoff_cards(&mut self) -> openpickle_api::Result<()> {
+        self.handoff_cards.next_refresh = None;
+        for (path, call_id) in std::mem::take(&mut self.handoff_cards.live) {
             match self.read_phone_card(path.clone(), call_id.clone()).await {
                 Ok(()) => {}
                 Err(error) if session_is_gone(&error) => return Err(error),
                 // One failed reading does not end the card: it is tried again with the others.
-                Err(_) => self.phone_cards.live.push((path, call_id)),
+                Err(_) => self.handoff_cards.live.push((path, call_id)),
             }
         }
-        let waiting = std::mem::take(&mut self.phone_cards.waiting);
+        let waiting = std::mem::take(&mut self.handoff_cards.waiting);
         if !waiting.is_empty() {
             let handoffs = match self.client.get_handoffs().await {
                 Ok(handoffs) => Some(handoffs),
@@ -1411,31 +1461,80 @@ impl Live {
                 Err(_) => None,
             };
             for (path, until) in waiting {
-                match handoffs.as_ref().map(|handoffs| task_call(handoffs, &path)) {
-                    Some(TaskCall::Call(call_id)) => {
+                match handoffs.as_ref().map(|handoffs| task_card(handoffs, &path)) {
+                    Some(TaskCard::Call(call_id)) => {
                         match self.read_phone_card(path.clone(), call_id).await {
                             Ok(()) => {}
                             Err(error) if session_is_gone(&error) => return Err(error),
-                            Err(_) => self.phone_cards.waiting.push((path, until)),
+                            Err(_) => self.handoff_cards.waiting.push((path, until)),
                         }
                     }
-                    Some(TaskCall::NoCall) => {}
-                    Some(TaskCall::Unlisted) if Instant::now() >= until => {}
-                    // Still running, not listed yet, or the list could not be read.
-                    _ => self.phone_cards.waiting.push((path, until)),
+                    Some(TaskCard::Task(task)) => {
+                        if self.show_task_card(&path, *task) {
+                            self.handoff_cards.waiting.push((path, until));
+                        }
+                    }
+                    Some(TaskCard::Unlisted) if Instant::now() >= until => {}
+                    // Not listed yet, or the list could not be read.
+                    _ => self.handoff_cards.waiting.push((path, until)),
                 }
             }
             if let Some(handoffs) = handoffs {
-                self.phone_cards.handoffs = Some((Instant::now(), handoffs));
+                self.handoff_cards.handoffs = Some((Instant::now(), handoffs));
             }
         }
-        let cards = &mut self.phone_cards;
+        let cards = &mut self.handoff_cards;
         if !cards.live.is_empty() || !cards.waiting.is_empty() {
             cards
                 .next_refresh
                 .get_or_insert_with(|| Instant::now() + PHONE_REFRESH);
         }
         Ok(())
+    }
+
+    /// Reads the progress of the task whose sheet is open. A task that still runs is read
+    /// again, and so is one whose reading failed.
+    async fn refresh_handoff(&mut self) -> openpickle_api::Result<()> {
+        let Some(path) = self.handoff_watch.as_ref().map(|watch| watch.path.clone()) else {
+            return Ok(());
+        };
+        let Some(name) = path
+            .strip_prefix("handoffs/")
+            .filter(|_| valid_handoff_path(&path))
+        else {
+            self.send(Update::Handoff {
+                path,
+                result: Err("This task link is not valid.".into()),
+            });
+            self.handoff_watch = None;
+            return Ok(());
+        };
+        let result = self.client.get_handoff(name).await;
+        match result {
+            Ok(handoff) => {
+                let running = handoff.state == "running";
+                self.send(Update::Handoff {
+                    path: path.clone(),
+                    result: Ok(handoff),
+                });
+                if let Some(watch) = &mut self.handoff_watch
+                    && watch.path == path
+                {
+                    watch.next_refresh = running.then(|| Instant::now() + PHONE_REFRESH);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.send(Update::Handoff {
+                    path,
+                    result: Err(explain(&error)),
+                });
+                if let Some(watch) = &mut self.handoff_watch {
+                    watch.next_refresh = Some(Instant::now() + PHONE_REFRESH);
+                }
+                Err(error)
+            }
+        }
     }
 
     async fn load_phone_calls(&mut self) -> openpickle_api::Result<()> {
@@ -2000,6 +2099,24 @@ mod tests {
                                 .to_string(),
                             )
                         }
+                    } else if target.starts_with("/api/screens/handoff?name=") {
+                        let done = target.ends_with("done-task");
+                        (
+                            "200 OK",
+                            serde_json::json!({
+                                "kind":"handoff",
+                                "state": if done { "done" } else { "running" },
+                                "title":"Synthetic task",
+                                "requested_at_epoch_ms":1.0,
+                                "latest_log_text":"Reading a public guide",
+                                "latest_log_kind":"web",
+                                "handoff_estimate_pct":50,
+                                "plan_blocks":[{"type":"prose","markdown":"## Plan\nRead the guide."}],
+                                "log_entries":[],
+                                "log_nodes":[{"kind":"future_kind","text":"Checking an option"}]
+                            })
+                            .to_string(),
+                        )
                     } else if target == "/api/screens/handoffs" {
                         // A task that has just started places its call a moment later: the
                         // list has its call from the second reading on.
@@ -2022,7 +2139,8 @@ mod tests {
                                 "requested_at_epoch_ms":1.0,"time_text":"Now","phone_call_id":"sample-call"
                             }, {
                                 "name":"finished-task","title":"Not a call","state":"done",
-                                "requested_at_epoch_ms":1.0,"finished_at_epoch_ms":2.0,"time_text":"Now"
+                                "subtitle":"Completed summary","requested_at_epoch_ms":1.0,
+                                "finished_at_epoch_ms":2.0,"time_text":"Now"
                             }],"handoff_estimate_pct":0.0,"active_items":[starting],"recent_items":[],
                             "active_count":1,"recent_count":0,"sections":[]
                         }).to_string())
@@ -2177,8 +2295,9 @@ mod tests {
             conversation: Conversation::load(&store, "primary"),
             identity: Identity::default(),
             profile: None,
+            handoff_watch: None,
             phone_watch: None,
-            phone_cards: PhoneCards::default(),
+            handoff_cards: HandoffCards::default(),
             active: false,
             history_complete: false,
             character_room: "primary".to_owned(),
@@ -2824,35 +2943,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_phone_card_reads_its_call_and_a_live_one_again_without_actions() {
+    async fn handoff_cards_share_the_list_and_refresh_only_while_running() {
         let server = HistoryServer::start();
-        let (mut live, mut received) = fixture_live("phone-card", &server);
-        live.load_phone_card("handoffs/sample-task".into())
+        let (mut live, mut received) = fixture_live("handoff-card", &server);
+        live.load_handoff_card("handoffs/sample-task".into())
             .await
             .unwrap();
         assert!(matches!(
             received.try_recv().unwrap(),
-            Update::PhoneCard { path, call }
+            Update::HandoffCard { path, card: crate::protocol::HandoffCard::Phone(call) }
                 if path == "handoffs/sample-task" && call.call_id == "sample-call" && call.live
         ));
-        assert!(live.phone_cards.next_refresh.is_some());
-        // A task that finished without a call, and a path that names no task, get no card
-        // and are not asked about again.
-        live.load_phone_card("handoffs/finished-task".into())
+        assert!(live.handoff_cards.next_refresh.is_some());
+
+        // A finished task without a call keeps the list's own summary, while an invalid path
+        // produces no card and makes no request.
+        live.load_handoff_card("handoffs/finished-task".into())
             .await
             .unwrap();
-        live.load_phone_card("handoffs/../sample-task".into())
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Update::HandoffCard { path, card: crate::protocol::HandoffCard::Task(item) }
+                if path == "handoffs/finished-task"
+                    && item.title == "Not a call"
+                    && item.subtitle.as_deref() == Some("Completed summary")
+        ));
+        live.load_handoff_card("handoffs/../sample-task".into())
             .await
             .unwrap();
         assert!(received.try_recv().is_err());
-        assert!(live.phone_cards.waiting.is_empty());
-        live.refresh_phone_cards().await.unwrap();
+        live.refresh_handoff_cards().await.unwrap();
         assert!(matches!(
             received.try_recv().unwrap(),
-            Update::PhoneCard { path, .. } if path == "handoffs/sample-task"
+            Update::HandoffCard { path, .. } if path == "handoffs/sample-task"
         ));
         let requests = server.requests.lock().unwrap();
-        // One reading of the handoff list served the cards that were drawn together.
+        // One reading of the handoff list served the cards drawn together.
         assert_eq!(
             requests
                 .iter()
@@ -2866,40 +2992,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_card_drawn_before_its_task_placed_the_call_waits_for_it() {
+    async fn a_running_task_card_refreshes_and_changes_to_a_call_card() {
         let server = HistoryServer::start();
-        let (mut live, mut received) = fixture_live("phone-card-waits", &server);
-        // The task is running and has no call yet.
-        live.load_phone_card("handoffs/starting-task".into())
+        let (mut live, mut received) = fixture_live("handoff-card-waits", &server);
+        live.load_handoff_card("handoffs/starting-task".into())
             .await
             .unwrap();
-        assert!(received.try_recv().is_err());
-        assert_eq!(live.phone_cards.waiting.len(), 1);
-        assert!(live.phone_cards.next_refresh.is_some());
-        // The next reading of the list has its call, and the card gets it.
-        live.refresh_phone_cards().await.unwrap();
         assert!(matches!(
             received.try_recv().unwrap(),
-            Update::PhoneCard { path, call }
+            Update::HandoffCard { path, card: crate::protocol::HandoffCard::Task(item) }
+                if path == "handoffs/starting-task" && item.state == "running"
+        ));
+        assert_eq!(live.handoff_cards.waiting.len(), 1);
+        assert!(live.handoff_cards.next_refresh.is_some());
+
+        // The next list reading has the call. The same card changes kind and stops waiting.
+        live.refresh_handoff_cards().await.unwrap();
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Update::HandoffCard { path, card: crate::protocol::HandoffCard::Phone(call) }
                 if path == "handoffs/starting-task" && call.call_id == "completed-call" && !call.live
         ));
-        assert!(live.phone_cards.waiting.is_empty());
-        assert!(live.phone_cards.next_refresh.is_none());
+        assert!(live.handoff_cards.waiting.is_empty());
+        assert!(live.handoff_cards.next_refresh.is_none());
 
         // A task the list does not have is asked about for a while, then no more.
-        live.load_phone_card("handoffs/unknown-task".into())
+        live.load_handoff_card("handoffs/unknown-task".into())
             .await
             .unwrap();
-        assert_eq!(live.phone_cards.waiting.len(), 1);
-        live.refresh_phone_cards().await.unwrap();
-        assert_eq!(live.phone_cards.waiting.len(), 1);
-        live.phone_cards.waiting[0].1 = Instant::now();
-        live.refresh_phone_cards().await.unwrap();
-        assert!(live.phone_cards.waiting.is_empty());
+        assert_eq!(live.handoff_cards.waiting.len(), 1);
+        live.refresh_handoff_cards().await.unwrap();
+        assert_eq!(live.handoff_cards.waiting.len(), 1);
+        live.handoff_cards.waiting[0].1 = Instant::now();
+        live.refresh_handoff_cards().await.unwrap();
+        assert!(live.handoff_cards.waiting.is_empty());
         assert!(received.try_recv().is_err());
         assert!(server.requests.lock().unwrap().iter().all(|path| {
             path == "/api/screens/handoffs" || path == "/api/phone-calls/completed-call"
         }));
+    }
+
+    #[tokio::test]
+    async fn an_open_running_handoff_refreshes_and_a_finished_one_does_not() {
+        let server = HistoryServer::start();
+        let (mut live, mut received) = fixture_live("handoff-progress", &server);
+        live.handoff_watch = Some(HandoffWatch {
+            path: "handoffs/sample task".into(),
+            next_refresh: None,
+        });
+        live.refresh_handoff().await.unwrap();
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Update::Handoff { path, result: Ok(handoff) }
+                if path == "handoffs/sample task"
+                    && handoff.log_nodes[0].kind == "future_kind"
+        ));
+        assert!(live.handoff_watch.as_ref().unwrap().next_refresh.is_some());
+        assert!(
+            server
+                .requests
+                .lock()
+                .unwrap()
+                .contains(&"/api/screens/handoff?name=sample%20task".to_owned())
+        );
+
+        live.handoff_watch = Some(HandoffWatch {
+            path: "handoffs/done-task".into(),
+            next_refresh: None,
+        });
+        live.refresh_handoff().await.unwrap();
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Update::Handoff { result: Ok(_), .. }
+        ));
+        assert!(live.handoff_watch.as_ref().unwrap().next_refresh.is_none());
     }
 
     #[tokio::test]

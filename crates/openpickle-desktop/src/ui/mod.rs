@@ -12,6 +12,7 @@ pub mod profile;
 pub mod rows;
 pub mod search;
 pub mod select;
+pub mod tasks;
 pub mod wrap;
 
 use gpui::{

@@ -3,10 +3,18 @@
 
 use crate::phone::CallSummary;
 use crate::profile::ProfileData;
-use openpickle_api::PhoneCallTranscript;
+use openpickle_api::{HandoffItem, HandoffScreen, PhoneCallTranscript};
 use std::path::PathBuf;
 
 use crate::model::{Attachment, Explore, Message, RoomInfo, SearchResult, Social};
+
+/// What the card of a task in the chat shows, once the handoff list has been asked about the
+/// task: the task itself, or the call it placed.
+#[derive(Clone)]
+pub enum HandoffCard {
+    Task(HandoffItem),
+    Phone(PhoneCallTranscript),
+}
 
 /// UI to backend. Neither side of the protocol can be printed with `{:?}`: a command may hold
 /// a phone number or a sign-in code, and both hold message text.
@@ -33,9 +41,11 @@ pub enum Command {
     LoadPhoneCalls,
     /// Resolve a captured subagent handoff path through the fresh authorized handoff list.
     ResolvePhoneTask(String),
-    /// Read the call of a phone task for its card in the chat. A live one is read again
-    /// until it ends.
-    LoadPhoneCard(String),
+    /// Read what the card of the task at this handoff path shows. A task that runs, or its
+    /// live call, is read again until it ends.
+    LoadHandoffCard(String),
+    /// Read the progress of one task, and again while it runs; with None, stop reading.
+    WatchHandoff(Option<String>),
     /// Open/refresh one transcript, or stop watching when None. Closing never hangs up.
     WatchPhoneCall(Option<String>),
     /// Explicitly confirmed request to end the currently watched live call.
@@ -110,10 +120,12 @@ pub enum Update {
         path: String,
         result: Result<String, String>,
     },
-    /// The call of the phone task at this handoff path, for its card in the chat.
-    PhoneCard {
+    /// What the card of the task at this handoff path shows.
+    HandoffCard { path: String, card: HandoffCard },
+    /// A reading of the progress of the task at this handoff path, or why there is none.
+    Handoff {
         path: String,
-        call: PhoneCallTranscript,
+        result: Result<HandoffScreen, String>,
     },
     /// A snapshot or failure of the requested call, never an unscoped update.
     PhoneCall {
