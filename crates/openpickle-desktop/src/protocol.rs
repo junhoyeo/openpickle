@@ -60,6 +60,8 @@ pub enum Command {
     LoadAttachments(Vec<String>),
     /// Download the thumbnail (or first-page preview) of one attachment in the open room.
     PreviewAttachment(String),
+    /// Download one attachment of the open room, the file itself, into the Downloads folder.
+    DownloadAttachment(String),
     /// Search the messages for this text.
     Search(String),
     /// Whether the chat can be read now: the window is in front and shows the chat. Only
@@ -159,6 +161,11 @@ pub enum Update {
     RoomOpenFailed { room_id: String, reason: String },
     /// A requested attachment thumbnail (or first-page preview) is ready or failed.
     AttachmentPreview {
+        path: String,
+        result: Result<PathBuf, String>,
+    },
+    /// An attachment was downloaded into this file, or why it was not.
+    AttachmentDownloaded {
         path: String,
         result: Result<PathBuf, String>,
     },

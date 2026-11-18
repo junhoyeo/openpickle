@@ -133,9 +133,9 @@ The notes on the API (endpoints, phone sign-in, login sessions, the event stream
 - Generated file links are resolved through the message's attachment map. Clicking a
   file card or its linked name opens a **thumbnail preview**. For a PDF this is its
   **first page**, not the original document. Loading failures show a retry action.
-- **Original-file opening, downloading and sharing are not implemented.** The captures
-  show only the thumbnail endpoint, not an original-file download route. Open the
-  original in the Pickle phone app until that route has been captured.
+- **Download** in that preview saves the file itself, a PDF, a Markdown file or any other
+  attachment, to your Downloads folder under its own name, or under the next free one
+  ("report (1).pdf"). Sharing a file from the app is not built.
 
 ## Your data
 
