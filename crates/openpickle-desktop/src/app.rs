@@ -87,6 +87,8 @@ pub struct Shell {
     /// The tasks the chat shows a task card for, by their handoff path: what a press on the
     /// card opens.
     tasks: std::collections::HashMap<String, openpickle_api::HandoffItem>,
+    /// The title of the task the character works on now.
+    active_task: Option<String>,
     pending_phone_task: Option<String>,
     /// The open conversation, oldest first.
     messages: Vec<Message>,
@@ -144,6 +146,7 @@ impl Shell {
             rooms: Vec::new(),
             calls: Vec::new(),
             tasks: std::collections::HashMap::new(),
+            active_task: None,
             pending_phone_task: None,
             messages: Vec::new(),
             room_id: String::new(),
@@ -266,6 +269,7 @@ impl Shell {
                         window.focus(&chat.focus_handle(cx));
                     }
                 }
+                self.show_active_task(cx);
                 self.refresh_room_avatar(cx);
                 self.refresh_rows(cx);
                 if self.tab == Tab::Archive {
@@ -374,6 +378,10 @@ impl Shell {
                     chat.update(cx, |chat, cx| chat.set_handoff_card(path, card, cx));
                 }
             }
+            Update::ActiveTask(title) => {
+                self.active_task = title;
+                self.show_active_task(cx);
+            }
             Update::Handoff { path, result } => {
                 if let Some(Over::Task(task)) = &self.over {
                     task.update(cx, |task, cx| task.set_handoff(&path, result, cx));
@@ -472,6 +480,7 @@ impl Shell {
         self.rooms.clear();
         self.calls.clear();
         self.tasks.clear();
+        self.active_task = None;
         self.pending_phone_task = None;
         self.drafts.clear();
         self.pending.clear();
@@ -830,6 +839,15 @@ impl Shell {
                     cx,
                 )
             });
+        }
+    }
+
+    /// The header of the character's own chat names the task the character works on. A
+    /// friend's room has no such line: the task is not theirs.
+    fn show_active_task(&self, cx: &mut Context<Self>) {
+        if let Screen::Chat(chat) = &self.screen {
+            let task = self.active_task.clone().filter(|_| self.is_character);
+            chat.update(cx, |chat, cx| chat.set_active_task(task, cx));
         }
     }
 

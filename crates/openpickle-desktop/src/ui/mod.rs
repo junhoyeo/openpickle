@@ -199,6 +199,53 @@ fn tab_header(
     on_invite: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     show_invite: bool,
 ) -> impl IntoElement {
+    tab_header_with_task(name, avatar, None, on_menu, on_invite, show_invite)
+}
+
+/// The size of a task's title under the name, and the width it is cut to.
+const TASK_TITLE: f32 = 13. * phone::TRACKED;
+const TASK_TITLE_ROOM: f32 = 200.;
+
+/// Cuts the title of the task the character works on for [`tab_header_with_task`].
+fn header_task_title(title: &str, window: &Window) -> SharedString {
+    wrap::fit(
+        title,
+        px(TASK_TITLE),
+        FontWeight::NORMAL,
+        px(TASK_TITLE_ROOM),
+        window,
+    )
+}
+
+/// [`tab_header`] of the chat. While the character works on a task, the task's title stands
+/// under the name in the same chip, as [`header_task_title`] cut it.
+fn tab_header_with_task(
+    name: SharedString,
+    avatar: Option<ImageSource>,
+    task: Option<SharedString>,
+    on_menu: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_invite: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    show_invite: bool,
+) -> impl IntoElement {
+    let name_chip = chrome("name").mt(px(-6.)).px(px(10.5));
+    let name_chip = match task {
+        None => name_chip.h(px(33.)).rounded_full().child(name),
+        Some(task) => name_chip
+            .pt(px(6.))
+            .pb(px(5.5))
+            .rounded(px(16.))
+            .flex_col()
+            .whitespace_nowrap()
+            .child(div().line_height(px(19.5)).child(name))
+            .child(
+                div()
+                    .text_size(px(TASK_TITLE))
+                    .line_height(px(18.))
+                    .font_weight(FontWeight::NORMAL)
+                    .text_color(theme::alpha(theme::TEXT, 0.4))
+                    .child(task),
+            ),
+    };
     let picture = own_face(avatar, 58.);
     div()
         .absolute()
@@ -244,14 +291,12 @@ fn tab_header(
                     ),
                 )
                 .child(
-                    div().flex().flex_col().items_center().child(picture).child(
-                        chrome("name")
-                            .mt(px(-6.))
-                            .h(px(33.))
-                            .px(px(10.5))
-                            .rounded_full()
-                            .child(name),
-                    ),
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .child(picture)
+                        .child(name_chip),
                 )
                 .child(div().w(px(74.)).when(show_invite, |slot| {
                     slot.child(

@@ -18,11 +18,11 @@ use crate::{
     protocol::HandoffCard,
     theme,
     ui::{
-        Cancel, Find, HEADER_SOLID, Pictures, Tab, chrome, header_cover, icon,
+        Cancel, Find, HEADER_SOLID, Pictures, Tab, chrome, header_cover, header_task_title, icon,
         input::{Copy, InputEvent, SelectAll, TextInput},
         rows::{HandoffCards, RowContext, render_row},
         select::SharedSelection,
-        tab_bar, tab_header,
+        tab_bar, tab_header_with_task,
     },
 };
 
@@ -71,6 +71,8 @@ pub struct ChatView {
     /// The task or call each handoff card shows, by the handoff path.
     handoff_cards: HandoffCards,
     requested_handoff_cards: std::collections::HashSet<String>,
+    /// The title of the task the character works on, which the header shows under the name.
+    active_task: Option<SharedString>,
     /// Redraws running tasks and live calls each second for their elapsed time.
     handoff_clock: Option<Task<()>>,
     /// False once the user scrolled up; the list then stops following new messages.
@@ -140,6 +142,7 @@ impl ChatView {
             requested_pictures: std::collections::HashSet::new(),
             handoff_cards: HandoffCards::new(),
             requested_handoff_cards: std::collections::HashSet::new(),
+            active_task: None,
             handoff_clock: None,
             at_latest: true,
             selection: SharedSelection::default(),
@@ -250,6 +253,11 @@ impl ChatView {
                 }
             }));
         }
+        cx.notify();
+    }
+
+    pub fn set_active_task(&mut self, title: Option<String>, cx: &mut Context<Self>) {
+        self.active_task = title.map(Into::into);
         cx.notify();
     }
 
@@ -674,9 +682,12 @@ impl Render for ChatView {
                     ),
             )
             .child(header_cover())
-            .child(tab_header(
+            .child(tab_header_with_task(
                 self.name.clone(),
                 self.avatar.clone(),
+                self.active_task
+                    .as_ref()
+                    .map(|title| header_task_title(title, window)),
                 cx.listener(|_, _, _, cx| cx.emit(ChatEvent::Menu)),
                 cx.listener(|_, _, _, cx| cx.emit(ChatEvent::Invite)),
                 true,

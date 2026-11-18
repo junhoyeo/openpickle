@@ -672,10 +672,15 @@ fn main() {
                                     at: "Today".into(),
                                 },
                             ])),
-                            Command::LoadHandoffCard(path) if task_card => Update::HandoffCard {
-                                path,
-                                card: HandoffCard::Task(sample_task_item(live)),
-                            },
+                            Command::LoadHandoffCard(path) if task_card => {
+                                let task = sample_task_item(live);
+                                let title = live.then(|| task.title.clone());
+                                updates.unbounded_send(Update::ActiveTask(title)).ok();
+                                Update::HandoffCard {
+                                    path,
+                                    card: HandoffCard::Task(task),
+                                }
+                            }
                             Command::LoadHandoffCard(path) => Update::HandoffCard {
                                 path,
                                 card: HandoffCard::Phone(sample_phone_call("sample-call", live)),

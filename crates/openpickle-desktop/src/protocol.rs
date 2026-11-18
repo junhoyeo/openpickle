@@ -122,6 +122,8 @@ pub enum Update {
     },
     /// What the card of the task at this handoff path shows.
     HandoffCard { path: String, card: HandoffCard },
+    /// The title of the task the character works on now, or that there is none.
+    ActiveTask(Option<String>),
     /// A reading of the progress of the task at this handoff path, or why there is none.
     Handoff {
         path: String,

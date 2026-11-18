@@ -482,6 +482,15 @@ fn task_call_id(handoffs: &openpickle_api::HandoffsScreen, path: &str) -> Option
     }
 }
 
+/// The title of the task the character works on now, which the chat's header shows.
+fn active_task_title(handoffs: &openpickle_api::HandoffsScreen) -> Option<String> {
+    handoffs
+        .active_items
+        .iter()
+        .find(|item| item.state == "running")
+        .map(|item| item.title.clone())
+}
+
 /// The task whose progress is open, and when it is read again.
 struct HandoffWatch {
     path: String,
@@ -1379,6 +1388,7 @@ impl Live {
             .is_some_and(|(read_at, _)| read_at.elapsed() < CARD_HANDOFFS_FRESH);
         if !fresh {
             let handoffs = self.client.get_handoffs().await?;
+            self.send(Update::ActiveTask(active_task_title(&handoffs)));
             self.handoff_cards.handoffs = Some((Instant::now(), handoffs));
         }
         let card = self
@@ -1456,7 +1466,10 @@ impl Live {
         let waiting = std::mem::take(&mut self.handoff_cards.waiting);
         if !waiting.is_empty() {
             let handoffs = match self.client.get_handoffs().await {
-                Ok(handoffs) => Some(handoffs),
+                Ok(handoffs) => {
+                    self.send(Update::ActiveTask(active_task_title(&handoffs)));
+                    Some(handoffs)
+                }
                 Err(error) if session_is_gone(&error) => return Err(error),
                 Err(_) => None,
             };
@@ -2951,6 +2964,10 @@ mod tests {
             .unwrap();
         assert!(matches!(
             received.try_recv().unwrap(),
+            Update::ActiveTask(Some(_))
+        ));
+        assert!(matches!(
+            received.try_recv().unwrap(),
             Update::HandoffCard { path, card: crate::protocol::HandoffCard::Phone(call) }
                 if path == "handoffs/sample-task" && call.call_id == "sample-call" && call.live
         ));
@@ -2998,6 +3015,11 @@ mod tests {
         live.load_handoff_card("handoffs/starting-task".into())
             .await
             .unwrap();
+        // Each reading of the list also says which task the character works on.
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Update::ActiveTask(Some(title)) if title == "Starting call"
+        ));
         assert!(matches!(
             received.try_recv().unwrap(),
             Update::HandoffCard { path, card: crate::protocol::HandoffCard::Task(item) }
@@ -3008,6 +3030,10 @@ mod tests {
 
         // The next list reading has the call. The same card changes kind and stops waiting.
         live.refresh_handoff_cards().await.unwrap();
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Update::ActiveTask(Some(_))
+        ));
         assert!(matches!(
             received.try_recv().unwrap(),
             Update::HandoffCard { path, card: crate::protocol::HandoffCard::Phone(call) }
@@ -3022,9 +3048,17 @@ mod tests {
             .unwrap();
         assert_eq!(live.handoff_cards.waiting.len(), 1);
         live.refresh_handoff_cards().await.unwrap();
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Update::ActiveTask(Some(_))
+        ));
         assert_eq!(live.handoff_cards.waiting.len(), 1);
         live.handoff_cards.waiting[0].1 = Instant::now();
         live.refresh_handoff_cards().await.unwrap();
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Update::ActiveTask(Some(_))
+        ));
         assert!(live.handoff_cards.waiting.is_empty());
         assert!(received.try_recv().is_err());
         assert!(server.requests.lock().unwrap().iter().all(|path| {
