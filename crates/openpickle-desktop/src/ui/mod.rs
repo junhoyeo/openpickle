@@ -39,23 +39,24 @@ actions!(
     ]
 );
 
-/// Binds the keys of the text field and of the screens.
+/// Binds the keys of the text field and of the screens. `secondary` is the Command key on a
+/// Mac and the Control key elsewhere, so Copy is Cmd-C there and Ctrl-C on Windows.
 pub fn bind_keys(cx: &mut App) {
     input::bind_keys(cx);
     cx.bind_keys([
-        KeyBinding::new("cmd-c", input::Copy, Some("Chat")),
-        KeyBinding::new("cmd-a", input::SelectAll, Some("Chat")),
-        KeyBinding::new("cmd-c", input::Copy, Some("Phone")),
-        KeyBinding::new("cmd-f", Find, None),
+        KeyBinding::new("secondary-c", input::Copy, Some("Chat")),
+        KeyBinding::new("secondary-a", input::SelectAll, Some("Chat")),
+        KeyBinding::new("secondary-c", input::Copy, Some("Phone")),
+        KeyBinding::new("secondary-f", Find, None),
         KeyBinding::new("escape", Cancel, None),
         KeyBinding::new("up", Previous, None),
         KeyBinding::new("down", Next, None),
-        KeyBinding::new("cmd-1", OpenChat, None),
-        KeyBinding::new("cmd-2", OpenExplore, None),
-        KeyBinding::new("cmd-3", OpenFriends, None),
-        KeyBinding::new("cmd-4", OpenArchive, None),
-        KeyBinding::new("cmd-5", OpenProfile, None),
-        KeyBinding::new("cmd-shift-p", OpenPhoneCalls, None),
+        KeyBinding::new("secondary-1", OpenChat, None),
+        KeyBinding::new("secondary-2", OpenExplore, None),
+        KeyBinding::new("secondary-3", OpenFriends, None),
+        KeyBinding::new("secondary-4", OpenArchive, None),
+        KeyBinding::new("secondary-5", OpenProfile, None),
+        KeyBinding::new("secondary-shift-p", OpenPhoneCalls, None),
     ]);
 }
 

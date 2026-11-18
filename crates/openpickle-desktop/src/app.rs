@@ -1367,9 +1367,9 @@ mod tests {
         };
         reading(cx, "");
         // Another section hides the chat, so what arrives meanwhile stays unread.
-        assert_eq!(reading(cx, "cmd-2"), Some(false));
-        assert_eq!(reading(cx, "cmd-3"), Some(false));
-        assert_eq!(reading(cx, "cmd-1"), Some(true));
+        assert_eq!(reading(cx, "secondary-2"), Some(false));
+        assert_eq!(reading(cx, "secondary-3"), Some(false));
+        assert_eq!(reading(cx, "secondary-1"), Some(true));
     }
 
     #[gpui::test]
@@ -1388,7 +1388,7 @@ mod tests {
         updates.unbounded_send(conversation).unwrap();
         let (shell, cx) =
             cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
-        cx.simulate_keystrokes("cmd-2");
+        cx.simulate_keystrokes("secondary-2");
         let explore = shell.read_with(cx, |shell, _| shell.explore.clone().unwrap());
         let offer = std::sync::Arc::new(crate::model::Offer {
             id: "offer-1".into(),
@@ -1447,14 +1447,14 @@ mod tests {
         };
 
         // Each section asks the backend for its data when it is opened.
-        let commands = asked(cx, "cmd-3");
+        let commands = asked(cx, "secondary-3");
         assert!(
             commands
                 .iter()
                 .any(|command| matches!(command, Command::LoadSocial))
         );
         shell.read_with(cx, |shell, _| assert_eq!(shell.tab, Tab::Friends));
-        let commands = asked(cx, "cmd-2");
+        let commands = asked(cx, "secondary-2");
         assert!(
             commands
                 .iter()
@@ -1518,7 +1518,7 @@ mod tests {
 
         cx.simulate_resize(gpui::size(gpui::px(440.), gpui::px(900.)));
 
-        cx.simulate_keystrokes("cmd-f");
+        cx.simulate_keystrokes("secondary-f");
         cx.simulate_input("비");
         cx.simulate_keystrokes("enter");
         let asked = std::iter::from_fn(|| sent.try_recv().ok()).find_map(|command| match command {
@@ -1551,7 +1551,7 @@ mod tests {
         shell.read_with(cx, |shell, _| assert!(!shell.searching()));
 
         // Escape closes the search too.
-        cx.simulate_keystrokes("cmd-f");
+        cx.simulate_keystrokes("secondary-f");
         shell.read_with(cx, |shell, _| assert!(shell.searching()));
         cx.simulate_keystrokes("escape");
         shell.read_with(cx, |shell, _| assert!(!shell.searching()));
@@ -1741,7 +1741,7 @@ mod tests {
         let (shell, cx) =
             cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
         cx.simulate_resize(gpui::size(px(440.), px(900.)));
-        cx.simulate_keystrokes("cmd-4");
+        cx.simulate_keystrokes("secondary-4");
         let old_archive = || Update::Archive {
             room_id: "primary".into(),
             complete: true,
@@ -1890,7 +1890,7 @@ mod tests {
             Shell::new(commands, received, window, cx)
         });
         while sent.try_recv().is_ok() {}
-        cx.simulate_keystrokes("cmd-5");
+        cx.simulate_keystrokes("secondary-5");
         let commands = std::iter::from_fn(|| sent.try_recv().ok()).collect::<Vec<_>>();
         assert!(
             commands
@@ -1915,7 +1915,7 @@ mod tests {
             })))
             .unwrap();
         cx.run_until_parked();
-        cx.simulate_keystrokes("cmd-1");
+        cx.simulate_keystrokes("secondary-1");
         shell.read_with(cx, |shell, _| assert_eq!(shell.tab, Tab::Chat));
     }
 
@@ -2106,7 +2106,7 @@ mod tests {
         let (shell, cx) =
             cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
         cx.simulate_resize(gpui::size(px(440.), px(900.)));
-        cx.simulate_keystrokes("cmd-shift-p");
+        cx.simulate_keystrokes("secondary-shift-p");
         shell.read_with(cx, |shell, _| {
             assert!(matches!(shell.over, Some(Over::Phone(_))))
         });

@@ -34,9 +34,9 @@ servers the iOS app does, with your own account.
   information. The usage card opens the detailed, read-only Usage screen.
 - **Friends and invites.** The menu leads to your friends, and Invite to your invite link, how
   many invites are left and who joined with it.
-- **Search.** Cmd-F, or the search button in the menu, searches your messages on Pickle's
-  server. Opening a result takes you to that message, with the conversation around it to scroll
-  through.
+- **Search.** Cmd-F (Ctrl-F on Windows), or the search button in the menu, searches your
+  messages on Pickle's server. Opening a result takes you to that message, with the
+  conversation around it to scroll through.
 - **Select and copy.** Drag across messages to select text, or right-click for Copy, Copy Message
   and Select All. Select All takes the whole conversation, not only what is on screen.
 - **Opens at once.** The app keeps the conversation on disk and draws it before it asks the
