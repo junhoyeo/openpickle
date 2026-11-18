@@ -1,6 +1,6 @@
 {
   "name": "@openpickle/client",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "description": "Typed client for the Pickle character API (character-api-prod.picklemem.com), built from captured iOS app traffic",
   "author": "Junho Yeo <i@junho.io>",

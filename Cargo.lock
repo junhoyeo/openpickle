@@ -3934,7 +3934,7 @@ dependencies = [
 
 [[package]]
 name = "openpickle-api"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -3952,7 +3952,7 @@ dependencies = [
 
 [[package]]
 name = "openpickle-desktop"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "dirs 6.0.0",
