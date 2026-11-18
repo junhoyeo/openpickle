@@ -1,9 +1,12 @@
 //! `phone-demo float` shows a synthetic live transcript and confirmation controls. It has no
 //! backend or action subscriber and cannot place or end a real call. `ended` shows the call
 //! after it ended, `call=<file>` the transcript in that JSON file, and `app phone` the card of
-//! the call in the chat. `app float tasks` shows a made-up running task card; add `task-open`
-//! for its progress sheet, `task-expanded` for the tall scrolled state, or `task-plan` for its
-//! plan. `task=<file>` loads a `GET /api/screens/handoff` JSON body for private comparisons.
+//! the call in the chat.
+//!
+//! `app tasks` shows the card of a made-up task in the chat, and `task-demo` the sheet with its
+//! progress: `expanded` as it is after scrolling, `plan` with the plan open, `ended` after the
+//! task finished, `task=<file>` with the progress in that JSON file, the body of a
+//! `GET /api/screens/handoff`.
 //!
 //! Opens the chat screen with made-up messages that have the same structure as the Figma frames,
 //! to compare the two side by side: `cargo run -p openpickle-desktop --example gallery`.
