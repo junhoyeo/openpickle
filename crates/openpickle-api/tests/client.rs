@@ -315,6 +315,34 @@ async fn an_offer_is_asked_for_with_its_text_and_its_id() {
 }
 
 #[tokio::test]
+async fn handoff_reads_progress_with_open_node_kinds_and_encodes_the_name() {
+    let server = MockServer::start(|_| {
+        Reply::json(
+            200,
+            r###"{"kind":"handoff","state":"running","title":"🧭 Plan a day trip","requested_at_epoch_ms":1700000000000.0,"latest_log_text":"Comparing routes","latest_log_kind":"web","handoff_estimate_pct":50,"plan_blocks":[{"type":"prose","markdown":"## Plan\nCompare two routes."}],"log_entries":[],"log_nodes":[{"kind":"future_kind","text":"Checking an option"},{"kind":"report","text":"A useful result"}]}"###,
+        )
+    })
+    .await;
+    let pickle = client(&server, Credentials::AccessToken("synthetic-token".into()));
+
+    let handoff = pickle.get_handoff("day trip/서울?").await.unwrap();
+
+    assert_eq!(handoff.state, "running");
+    assert_eq!(
+        handoff.plan_blocks[0].markdown.as_deref(),
+        Some("## Plan\nCompare two routes.")
+    );
+    assert_eq!(handoff.log_nodes[0].kind, "future_kind");
+    assert_eq!(
+        handoff.log_nodes[1].text.as_deref(),
+        Some("A useful result")
+    );
+    let request = &server.take()[0];
+    assert_eq!(request.path, "/api/screens/handoff");
+    assert_eq!(request.query, "name=day%20trip%2F%EC%84%9C%EC%9A%B8%3F");
+}
+
+#[tokio::test]
 async fn phone_calls_read_live_ending_and_completed_shapes_and_encode_the_id() {
     let line = r#"{"id":"line-1","line_id":"line-1","speaker":"me","text":"Synthetic transcript line","keys":"12#","joins_previous":false,"joins_next":false}"#;
     let server = MockServer::start(move |request| {

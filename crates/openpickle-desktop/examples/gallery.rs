@@ -1,18 +1,21 @@
 //! `phone-demo float` shows a synthetic live transcript and confirmation controls. It has no
 //! backend or action subscriber and cannot place or end a real call. `ended` shows the call
 //! after it ended, `call=<file>` the transcript in that JSON file, and `app phone` the card of
-//! the call in the chat.
+//! the call in the chat. `app float tasks` shows a made-up running task card; add `task-open`
+//! for its progress sheet, `task-expanded` for the tall scrolled state, or `task-plan` for its
+//! plan. `task=<file>` loads a `GET /api/screens/handoff` JSON body for private comparisons.
 //!
 //! Opens the chat screen with made-up messages that have the same structure as the Figma frames,
 //! to compare the two side by side: `cargo run -p openpickle-desktop --example gallery`.
 //! Pass `login` to see the sign-in screen instead, or `app` to run the whole window on these
 //! messages: the menu, and a search that looks through them (Cmd-F).
 //!
-//! After `app`, further arguments are played into the window as keys, so a flow can be looked
-//! at without the real keyboard: `key:<keystroke>`, `type:<text>` and `wait:<ms>`. `float`
-//! keeps the window above the others and leaves the keyboard focus where it is. For example:
+//! Further arguments are played into the window as steps, so a flow can be looked at without
+//! the real keyboard: `key:<keystroke>`, `type:<text>` and `wait:<ms>`. `shot:<file>` saves the
+//! window as a PNG, which needs no Screen Recording permission. `float` keeps the window above
+//! the others and leaves the keyboard focus where it is. For example:
 //!
-//!     gallery app float key:cmd-f type:취소표 wait:600 key:down key:enter
+//!     gallery app float key:cmd-f type:취소표 wait:600 key:down key:enter shot:/tmp/found.png
 
 use std::sync::Arc;
 
@@ -29,7 +32,7 @@ use openpickle_desktop::{
         Attachment, AttachmentKind, Explore, Invite, Message, Offer, OfferSection, Part, Person,
         Request, RequestStatus, SearchResult, Side, Social, build_rows,
     },
-    protocol::{Command, Update},
+    protocol::{Command, HandoffCard, Update},
     ui::{self, chat::ChatView, login::LoginView},
 };
 
@@ -83,6 +86,72 @@ fn sample_phone_call(call_id: &str, live: bool) -> openpickle_api::PhoneCallTran
         call["duration_s"] = 95.into();
     }
     serde_json::from_value(call).unwrap()
+}
+
+/// The progress of a made-up task, or with `task=<file>` the one in that JSON file, which is
+/// the body of a `GET /api/screens/handoff`.
+fn sample_task_screen(running: bool) -> openpickle_api::HandoffScreen {
+    if let Some(path) = std::env::args().find_map(|arg| arg.strip_prefix("task=").map(String::from))
+    {
+        return serde_json::from_slice(&std::fs::read(path).expect("read task JSON"))
+            .expect("parse GET /api/screens/handoff body");
+    }
+    let node = |kind: &str, text: &str| openpickle_api::HandoffLogNode {
+        kind: kind.into(),
+        text: Some(text.into()),
+    };
+    openpickle_api::HandoffScreen {
+        kind: "handoff".into(),
+        state: if running { "running" } else { "done" }.into(),
+        title: "🧭 Plan a museum afternoon".into(),
+        requested_at_epoch_ms: chrono::Utc::now().timestamp_millis() as f64 - 137_000.,
+        latest_log_text: Some("Comparing walking times between the two museums".into()),
+        latest_log_kind: Some("shell".into()),
+        handoff_estimate_pct: Some(50.),
+        plan_blocks: vec![openpickle_api::HandoffPlanBlock {
+            r#type: "prose".into(),
+            markdown: Some(
+                "## Afternoon plan\n\nCompare opening hours, travel time, and one nearby café."
+                    .into(),
+            ),
+        }],
+        log_entries: Vec::new(),
+        log_nodes: vec![
+            node("report", "The request was handed to the trip researcher."),
+            node("start", "Work started"),
+            node(
+                "page",
+                "Reading notes/trips/museum-afternoon/visitor-guide.md",
+            ),
+            node("web", "Searching \"museum late opening hours Thursday\""),
+            node("browser", "Opening https://example.com/transit/planner"),
+            node(
+                "report",
+                "Both museums are open late. Next I compare the routes.",
+            ),
+            node("shell", "Comparing walking times between the two museums"),
+        ],
+    }
+}
+
+/// What the handoff list says about the same task.
+fn sample_task_item(running: bool) -> openpickle_api::HandoffItem {
+    let task = sample_task_screen(running);
+    openpickle_api::HandoffItem {
+        name: "sample-task".into(),
+        title: task.title,
+        subtitle: (task.state != "running").then(|| "Nov 18, 2:10pm".into()),
+        state: task.state,
+        requested_at_epoch_ms: task.requested_at_epoch_ms,
+        finished_at_epoch_ms: None,
+        result_text: None,
+        time_text: "Now".into(),
+        latest_log_text: task.latest_log_text,
+        latest_log_kind: task.latest_log_kind,
+        phone_call_id: None,
+        phone_status_text: None,
+        phone_answered_at_epoch_ms: None,
+    }
 }
 
 /// Made-up profile values, never copied from an account or a capture.
@@ -314,6 +383,22 @@ fn sample_explore() -> Explore {
     }
 }
 
+/// The app's own window, or with `float` one that stays above the others and takes no focus.
+fn float_options(float: bool, cx: &mut App) -> WindowOptions {
+    if !float {
+        return ui::window_options(cx);
+    }
+    WindowOptions {
+        kind: WindowKind::PopUp,
+        focus: false,
+        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+            point(px(1280.), px(140.)),
+            size(px(440.), px(900.)),
+        ))),
+        ..Default::default()
+    }
+}
+
 /// Plays one step of input into the window.
 fn play(step: &str, window: &mut Window, cx: &mut App) {
     let (name, value) = step.split_once(':').unwrap_or((step, ""));
@@ -331,9 +416,106 @@ fn play(step: &str, window: &mut Window, cx: &mut App) {
                 window.dispatch_keystroke(keystroke, cx);
             }
         }
+        "shot" => shoot(value, window),
         _ => panic!("unknown step {step}"),
     }
     window.refresh();
+}
+
+/// Saves the window as it is drawn into a PNG file. A process may read its own windows, so
+/// this needs no Screen Recording permission, which `screencapture` does.
+#[cfg(target_os = "macos")]
+fn shoot(path: &str, window: &Window) {
+    use std::ffi::{c_char, c_void};
+
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    type Ref = *const c_void;
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Rect {
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        static CGRectNull: Rect;
+        fn CGWindowListCreateImage(bounds: Rect, list: u32, window: u32, image: u32) -> Ref;
+    }
+    #[link(name = "ImageIO", kind = "framework")]
+    unsafe extern "C" {
+        fn CGImageDestinationCreateWithURL(url: Ref, kind: Ref, count: usize, options: Ref) -> Ref;
+        fn CGImageDestinationAddImage(destination: Ref, image: Ref, properties: Ref);
+        fn CGImageDestinationFinalize(destination: Ref) -> bool;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFURLCreateFromFileSystemRepresentation(
+            allocator: Ref,
+            path: *const u8,
+            length: isize,
+            directory: bool,
+        ) -> Ref;
+        fn CFStringCreateWithCString(allocator: Ref, text: *const c_char, encoding: u32) -> Ref;
+        fn CFRelease(value: Ref);
+    }
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn sel_registerName(name: *const c_char) -> Ref;
+        fn objc_msgSend();
+    }
+    const ONLY_THIS_WINDOW: u32 = 1 << 3;
+    const WITHOUT_SHADOW: u32 = 1 << 0;
+    const AT_SCREEN_RESOLUTION: u32 = 1 << 3;
+    const UTF8: u32 = 0x0800_0100;
+
+    let handle = HasWindowHandle::window_handle(window).expect("the window's handle");
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        panic!("an AppKit window");
+    };
+    let view: Ref = handle.ns_view.as_ptr();
+    // SAFETY: `view` is the live NSView of this window and the calls are made on the main
+    // thread. `objc_msgSend` is called through the signature of the message sent. Every
+    // Core Foundation object created here is released once.
+    unsafe {
+        let untyped = objc_msgSend as unsafe extern "C" fn();
+        let object: unsafe extern "C" fn(Ref, Ref) -> Ref = std::mem::transmute(untyped);
+        let integer: unsafe extern "C" fn(Ref, Ref) -> isize = std::mem::transmute(untyped);
+        let ns_window = object(view, sel_registerName(c"window".as_ptr()));
+        let number = integer(ns_window, sel_registerName(c"windowNumber".as_ptr()));
+        let image = CGWindowListCreateImage(
+            CGRectNull,
+            ONLY_THIS_WINDOW,
+            number as u32,
+            WITHOUT_SHADOW | AT_SCREEN_RESOLUTION,
+        );
+        assert!(!image.is_null(), "the window could not be read");
+        let null = std::ptr::null();
+        let url = CFURLCreateFromFileSystemRepresentation(
+            null,
+            path.as_ptr(),
+            path.len() as isize,
+            false,
+        );
+        let png = CFStringCreateWithCString(null, c"public.png".as_ptr(), UTF8);
+        let destination = CGImageDestinationCreateWithURL(url, png, 1, null);
+        assert!(!destination.is_null(), "{path} could not be opened");
+        CGImageDestinationAddImage(destination, image, null);
+        assert!(
+            CGImageDestinationFinalize(destination),
+            "{path} was not written"
+        );
+        for value in [destination, png, url, image] {
+            CFRelease(value);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn shoot(_: &str, _: &Window) {
+    panic!("shot: is built for macOS only");
 }
 
 /// Stands in for the server's search: the bubbles that contain the text, newest first.
@@ -381,6 +563,7 @@ fn message(seq: u64, minutes_ago: f64, side: Side, text: &str) -> Message {
 }
 
 fn main() {
+    let task_card = std::env::args().any(|arg| arg == "tasks");
     let mut messages = vec![
         message(
             1,
@@ -458,6 +641,25 @@ fn main() {
         messages.push(message(11, 0.5, Side::Mine, "주말에도 여는지 알려줘"));
     }
 
+    // `tasks` adds a task that is not a call. The fake backend below has its card.
+    if task_card {
+        messages.push(message(
+            9,
+            0.9,
+            Side::Theirs,
+            "<bubble>I’ll compare a few options and put together a simple afternoon plan.</bubble>",
+        ));
+        let task = serde_json::json!({
+            "id": "sample-task", "role": "subagent", "seq": 10,
+            "at": Local::now().timestamp() as f64 - 0.8 * 60.,
+            "title": "🧭 Plan a museum afternoon", "path": "handoffs/sample-task",
+        });
+        messages.push(openpickle_desktop::convert::message(
+            &serde_json::from_value(task).unwrap(),
+            None,
+        ));
+    }
+
     // `many` repeats the conversation to check that a long history costs nothing at launch.
     if std::env::args().any(|arg| arg == "many") {
         let sample = messages.clone();
@@ -472,8 +674,11 @@ fn main() {
     let login = std::env::args().any(|arg| arg == "login");
     let whole_app = std::env::args().any(|arg| arg == "app");
     let phone_demo = std::env::args().any(|arg| arg == "phone-demo");
-    // A call is live in the samples unless `ended` says otherwise.
-    let live_call = !std::env::args().any(|arg| arg == "ended");
+    let task_sheet = std::env::args().any(|arg| arg == "task-demo");
+    let task_expanded = std::env::args().any(|arg| arg == "expanded");
+    let task_plan = std::env::args().any(|arg| arg == "plan");
+    // In the samples a call is live and a task runs, unless `ended` says otherwise.
+    let live = !std::env::args().any(|arg| arg == "ended");
     let float = std::env::args().any(|arg| arg == "float");
     let steps: Vec<String> = std::env::args().filter(|arg| arg.contains(':')).collect();
     let started = std::time::Instant::now();
@@ -482,27 +687,18 @@ fn main() {
         .run(move |cx: &mut App| {
             eprintln!("app ready after {:?}", started.elapsed());
             ui::bind_keys(cx);
-            if login {
+            // The untyped handle: a typed one would hold the root view while a step is played,
+            // and the steps make the root view do things.
+            let window: AnyWindowHandle = if login {
                 cx.open_window(ui::window_options(cx), |window, cx| {
                     let view = cx.new(LoginView::new);
                     window.focus(&view.focus_handle(cx));
                     view
                 })
-                .unwrap();
+                .unwrap()
+                .into()
             } else if phone_demo {
-                let options = if float {
-                    WindowOptions {
-                        kind: WindowKind::PopUp,
-                        focus: false,
-                        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-                            point(px(1280.), px(140.)),
-                            size(px(440.), px(900.)),
-                        ))),
-                        ..Default::default()
-                    }
-                } else {
-                    ui::window_options(cx)
-                };
+                let options = float_options(float, cx);
                 cx.open_window(options, |window, cx| {
                     let view = cx.new(|cx| {
                         ui::phone::PhoneView::new(
@@ -514,14 +710,36 @@ fn main() {
                     view.update(cx, |view, cx| {
                         view.set_call(
                             "sample-call",
-                            Ok(sample_phone_call("sample-call", live_call)),
+                            Ok(sample_phone_call("sample-call", live)),
                             cx,
                         )
                     });
                     window.focus(&view.focus_handle(cx));
                     view
                 })
-                .unwrap();
+                .unwrap()
+                .into()
+            } else if task_sheet {
+                let options = float_options(float, cx);
+                cx.open_window(options, |window, cx| {
+                    let view = cx.new(|cx| {
+                        let pictures = cx.new(|_| ui::Pictures::default());
+                        let path = "handoffs/sample-task".to_owned();
+                        let mut view = ui::tasks::TaskView::new(
+                            path.clone(),
+                            sample_task_item(live),
+                            pictures,
+                            cx,
+                        );
+                        view.set_handoff(&path, Ok(sample_task_screen(live)), cx);
+                        view.show(task_expanded, task_plan, cx);
+                        view
+                    });
+                    window.focus(&view.focus_handle(cx));
+                    view
+                })
+                .unwrap()
+                .into()
             } else if whole_app {
                 let (commands, mut asked) = tokio::sync::mpsc::unbounded_channel();
                 let (updates, received) = futures::channel::mpsc::unbounded();
@@ -557,12 +775,26 @@ fn main() {
                                     at: "Today".into(),
                                 },
                             ])),
-                            Command::LoadPhoneCard(path) => Update::PhoneCard {
+                            Command::LoadHandoffCard(path) if task_card => {
+                                let task = sample_task_item(live);
+                                let title = live.then(|| task.title.clone());
+                                updates.unbounded_send(Update::ActiveTask(title)).ok();
+                                Update::HandoffCard {
+                                    path,
+                                    card: HandoffCard::Task(task),
+                                }
+                            }
+                            Command::LoadHandoffCard(path) => Update::HandoffCard {
                                 path,
-                                call: sample_phone_call("sample-call", live_call),
+                                card: HandoffCard::Phone(sample_phone_call("sample-call", live)),
                             },
+                            Command::WatchHandoff(Some(path)) if task_card => Update::Handoff {
+                                path,
+                                result: Ok(sample_task_screen(live)),
+                            },
+                            Command::WatchHandoff(_) => continue,
                             Command::WatchPhoneCall(Some(call_id)) => Update::PhoneCall {
-                                result: Ok(sample_phone_call(&call_id, live_call)),
+                                result: Ok(sample_phone_call(&call_id, live)),
                                 call_id,
                             },
                             Command::WatchPhoneCall(None) => continue,
@@ -610,66 +842,55 @@ fn main() {
                         updates.unbounded_send(update).ok();
                     }
                 });
-                let options = match float {
-                    false => ui::window_options(cx),
-                    true => WindowOptions {
-                        kind: WindowKind::PopUp,
-                        focus: false,
-                        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-                            point(px(1280.), px(140.)),
-                            size(px(440.), px(900.)),
-                        ))),
-                        ..Default::default()
-                    },
-                };
-                // The untyped handle: the typed one would hold the root view while a key is
-                // played, and the keys make the root view do things.
-                let window: AnyWindowHandle = cx
-                    .open_window(options, |window, cx| {
-                        cx.new(|cx| Shell::new(commands, received, window, cx))
-                    })
-                    .unwrap()
-                    .into();
-                cx.spawn(async move |cx: &mut AsyncApp| {
-                    for step in steps {
-                        let pause = step
-                            .strip_prefix("wait:")
-                            .map_or(300, |ms| ms.parse().unwrap());
-                        cx.background_executor()
-                            .timer(std::time::Duration::from_millis(pause))
-                            .await;
-                        if !step.starts_with("wait:") {
-                            window
-                                .update(cx, |_, window, cx| play(&step, window, cx))
-                                .ok();
-                        }
-                    }
+                let options = float_options(float, cx);
+                cx.open_window(options, |window, cx| {
+                    cx.new(|cx| Shell::new(commands, received, window, cx))
                 })
-                .detach();
+                .unwrap()
+                .into()
             } else {
-                cx.open_window(ui::window_options(cx), |window, cx| {
-                    let view = cx.new(|cx| {
-                        let pictures = cx.new(|_| ui::Pictures::default());
-                        let mut view = ChatView::new(pictures, cx);
-                        let (rows, _) = build_rows(&messages, Some(Some("Working")), Local::now());
-                        eprintln!("{} messages, {} rows", messages.len(), rows.len());
-                        view.set_rows(rows, cx);
+                let window = cx
+                    .open_window(ui::window_options(cx), |window, cx| {
+                        let view = cx.new(|cx| {
+                            let pictures = cx.new(|_| ui::Pictures::default());
+                            let mut view = ChatView::new(pictures, cx);
+                            let (rows, _) =
+                                build_rows(&messages, Some(Some("Working")), Local::now());
+                            eprintln!("{} messages, {} rows", messages.len(), rows.len());
+                            view.set_rows(rows, cx);
+                            view
+                        });
+                        window.focus(&view.focus_handle(cx));
+                        // GPUI draws the first frame while opening the window; this runs when the
+                        // display asks for the next one.
+                        window.on_next_frame(move |_, _| {
+                            eprintln!("second frame requested after {:?}", started.elapsed())
+                        });
                         view
-                    });
-                    window.focus(&view.focus_handle(cx));
-                    // GPUI draws the first frame while opening the window; this runs when the
-                    // display asks for the next one.
-                    window.on_next_frame(move |_, _| {
-                        eprintln!("second frame requested after {:?}", started.elapsed())
-                    });
-                    view
-                })
-                .unwrap();
+                    })
+                    .unwrap();
                 eprintln!(
                     "window open and first frame drawn after {:?}",
                     started.elapsed()
                 );
-            }
+                window.into()
+            };
+            cx.spawn(async move |cx: &mut AsyncApp| {
+                for step in steps {
+                    let pause = step
+                        .strip_prefix("wait:")
+                        .map_or(300, |ms| ms.parse().unwrap());
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(pause))
+                        .await;
+                    if !step.starts_with("wait:") {
+                        window
+                            .update(cx, |_, window, cx| play(&step, window, cx))
+                            .ok();
+                    }
+                }
+            })
+            .detach();
             if !float {
                 cx.activate(true);
             }

@@ -7,22 +7,25 @@ use gpui::{
     ObjectFit, Pixels, SharedString, StyledText, UnderlineStyle, Window, div, img,
     linear_color_stop, linear_gradient, prelude::*, px, relative, svg,
 };
-use openpickle_api::PhoneCallTranscript;
+use openpickle_api::{HandoffItem, PhoneCallTranscript};
 
 use crate::{
     content::{Card, CardRow, RichText, Span, SpanKind},
     model::{AttachmentKind, Part, Request, RequestStatus, Row, RowKind, Side},
-    phone, theme,
+    phone,
+    protocol::HandoffCard,
+    theme,
     ui::{
         Pictures,
         phone::{TRACKED, transcript_line},
         select::{LinkHandler, SelectableText, SharedSelection},
-        wrap::keep_words,
+        tasks::elapsed_label,
+        wrap::{fit, keep_words, line_width},
     },
 };
 
-/// The calls the phone cards show, by the handoff path of their task.
-pub type PhoneCards = HashMap<String, PhoneCallTranscript>;
+/// The task or call each handoff card shows, by its handoff path.
+pub type HandoffCards = HashMap<String, HandoffCard>;
 
 /// Widths from the design column (408 pt of content): bubbles hug their text up to these.
 const THEIRS_MAX: f32 = 394. / 408.;
@@ -43,8 +46,8 @@ pub struct RowContext<'a> {
     pub pictures: &'a Pictures,
     /// Whether the row belongs to the message a search result has just opened.
     pub marked: bool,
-    /// The calls that have been read for the phone cards.
-    pub phone_cards: Option<&'a PhoneCards>,
+    /// The summaries that have been read for the handoff cards.
+    pub handoff_cards: Option<&'a HandoffCards>,
     /// The character's picture, which stands next to its lines of a call.
     pub avatar: Option<ImageSource>,
     /// How many of the row's texts have been drawn so far.
@@ -71,7 +74,7 @@ impl<'a> RowContext<'a> {
             on_link,
             pictures,
             marked: false,
-            phone_cards: None,
+            handoff_cards: None,
             avatar: None,
             drawn: Cell::new(0),
         }
@@ -113,23 +116,22 @@ pub fn render_row(cx: &RowContext) -> AnyElement {
                 Side::Mine => line.justify_end(),
                 Side::Theirs => line.justify_start(),
             };
-            let surface = shaped(row, matches!(part, Part::Bubble(_) | Part::Task(_)));
+            // A handoff stays the quiet task note only until the handoff list identifies it.
+            let card = match part {
+                Part::PhoneTask { path, .. } => cx.handoff_cards.and_then(|cards| cards.get(path)),
+                _ => None,
+            };
+            let is_note = matches!(part, Part::Task(_))
+                || (matches!(part, Part::PhoneTask { .. }) && card.is_none());
+            let surface = shaped(row, matches!(part, Part::Bubble(_)) || is_note);
             let content: AnyElement = match part {
-                Part::PhoneTask { title, path } => phone_card(surface, title, path, cx),
+                Part::PhoneTask { title, path } => match card {
+                    Some(HandoffCard::Phone(call)) => phone_card(surface, call, path, cx),
+                    Some(HandoffCard::Task(task)) => task_card(surface, task, path, cx),
+                    None => task_note(surface, title, cx),
+                },
                 Part::Bubble(rich) => bubble(surface, rich, cx).into_any_element(),
-                // A note, not speech: a started task, attachments, a failed send.
-                Part::Task(title) => surface
-                    .px(px(14.))
-                    .py(px(11.))
-                    .max_w(relative(THEIRS_MAX))
-                    .when(row.side == Side::Theirs, |note| {
-                        note.text_color(theme::color(theme::TEXT_MUTED))
-                    })
-                    .when(row.side == Side::Mine, |note| {
-                        note.text_color(theme::alpha(theme::ON_MINE, 0.6))
-                    })
-                    .child(plain(title, cx))
-                    .into_any_element(),
+                Part::Task(title) => task_note(surface, title, cx),
                 Part::Files(files) => {
                     let room = cx.content_width
                         * if row.side == Side::Mine {
@@ -331,6 +333,121 @@ fn file_card(item: &crate::model::Attachment, room: Pixels, cx: &RowContext) -> 
         .into_any_element()
 }
 
+/// The phone app's task card is 280 pt wide. Its texts fill 220 pt, left of the chevron.
+const TASK_CARD_WIDTH: f32 = 280.;
+const TASK_CARD_TEXT: f32 = 220.;
+
+/// A task Pickle handed off, as the phone app draws it in the chat: its title, what it is
+/// doing now and for how long, and the note that the chat stays open meanwhile. A task that
+/// has ended keeps its title and the line the handoff list has about it.
+fn task_card(surface: Div, task: &HandoffItem, path: &str, cx: &RowContext) -> AnyElement {
+    let target = format!("handoff:{path}");
+    let on_link = cx.on_link.clone();
+    let selection = cx.selection.clone();
+    let running = task.state == "running";
+    let room = px(TASK_CARD_TEXT);
+    let label = px(14. * TRACKED);
+    let fit_label =
+        |text: &str, room: Pixels| fit(text, label, FontWeight::NORMAL, room, cx.window);
+    let status = if running {
+        let elapsed = elapsed_label(task.requested_at_epoch_ms, phone::now_ms());
+        let line = div()
+            .flex()
+            .gap(px(3.))
+            .text_color(theme::color(theme::LINK));
+        Some(match task.latest_log_text.as_deref() {
+            Some(log) => {
+                let elapsed = format!("· {elapsed}");
+                let taken = line_width(&elapsed, label, FontWeight::NORMAL, cx.window);
+                line.child(fit_label(log, room - px(3.) - taken))
+                    .child(elapsed)
+            }
+            // Nothing is logged yet: the time alone says that the task runs.
+            None => line.child(elapsed),
+        })
+    } else {
+        task.subtitle.as_deref().map(|subtitle| {
+            div()
+                .text_color(theme::color(theme::TEXT_FAINT))
+                .child(fit_label(subtitle, room))
+        })
+    };
+    let texts = div()
+        .w(room)
+        .flex_none()
+        .flex()
+        .flex_col()
+        .whitespace_nowrap()
+        .child(
+            div()
+                .text_size(px(16.))
+                .line_height(px(22.))
+                .font_weight(FontWeight::MEDIUM)
+                .child(fit(
+                    &task.title,
+                    px(16.),
+                    FontWeight::MEDIUM,
+                    room,
+                    cx.window,
+                )),
+        )
+        .children(status.map(|status| status.pt(px(4.)).text_size(label).line_height(px(18.))));
+    let chevron = div()
+        .w(px(20.))
+        .flex()
+        .justify_center()
+        .opacity(0.8)
+        .child(super::icon("chevron-right", 14., theme::TEXT_FAINT));
+    let footer = running.then(|| {
+        div()
+            .mt(px(8.))
+            .pt(px(6.75))
+            .border_t_1()
+            .border_color(theme::color(theme::HAIRLINE))
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .text_size(px(12. * TRACKED))
+            .line_height(px(16.))
+            .text_color(theme::alpha(theme::TEXT_MUTED, 0.9))
+            .child(
+                div()
+                    .w(px(16.))
+                    .pb(px(1.5))
+                    .flex()
+                    .justify_center()
+                    .opacity(0.7)
+                    .child(super::icon("message-circle-filled", 12., theme::TEXT_FAINT)),
+            )
+            .child("Feel free to chat about other things")
+    });
+    surface
+        .id(("handoff-task", cx.index))
+        .w(px(TASK_CARD_WIDTH))
+        .max_w_full()
+        .px(px(16.))
+        .pt(px(14.5))
+        .pb(px(if running { 10.75 } else { 13.5 }))
+        .flex()
+        .flex_col()
+        .cursor_pointer()
+        .on_click(move |_, window, cx| {
+            if selection.borrow().is_empty() {
+                on_link(&target, window, cx);
+            }
+        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(texts)
+                .child(chevron),
+        )
+        .children(footer)
+        .into_any_element()
+}
+
 /// The transcript in a phone card is the transcript screen at this scale, with text that is
 /// a little larger for it: a line holds fewer words there.
 const CARD_TRANSCRIPT_SCALE: f32 = 0.73;
@@ -338,22 +455,31 @@ const CARD_TEXT_SCALE: f32 = 0.742;
 /// A card shows the end of the call: no more lines than can fill its window.
 const CARD_TRANSCRIPT_LINES: usize = 6;
 
+/// A note, not speech: a task the character started, a failed send.
+fn task_note(surface: Div, title: &str, cx: &RowContext) -> AnyElement {
+    surface
+        .px(px(14.))
+        .py(px(11.))
+        .max_w(relative(THEIRS_MAX))
+        .when(cx.row.side == Side::Theirs, |note| {
+            note.text_color(theme::color(theme::TEXT_MUTED))
+        })
+        .when(cx.row.side == Side::Mine, |note| {
+            note.text_color(theme::alpha(theme::ON_MINE, 0.6))
+        })
+        .child(plain(title, cx))
+        .into_any_element()
+}
+
 /// A call Pickle placed: its name, the other side and how long it lasted, over the end of its
-/// transcript. Until the call has been read the card has the task's title alone.
-fn phone_card(surface: Div, title: &str, path: &str, cx: &RowContext) -> AnyElement {
-    let call = cx.phone_cards.and_then(|cards| cards.get(path));
+/// transcript.
+fn phone_card(surface: Div, call: &PhoneCallTranscript, path: &str, cx: &RowContext) -> AnyElement {
     let target = format!("handoff:{path}");
     let on_link = cx.on_link.clone();
     let selection = cx.selection.clone();
-    // The task is titled "📞 name"; the card has its own phone icon.
-    let name = call.map_or_else(
-        || title.trim_start_matches('📞').trim_start().to_owned(),
-        |call| call.title.clone(),
-    );
-    let counterpart = call
-        .map(|call| call.counterpart_label.clone())
-        .filter(|label| !label.is_empty());
-    let duration = call.and_then(|call| phone::duration_label(call, phone::now_ms()));
+    let name = call.title.clone();
+    let counterpart = Some(call.counterpart_label.clone()).filter(|label| !label.is_empty());
+    let duration = phone::duration_label(call, phone::now_ms());
 
     let header = div()
         .w_full()
@@ -412,13 +538,10 @@ fn phone_card(surface: Div, title: &str, path: &str, cx: &RowContext) -> AnyElem
                 .child(duration)
         }));
 
-    let lines = call.map(|call| {
-        let from = call.lines.len().saturating_sub(CARD_TRANSCRIPT_LINES);
-        &call.lines[from..]
-    });
+    let lines = &call.lines[call.lines.len().saturating_sub(CARD_TRANSCRIPT_LINES)..];
     // The window on the transcript: its last lines stand at the bottom, the ones before them
     // run out under the top, where the page fades in over them.
-    let transcript = lines.filter(|lines| !lines.is_empty()).map(|lines| {
+    let transcript = (!lines.is_empty()).then(|| {
         div()
             .relative()
             .mx(px(4.))
@@ -484,7 +607,7 @@ fn phone_card(surface: Div, title: &str, path: &str, cx: &RowContext) -> AnyElem
 
 /// Text with its bold, link and code ranges styled. `wrap` is the width body text may fill;
 /// with it, lines break between words only.
-fn rich_text(rich: &RichText, wrap: Option<Pixels>, cx: &RowContext) -> AnyElement {
+pub(super) fn rich_text(rich: &RichText, wrap: Option<Pixels>, cx: &RowContext) -> AnyElement {
     text(&rich.text, &rich.spans, wrap, cx)
 }
 

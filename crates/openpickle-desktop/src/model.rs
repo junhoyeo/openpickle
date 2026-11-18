@@ -170,7 +170,8 @@ pub enum Part {
     Request(Arc<Request>),
     /// A task the character started (a phone call, a purchase).
     Task(Arc<str>),
-    /// A subagent handoff whose call transcript can be resolved from the handoff list.
+    /// A task the character handed off. It is drawn as the note of a started task, and as a
+    /// phone card once the handoff list is known to have a call for it.
     PhoneTask {
         title: Arc<str>,
         path: String,

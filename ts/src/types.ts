@@ -576,6 +576,37 @@ export interface HandoffsScreen {
   sections: { key: string; date_label: string; items: HandoffItem[] }[];
 }
 
+export interface HandoffPlanBlock {
+  /** `prose` in the captured response; other block types remain readable. */
+  type: Open<"prose">;
+  markdown?: string;
+}
+
+export interface HandoffLogEntry {
+  /** `report`, `page`, `shell`, …; the server may add kinds without a client update. */
+  type: Open<"report" | "start" | "page" | "shell" | "web" | "browser">;
+  text?: string;
+}
+
+export interface HandoffLogNode {
+  kind: Open<"report" | "start" | "page" | "shell" | "web" | "browser">;
+  text?: string;
+}
+
+/** `GET /api/screens/handoff?name=`: one task's plan and progress log. */
+export interface HandoffScreen {
+  kind: Open<"handoff">;
+  state: Open<"done" | "canceled" | "running" | "planned">;
+  title: string;
+  requested_at_epoch_ms: number;
+  latest_log_text?: string;
+  latest_log_kind?: string;
+  handoff_estimate_pct?: number;
+  plan_blocks: HandoffPlanBlock[];
+  log_entries: HandoffLogEntry[];
+  log_nodes: HandoffLogNode[];
+}
+
 export interface ExtraConversation {
   /** `<kind>:<id>`, e.g. `phone:<call_id>`. */
   id: string;
