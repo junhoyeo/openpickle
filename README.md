@@ -27,6 +27,9 @@ servers the iOS app does, with your own account.
 - **Phone calls.** A call Pickle placed shows in the chat as a card with the end of its
   transcript. Open it to read the whole call as it goes, and request an end only after
   confirmation. Opening a call or the call list does not dial a number.
+- **Tasks.** A task Pickle takes on shows in the chat as a card with what it is doing now and
+  for how long, and the chat's header names it while it runs. Open the card to read the
+  task's plan and the log of its steps. The app only reads a task: it cannot cancel one.
 - **My Pickle.** The fourth tab shows account, usage, reset-ticket holdings and connected-service
   information. The usage card opens the detailed, read-only Usage screen.
 - **Friends and invites.** The menu leads to your friends, and Invite to your invite link, how
