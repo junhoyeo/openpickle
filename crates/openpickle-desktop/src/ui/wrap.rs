@@ -321,9 +321,9 @@ mod tests {
 
     #[test]
     fn breaks_only_at_spaces_and_keeps_byte_offsets() {
-        let text = "취소표 감시는 계속 돌려둘게요";
+        let text = "빈자리 알림은 계속 켜두겠어요";
         let wrapped = wrap(text, 80.);
-        assert_eq!(wrapped, "취소표 감시는\n계속 돌려둘게요");
+        assert_eq!(wrapped, "빈자리 알림은\n계속 켜두겠어요");
         assert_eq!(wrapped.len(), text.len());
     }
 
