@@ -151,8 +151,13 @@ fn decode_segment(segment: &str) -> String {
 
 /// The endpoint label: path with private resource ids replaced.
 fn label(flow: &Flow) -> String {
-    if flow.path.starts_with("/api/attachments/") && flow.path.ends_with("/thumbnail") {
-        return format!("{} /api/attachments/{{path}}/thumbnail", flow.method);
+    if flow.path.starts_with("/api/attachments/") {
+        let thumbnail = if flow.path.ends_with("/thumbnail") {
+            "/thumbnail"
+        } else {
+            ""
+        };
+        return format!("{} /api/attachments/{{path}}{thumbnail}", flow.method);
     }
     let segments: Vec<&str> = flow.path.split('/').collect();
     let mut out = Vec::with_capacity(segments.len());
@@ -284,6 +289,9 @@ async fn call(client: &PickleClient, flow: &Flow, json: &Value) -> Option<Result
             // The segments are decoded already; the client encodes them again.
             let path = rest[..rest.len() - 1].join("/");
             done(client.get_attachment_thumbnail(&path).await)
+        }
+        ("GET", ["", "api", "attachments", rest @ ..]) => {
+            done(client.get_attachment(&rest.join("/")).await)
         }
         ("GET", ["", "api", "rooms", room, "history", "delta"]) => {
             let limit = q("limit").parse().ok();

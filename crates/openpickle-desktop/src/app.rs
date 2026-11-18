@@ -339,6 +339,23 @@ impl Shell {
                     view.update(cx, |view, cx| view.loaded(result, cx));
                 }
             }
+            Update::AttachmentDownloaded { path, result } => {
+                if let Some(Over::Attachment(view)) = &self.over
+                    && view.read(cx).path() == path
+                {
+                    view.update(cx, |view, cx| view.downloaded(result, cx));
+                } else {
+                    // The preview was closed meanwhile: the file is saved all the same.
+                    self.notice = Some(match result {
+                        Ok(file) => {
+                            let name = file.file_name().unwrap_or_default().to_string_lossy();
+                            format!("Saved {name} to your downloads.").into()
+                        }
+                        Err(reason) => reason.into(),
+                    });
+                    cx.notify();
+                }
+            }
             Update::PhoneTask { path, result } => {
                 if self.pending_phone_task.as_deref() == Some(path.as_str()) {
                     self.pending_phone_task = None;
@@ -1038,6 +1055,19 @@ impl Shell {
                                 let path = view.read(cx).path().to_owned();
                                 this.commands.send(Command::PreviewAttachment(path)).ok();
                             }
+                            AttachmentEvent::Download => {
+                                let path = view.read(cx).path().to_owned();
+                                if this
+                                    .commands
+                                    .send(Command::DownloadAttachment(path))
+                                    .is_err()
+                                {
+                                    let stopped = "OpenPickle has stopped. Reopen the app.";
+                                    view.update(cx, |view, cx| {
+                                        view.downloaded(Err(stopped.into()), cx)
+                                    });
+                                }
+                            }
                         },
                     ));
                     window.focus(&preview.focus_handle(cx));
@@ -1664,7 +1694,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn attachment_links_request_previews_and_reject_unknown_paths(cx: &mut gpui::TestAppContext) {
+    fn attachment_links_open_previews_that_download_and_reject_unknown_paths(
+        cx: &mut gpui::TestAppContext,
+    ) {
         cx.update(crate::ui::bind_keys);
         let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
         let (updates, received) = futures::channel::mpsc::unbounded();
@@ -1707,14 +1739,36 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
-        shell.read_with(cx, |shell, cx| match &shell.over {
+        let preview = shell.read_with(cx, |shell, cx| match &shell.over {
             Some(Over::Attachment(view)) => {
-                assert_eq!(view.read(cx).path(), "attachments/2026-01-01/report.pdf")
+                assert_eq!(view.read(cx).path(), "attachments/2026-01-01/report.pdf");
+                view.clone()
             }
             _ => panic!("attachment preview must stay open"),
         });
+        // The preview's Download asks for the file itself.
+        preview.update(cx, |_, cx| cx.emit(AttachmentEvent::Download));
+        cx.run_until_parked();
+        assert!(std::iter::from_fn(|| sent.try_recv().ok()).any(|command| {
+            matches!(command,
+            Command::DownloadAttachment(path) if path == "attachments/2026-01-01/report.pdf")
+        }));
         cx.simulate_keystrokes("escape");
         shell.read_with(cx, |shell, _| assert!(shell.over.is_none()));
+        // A download that ends after its preview was closed is reported in the window.
+        updates
+            .unbounded_send(Update::AttachmentDownloaded {
+                path: "attachments/2026-01-01/report.pdf".into(),
+                result: Ok("/made-up/Downloads/Report.pdf".into()),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.notice.as_ref().map(|notice| notice.as_ref()),
+                Some("Saved Report.pdf to your downloads.")
+            )
+        });
         shell.update_in(cx, |shell, window, cx| {
             shell.open_link("attachment:attachments/unknown.pdf", window, cx)
         });

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
-// Small CLI over PickleClient. Output is JSON, except `search`, `explore`, `attachments` and
-// `thumbnail`. Credentials come from one of:
+// Small CLI over PickleClient. Output is JSON, except `search`, `explore`, `attachments`,
+// `thumbnail` and `download`. Credentials come from one of:
 //   PICKLE_SESSION_FILE  a JSON file holding {"login_session_token": "ls_…"}. Each run refreshes
 //                        once and writes the next token back, so never run two at once.
 //   PICKLE_TOKEN         an access token (the app's Authorization header), valid for 5 minutes.
@@ -31,6 +31,7 @@ const USAGE = `usage: PICKLE_SESSION_FILE=<file> pickle <command>
                                date, kind (image or file), file name, size (bytes for
                                files, width x height for images) and the attachment path
   thumbnail <path> <out file>  write the JPEG thumbnail of an attachment path to <out file>
+  download <path> <out file>   write the attachment itself, the original file, to <out file>
   export <dir>                 write the full history of every room to <dir>/<room_id>.json
   events                       stream live events, one JSON object per line
   session | register | character | profile | social
@@ -179,6 +180,14 @@ switch (command) {
     const [path, out] = args;
     if (!path || !out) throw new Error("thumbnail <path> <out file>");
     const { bytes, contentType } = await pickle.getAttachmentThumbnail(path);
+    await writeFile(out, bytes);
+    console.error(`${contentType}, ${bytes.length} bytes written to ${out}`);
+    break;
+  }
+  case "download": {
+    const [path, out] = args;
+    if (!path || !out) throw new Error("download <path> <out file>");
+    const { bytes, contentType } = await pickle.getAttachment(path);
     await writeFile(out, bytes);
     console.error(`${contentType}, ${bytes.length} bytes written to ${out}`);
     break;

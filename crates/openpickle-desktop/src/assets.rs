@@ -32,6 +32,7 @@ icons![
     "clock",
     "compass",
     "contact",
+    "download",
     "file-text",
     "files",
     "gift",

@@ -1,9 +1,15 @@
 //! `phone-demo float` shows a synthetic live transcript and confirmation controls. It has no
 //! backend or action subscriber and cannot place or end a real call. `ended` shows the call
 //! after it ended, `call=<file>` the transcript in that JSON file, and `app phone` the card of
-//! the call in the chat. `app float tasks` shows a made-up running task card; add `task-open`
-//! for its progress sheet, `task-expanded` for the tall scrolled state, or `task-plan` for its
-//! plan. `task=<file>` loads a `GET /api/screens/handoff` JSON body for private comparisons.
+//! the call in the chat.
+//!
+//! `app tasks` shows the card of a made-up task in the chat, and `task-demo` the sheet with its
+//! progress: `expanded` as it is after scrolling, `plan` with the plan open, `ended` after the
+//! task finished, `task=<file>` with the progress in that JSON file, the body of a
+//! `GET /api/screens/handoff`.
+//!
+//! `file-demo` shows the preview of a made-up file with its Download button, and with `saved`
+//! as it is after the download.
 //!
 //! Opens the chat screen with made-up messages that have the same structure as the Figma frames,
 //! to compare the two side by side: `cargo run -p openpickle-desktop --example gallery`.
@@ -86,6 +92,18 @@ fn sample_phone_call(call_id: &str, live: bool) -> openpickle_api::PhoneCallTran
         call["duration_s"] = 95.into();
     }
     serde_json::from_value(call).unwrap()
+}
+
+/// A made-up file of a message, for the preview that downloads it.
+fn sample_file() -> Attachment {
+    Attachment {
+        path: "attachments/2026-11-18/Trip plan.md".into(),
+        seq: 1,
+        at: Local::now().timestamp() as f64,
+        name: "Trip plan.md".into(),
+        detail: "MD · 4 KB".into(),
+        kind: AttachmentKind::File,
+    }
 }
 
 /// The progress of a made-up task, or with `task=<file>` the one in that JSON file, which is
@@ -675,6 +693,8 @@ fn main() {
     let whole_app = std::env::args().any(|arg| arg == "app");
     let phone_demo = std::env::args().any(|arg| arg == "phone-demo");
     let task_sheet = std::env::args().any(|arg| arg == "task-demo");
+    let file_demo = std::env::args().any(|arg| arg == "file-demo");
+    let file_saved = std::env::args().any(|arg| arg == "saved");
     let task_expanded = std::env::args().any(|arg| arg == "expanded");
     let task_plan = std::env::args().any(|arg| arg == "plan");
     // In the samples a call is live and a task runs, unless `ended` says otherwise.
@@ -713,6 +733,22 @@ fn main() {
                             Ok(sample_phone_call("sample-call", live)),
                             cx,
                         )
+                    });
+                    window.focus(&view.focus_handle(cx));
+                    view
+                })
+                .unwrap()
+                .into()
+            } else if file_demo {
+                let options = float_options(float, cx);
+                cx.open_window(options, |window, cx| {
+                    let view = cx.new(|cx| {
+                        let mut view = ui::attachment::AttachmentView::new(sample_file(), cx);
+                        view.loaded(Err("No thumbnail exists for this sample file.".into()), cx);
+                        if file_saved {
+                            view.downloaded(Ok("/Users/sample/Downloads/Trip plan.md".into()), cx);
+                        }
+                        view
                     });
                     window.focus(&view.focus_handle(cx));
                     view
@@ -836,6 +872,12 @@ fn main() {
                             Command::PreviewAttachment(path) => Update::AttachmentPreview {
                                 path,
                                 result: Err("No thumbnail exists for this sample file.".into()),
+                            },
+                            // Nothing is written: the sample only shows where a file would be.
+                            Command::DownloadAttachment(path) => Update::AttachmentDownloaded {
+                                result: Ok(std::path::Path::new("/Users/sample/Downloads")
+                                    .join(path.rsplit('/').next().unwrap_or_default())),
+                                path,
                             },
                             _ => continue,
                         };

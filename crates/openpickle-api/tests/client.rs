@@ -456,6 +456,31 @@ async fn history_pages_go_back_and_thumbnails_are_asked_for_by_encoded_path() {
 }
 
 #[tokio::test]
+async fn an_attachment_itself_is_asked_for_by_its_encoded_path_without_a_suffix() {
+    let server = MockServer::start(|_| Reply {
+        content_type: "application/pdf".into(),
+        ..Reply::json(200, "%PDF-1.7 made-up bytes")
+    })
+    .await;
+    let pickle = client(&server, Credentials::AccessToken("token".into()));
+
+    let file = pickle
+        .get_attachment("attachments/2026-11-05/여행 계획 v2.pdf")
+        .await
+        .unwrap();
+
+    assert_eq!(&file[..], b"%PDF-1.7 made-up bytes");
+    let request = &server.take()[0];
+    assert_eq!(
+        request.path,
+        "/api/attachments/attachments/2026-11-05/%EC%97%AC%ED%96%89%20%EA%B3%84%ED%9A%8D%20v2.pdf"
+    );
+    // Like its thumbnail, the file is loaded with the token alone.
+    assert_eq!(request.header("authorization"), Some("Bearer token"));
+    assert!(request.header("x-client-version").is_none());
+}
+
+#[tokio::test]
 async fn api_errors_carry_status_detail_and_body() {
     let server = MockServer::start(|request| match request.path.as_str() {
         "/api/device/location/token" => Reply::json(409, r#"{"detail":"location_disabled"}"#),
