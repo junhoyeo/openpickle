@@ -10,11 +10,12 @@
 //! Pass `login` to see the sign-in screen instead, or `app` to run the whole window on these
 //! messages: the menu, and a search that looks through them (Cmd-F).
 //!
-//! After `app`, further arguments are played into the window as keys, so a flow can be looked
-//! at without the real keyboard: `key:<keystroke>`, `type:<text>` and `wait:<ms>`. `float`
-//! keeps the window above the others and leaves the keyboard focus where it is. For example:
+//! Further arguments are played into the window as steps, so a flow can be looked at without
+//! the real keyboard: `key:<keystroke>`, `type:<text>` and `wait:<ms>`. `shot:<file>` saves the
+//! window as a PNG, which needs no Screen Recording permission. `float` keeps the window above
+//! the others and leaves the keyboard focus where it is. For example:
 //!
-//!     gallery app float key:cmd-f type:취소표 wait:600 key:down key:enter
+//!     gallery app float key:cmd-f type:취소표 wait:600 key:down key:enter shot:/tmp/found.png
 
 use std::sync::Arc;
 
@@ -415,9 +416,106 @@ fn play(step: &str, window: &mut Window, cx: &mut App) {
                 window.dispatch_keystroke(keystroke, cx);
             }
         }
+        "shot" => shoot(value, window),
         _ => panic!("unknown step {step}"),
     }
     window.refresh();
+}
+
+/// Saves the window as it is drawn into a PNG file. A process may read its own windows, so
+/// this needs no Screen Recording permission, which `screencapture` does.
+#[cfg(target_os = "macos")]
+fn shoot(path: &str, window: &Window) {
+    use std::ffi::{c_char, c_void};
+
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    type Ref = *const c_void;
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Rect {
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        static CGRectNull: Rect;
+        fn CGWindowListCreateImage(bounds: Rect, list: u32, window: u32, image: u32) -> Ref;
+    }
+    #[link(name = "ImageIO", kind = "framework")]
+    unsafe extern "C" {
+        fn CGImageDestinationCreateWithURL(url: Ref, kind: Ref, count: usize, options: Ref) -> Ref;
+        fn CGImageDestinationAddImage(destination: Ref, image: Ref, properties: Ref);
+        fn CGImageDestinationFinalize(destination: Ref) -> bool;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFURLCreateFromFileSystemRepresentation(
+            allocator: Ref,
+            path: *const u8,
+            length: isize,
+            directory: bool,
+        ) -> Ref;
+        fn CFStringCreateWithCString(allocator: Ref, text: *const c_char, encoding: u32) -> Ref;
+        fn CFRelease(value: Ref);
+    }
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn sel_registerName(name: *const c_char) -> Ref;
+        fn objc_msgSend();
+    }
+    const ONLY_THIS_WINDOW: u32 = 1 << 3;
+    const WITHOUT_SHADOW: u32 = 1 << 0;
+    const AT_SCREEN_RESOLUTION: u32 = 1 << 3;
+    const UTF8: u32 = 0x0800_0100;
+
+    let handle = HasWindowHandle::window_handle(window).expect("the window's handle");
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        panic!("an AppKit window");
+    };
+    let view: Ref = handle.ns_view.as_ptr();
+    // SAFETY: `view` is the live NSView of this window and the calls are made on the main
+    // thread. `objc_msgSend` is called through the signature of the message sent. Every
+    // Core Foundation object created here is released once.
+    unsafe {
+        let untyped = objc_msgSend as unsafe extern "C" fn();
+        let object: unsafe extern "C" fn(Ref, Ref) -> Ref = std::mem::transmute(untyped);
+        let integer: unsafe extern "C" fn(Ref, Ref) -> isize = std::mem::transmute(untyped);
+        let ns_window = object(view, sel_registerName(c"window".as_ptr()));
+        let number = integer(ns_window, sel_registerName(c"windowNumber".as_ptr()));
+        let image = CGWindowListCreateImage(
+            CGRectNull,
+            ONLY_THIS_WINDOW,
+            number as u32,
+            WITHOUT_SHADOW | AT_SCREEN_RESOLUTION,
+        );
+        assert!(!image.is_null(), "the window could not be read");
+        let null = std::ptr::null();
+        let url = CFURLCreateFromFileSystemRepresentation(
+            null,
+            path.as_ptr(),
+            path.len() as isize,
+            false,
+        );
+        let png = CFStringCreateWithCString(null, c"public.png".as_ptr(), UTF8);
+        let destination = CGImageDestinationCreateWithURL(url, png, 1, null);
+        assert!(!destination.is_null(), "{path} could not be opened");
+        CGImageDestinationAddImage(destination, image, null);
+        assert!(
+            CGImageDestinationFinalize(destination),
+            "{path} was not written"
+        );
+        for value in [destination, png, url, image] {
+            CFRelease(value);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn shoot(_: &str, _: &Window) {
+    panic!("shot: is built for macOS only");
 }
 
 /// Stands in for the server's search: the bubbles that contain the text, newest first.
@@ -589,13 +687,16 @@ fn main() {
         .run(move |cx: &mut App| {
             eprintln!("app ready after {:?}", started.elapsed());
             ui::bind_keys(cx);
-            if login {
+            // The untyped handle: a typed one would hold the root view while a step is played,
+            // and the steps make the root view do things.
+            let window: AnyWindowHandle = if login {
                 cx.open_window(ui::window_options(cx), |window, cx| {
                     let view = cx.new(LoginView::new);
                     window.focus(&view.focus_handle(cx));
                     view
                 })
-                .unwrap();
+                .unwrap()
+                .into()
             } else if phone_demo {
                 let options = float_options(float, cx);
                 cx.open_window(options, |window, cx| {
@@ -616,7 +717,8 @@ fn main() {
                     window.focus(&view.focus_handle(cx));
                     view
                 })
-                .unwrap();
+                .unwrap()
+                .into()
             } else if task_sheet {
                 let options = float_options(float, cx);
                 cx.open_window(options, |window, cx| {
@@ -636,7 +738,8 @@ fn main() {
                     window.focus(&view.focus_handle(cx));
                     view
                 })
-                .unwrap();
+                .unwrap()
+                .into()
             } else if whole_app {
                 let (commands, mut asked) = tokio::sync::mpsc::unbounded_channel();
                 let (updates, received) = futures::channel::mpsc::unbounded();
@@ -740,54 +843,54 @@ fn main() {
                     }
                 });
                 let options = float_options(float, cx);
-                // The untyped handle: the typed one would hold the root view while a key is
-                // played, and the keys make the root view do things.
-                let window: AnyWindowHandle = cx
-                    .open_window(options, |window, cx| {
-                        cx.new(|cx| Shell::new(commands, received, window, cx))
-                    })
-                    .unwrap()
-                    .into();
-                cx.spawn(async move |cx: &mut AsyncApp| {
-                    for step in steps {
-                        let pause = step
-                            .strip_prefix("wait:")
-                            .map_or(300, |ms| ms.parse().unwrap());
-                        cx.background_executor()
-                            .timer(std::time::Duration::from_millis(pause))
-                            .await;
-                        if !step.starts_with("wait:") {
-                            window
-                                .update(cx, |_, window, cx| play(&step, window, cx))
-                                .ok();
-                        }
-                    }
+                cx.open_window(options, |window, cx| {
+                    cx.new(|cx| Shell::new(commands, received, window, cx))
                 })
-                .detach();
+                .unwrap()
+                .into()
             } else {
-                cx.open_window(ui::window_options(cx), |window, cx| {
-                    let view = cx.new(|cx| {
-                        let pictures = cx.new(|_| ui::Pictures::default());
-                        let mut view = ChatView::new(pictures, cx);
-                        let (rows, _) = build_rows(&messages, Some(Some("Working")), Local::now());
-                        eprintln!("{} messages, {} rows", messages.len(), rows.len());
-                        view.set_rows(rows, cx);
+                let window = cx
+                    .open_window(ui::window_options(cx), |window, cx| {
+                        let view = cx.new(|cx| {
+                            let pictures = cx.new(|_| ui::Pictures::default());
+                            let mut view = ChatView::new(pictures, cx);
+                            let (rows, _) =
+                                build_rows(&messages, Some(Some("Working")), Local::now());
+                            eprintln!("{} messages, {} rows", messages.len(), rows.len());
+                            view.set_rows(rows, cx);
+                            view
+                        });
+                        window.focus(&view.focus_handle(cx));
+                        // GPUI draws the first frame while opening the window; this runs when the
+                        // display asks for the next one.
+                        window.on_next_frame(move |_, _| {
+                            eprintln!("second frame requested after {:?}", started.elapsed())
+                        });
                         view
-                    });
-                    window.focus(&view.focus_handle(cx));
-                    // GPUI draws the first frame while opening the window; this runs when the
-                    // display asks for the next one.
-                    window.on_next_frame(move |_, _| {
-                        eprintln!("second frame requested after {:?}", started.elapsed())
-                    });
-                    view
-                })
-                .unwrap();
+                    })
+                    .unwrap();
                 eprintln!(
                     "window open and first frame drawn after {:?}",
                     started.elapsed()
                 );
-            }
+                window.into()
+            };
+            cx.spawn(async move |cx: &mut AsyncApp| {
+                for step in steps {
+                    let pause = step
+                        .strip_prefix("wait:")
+                        .map_or(300, |ms| ms.parse().unwrap());
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(pause))
+                        .await;
+                    if !step.starts_with("wait:") {
+                        window
+                            .update(cx, |_, window, cx| play(&step, window, cx))
+                            .ok();
+                    }
+                }
+            })
+            .detach();
             if !float {
                 cx.activate(true);
             }

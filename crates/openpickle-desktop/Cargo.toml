@@ -24,3 +24,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 gpui = { version = "0.2.2", features = ["test-support"] }
+
+# The gallery reads its own window to save a picture of it.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+raw-window-handle = "0.6"
