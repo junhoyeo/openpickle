@@ -1,6 +1,6 @@
 // `GET /api/events`: the server-sent event stream the app keeps open while in the foreground.
 
-import type { CharacterStatus, CreditUsage, JellyRewards, Plan, Room } from "./types.ts";
+import type { CharacterStatus, CreditUsage, JellyRewards, LevelMilestone, Plan, Room, UserSummary } from "./types.ts";
 
 /** One parsed SSE frame. `data` is the raw text, lines joined with `\n`. */
 export interface SseFrame {
@@ -67,9 +67,8 @@ export class SseParser {
 
 // ---- Typed events ----
 //
-// Every payload carries `v: 1`. The event name plus `kind` select the shape. The names and kinds
-// below were present in traffic. Others may exist, so a payload can carry a `kind` this union does
-// not list. An event name outside this list arrives as `{ event: "unknown", name, data }`.
+// Typed payloads carry `v: 1`. The event name and, where present, `kind` select the shape.
+// A payload that does not match a typed shape arrives as `{ event: "unknown", name, data }`.
 
 export type ChatEvent =
   | {
@@ -160,6 +159,12 @@ export type WidgetEvent =
   | { kind: "state"; widget: string; revision: number; data: Record<string, unknown> };
 
 type V1<T> = T & { v: 1 };
+type RoomEvent = {
+  kind: "advanced";
+  room_id: string;
+  last_seq: number;
+  room: Omit<Room, "log_epoch" | "projection_version">;
+};
 
 export type PickleEvent =
   | { event: "chat"; data: V1<ChatEvent> }
@@ -168,23 +173,208 @@ export type PickleEvent =
   | { event: "widget"; data: V1<WidgetEvent> }
   /** A change to the room list; call `sync()` when `rev` moves past what you hold. */
   | { event: "sync"; data: V1<{ rev: number }> }
-  | {
-      event: "room";
-      data: V1<{
-        kind: "advanced";
-        room_id: string;
-        last_seq: number;
-        room: Omit<Room, "log_epoch" | "projection_version">;
-      }>;
-    }
+  | { event: "room"; data: V1<RoomEvent> }
   | { event: "unknown"; name: string; data: unknown };
 
-const KNOWN_EVENTS = new Set(["chat", "usage", "status", "widget", "sync", "room"]);
+type Check<T> = (value: unknown) => value is T;
+type Fields<T> = { [K in keyof T]-?: Check<T[K]> };
+type Kinds<T extends { kind: string }> = {
+  [K in T["kind"]]: Fields<Omit<Extract<T, { kind: K }>, "kind">>;
+};
 
-/** Parses a frame's JSON payload. Frames without data (the leading `retry:` frame) yield nothing. */
-export function toPickleEvent(frame: SseFrame): PickleEvent | undefined {
-  if (frame.data === "") return undefined;
-  const data: unknown = JSON.parse(frame.data);
-  if (!KNOWN_EVENTS.has(frame.event)) return { event: "unknown", name: frame.event, data };
-  return { event: frame.event, data } as PickleEvent;
+const isString = (value: unknown): value is string => typeof value === "string";
+const isBoolean = (value: unknown): value is boolean => typeof value === "boolean";
+const isNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+const isV1 = (value: unknown): value is { v: 1 } => isRecord(value) && value.v === 1;
+
+const optional = <T>(check: Check<T>): Check<T | undefined> =>
+  (value): value is T | undefined => value === undefined || check(value);
+const nullable = <T>(check: Check<T>): Check<T | null> =>
+  (value): value is T | null => value === null || check(value);
+const arrayOf = <T>(check: Check<T>): Check<T[]> =>
+  (value): value is T[] => Array.isArray(value) && value.every(check);
+const recordOf = <T>(check: Check<T>): Check<Record<string, T>> =>
+  (value): value is Record<string, T> => isRecord(value) && Object.values(value).every(check);
+
+function object<T>(checks: Fields<T>): Check<T> {
+  const fields: [string, Check<unknown>][] = Object.entries(checks);
+  return (value): value is T => isRecord(value) && fields.every(([key, check]) => check(value[key]));
+}
+
+function variants<T extends { kind: string }>(checks: Kinds<T>): Check<T> {
+  const entries: [string, Fields<Record<string, unknown>>][] = Object.entries(checks);
+  const byKind = new Map(entries.map(([kind, fields]) => [kind, object(fields)] as const));
+  return (value): value is T => isRecord(value) && isString(value.kind) && byKind.get(value.kind)?.(value) === true;
+}
+
+const chatMessage = { role: isString, id: isString, at: isNumber, channel: isString };
+const roomSequence = { seq: isNumber, prev_seq: isNumber };
+const isChat = variants<ChatEvent>({
+  user: { ...chatMessage, ...roomSequence, text: isString, prev_seq: optional(isNumber) },
+  assistant: { ...chatMessage, ...roomSequence, text: isString, parts: arrayOf(isNumber) },
+  assistant_partial: { ...chatMessage, text: isString, parts: arrayOf(isNumber) },
+  subagent: { ...chatMessage, ...roomSequence, title: isString, path: isString },
+  pending: { on: isBoolean },
+  responder: { state: isString },
+  activity: { state: isString, label: optional(isString), typing: optional(isBoolean) },
+  reaction: {
+    ...roomSequence,
+    id: isString,
+    target_id: isString,
+    part: isNumber,
+    actor: isString,
+    emoji: isString,
+    at: isNumber,
+  },
+});
+
+const creditFields = {
+  allowance: isNumber,
+  used: isNumber,
+  remaining: isNumber,
+  bonus: isNumber,
+  exhausted: isBoolean,
+  reset_at: isString,
+  ticket_credits: isNumber,
+  tickets: isNumber,
+  tickets_by_kind: recordOf(isNumber),
+  ticket_auto_use: isBoolean,
+  period: isString,
+  balance: isNumber,
+  credit_auto_use: isBoolean,
+  auto_use_order: isString,
+  ticket_order: isString,
+  credit_spending: isBoolean,
+} satisfies Fields<CreditUsage>;
+const isLevelMilestone = object<LevelMilestone>({ level: isNumber, amount: isNumber, full_size: isBoolean });
+const levelRewardFields = {
+  level_milestones: arrayOf(isLevelMilestone),
+  next_level_reward_level: isNumber,
+  next_level_reward_amount: isNumber,
+};
+const isUsage = variants<UsageEvent>({
+  energy: { pct: isNumber, state: isString },
+  credits: creditFields,
+  jelly: {
+    count: isNumber,
+    rewards: object<JellyRewards>({
+      ...levelRewardFields,
+      day: isString,
+      checkin_available: isBoolean,
+      checkin_amount: isNumber,
+      talk_seconds: isNumber,
+      talk_milestones: Array.isArray,
+      talk_claimable: isNumber,
+      friends_reward_day: isString,
+      notices: Array.isArray,
+      purchase_granted: isBoolean,
+    }),
+    batch: object({ accepted: isNumber, eating: isBoolean, rev: isNumber }),
+  },
+  plan: { plan: isString, plan_rank: isNumber, expires_at: nullable(isString), credits: object<CreditUsage>(creditFields) },
+});
+const isStatus = object<CharacterStatus>({
+  ...levelRewardFields,
+  color_combo_id: isString,
+  level: isNumber,
+  xp: isNumber,
+  xp_next: isNumber,
+  satiety: isNumber,
+  portrait_redraw_due: isBoolean,
+  body_color: isString,
+  line_id: isString,
+  body_hex: isString,
+  line_hex: isString,
+  energy_pct: isNumber,
+  energy_exhausted: isBoolean,
+  jelly_count: isNumber,
+  jelly_checkin_available: isBoolean,
+  jelly_checkin_amount: isNumber,
+  jelly_notice_kind: isString,
+  jelly_notice_amount: isNumber,
+});
+const isWidget = variants<WidgetEvent>({
+  bgm_catalog: {
+    widget: isString,
+    tracks: arrayOf(object({
+      name: isString,
+      title: isString,
+      emoji: isString,
+      sha256: isString,
+      bytes: isNumber,
+      group: optional(isString),
+    })),
+  },
+  state: { widget: isString, revision: isNumber, data: isRecord },
+});
+const isSync = object<{ rev: number }>({ rev: isNumber });
+const isRoom = variants<RoomEvent>({
+  advanced: {
+    room_id: isString,
+    last_seq: isNumber,
+    room: object<RoomEvent["room"]>({
+      room_id: isString,
+      kind: isString,
+      title: isString,
+      peer: nullable(object<UserSummary>({
+        user_id: isString,
+        handle: isString,
+        display_name: isString,
+        avatar_url: isString,
+        character_avatar_url: isString,
+        character_name: isString,
+      })),
+      member_count: isNumber,
+      last_seq: isNumber,
+      read_seq: isNumber,
+      role: isString,
+      last_event_at: isString,
+      observer: isBoolean,
+      unread: isNumber,
+      muted: isBoolean,
+      pinned_at: nullable(isString),
+      peer_read_seq: nullable(isNumber),
+      peer_read_at: nullable(isString),
+      peer_joined_at: nullable(isString),
+      request_id: isString,
+      request_role: isString,
+      extra_conversation_unread: isBoolean,
+    }),
+  },
+});
+
+/** Empty data (including retry-only frames) yields nothing. Unknown events keep JSON or raw text. */
+export function toPickleEvent({ event: name, data: raw }: SseFrame): PickleEvent | undefined {
+  if (raw === "") return undefined;
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return { event: "unknown", name, data: raw };
+  }
+  if (isV1(data)) {
+    switch (name) {
+      case "chat":
+        if (isChat(data)) return { event: name, data };
+        break;
+      case "usage":
+        if (isUsage(data)) return { event: name, data };
+        break;
+      case "status":
+        if (isStatus(data)) return { event: name, data };
+        break;
+      case "widget":
+        if (isWidget(data)) return { event: name, data };
+        break;
+      case "sync":
+        if (isSync(data)) return { event: name, data };
+        break;
+      case "room":
+        if (isRoom(data)) return { event: name, data };
+        break;
+    }
+  }
+  return { event: "unknown", name, data };
 }
