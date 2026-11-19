@@ -170,6 +170,15 @@ impl TaskLog {
         true
     }
 
+    fn remeasure_header(&self) {
+        let offset = self.list.logical_scroll_top();
+        // Replacing the current item resets its within-item scroll offset in GPUI.
+        self.list.splice(0..1, 1);
+        if offset.item_ix == 0 {
+            self.list.scroll_to(offset);
+        }
+    }
+
     fn text(&self) -> String {
         self.rows
             .iter()
@@ -302,7 +311,7 @@ impl TaskView {
             || plan_was_empty != self.plan.rows.is_empty()
             || log_was_empty != self.log.rows.is_empty()
         {
-            self.log.list.splice(0..1, 1);
+            self.log.remeasure_header();
         }
         if changed || error_changed {
             self.update_clock(cx);
@@ -418,6 +427,7 @@ impl TaskView {
             .left_0()
             .right_0()
             .h(px(HEADER + 16.))
+            .block_mouse_except_scroll()
             .rounded_t(px(RADIUS))
             .bg(linear_gradient(
                 180.,
@@ -931,6 +941,18 @@ mod tests {
         assert_eq!(log.text(), "Guide missing");
     }
 
+    #[test]
+    fn remeasuring_the_log_header_does_not_rewind_it() {
+        let log = TaskLog::new();
+        log.list.scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: px(30.),
+        });
+        log.remeasure_header();
+        assert_eq!(log.list.logical_scroll_top().item_ix, 0);
+        assert_eq!(log.list.logical_scroll_top().offset_in_item, px(30.));
+    }
+
     #[gpui::test]
     fn a_long_log_wraps_only_a_window_of_entries_and_scrolls(cx: &mut TestAppContext) {
         let log_nodes = (0..1_000)
@@ -953,7 +975,7 @@ mod tests {
             assert!((1..100).contains(&wrapped), "wrapped {wrapped} entries");
         });
         cx.simulate_event(ScrollWheelEvent {
-            position: point(WIDTH / 2., HEIGHT_PX - px(100.)),
+            position: point(WIDTH / 2., sheet_top() + px(HEADER + 4.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(-260.))),
             modifiers: Modifiers::none(),
             touch_phase: TouchPhase::Moved,
@@ -963,6 +985,37 @@ mod tests {
             assert!(view.expanded);
             assert!(view.log.list.logical_scroll_top().item_ix > 0);
         });
+    }
+
+    fn sheet_top() -> Pixels {
+        HEIGHT_PX * (1. - HEIGHT) - px(INSET)
+    }
+
+    #[gpui::test]
+    fn the_sticky_header_blocks_clicks_through_to_the_scrolled_plan(cx: &mut TestAppContext) {
+        let nodes = (0..30)
+            .map(|_| node("shell", Some("Reading a guide")))
+            .collect();
+        let (view, cx) = open(cx, nodes);
+        view.update(cx, |view, cx| {
+            view.log.list.scroll_to(ListOffset {
+                item_ix: 0,
+                offset_in_item: px(30.),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_click(
+            point(WIDTH / 2., sheet_top() + px(HEADER + 4.)),
+            Modifiers::none(),
+        );
+        assert!(!view.read_with(cx, |view, _| view.showing_plan));
+        cx.simulate_click(
+            point(WIDTH / 2., sheet_top() + px(HEADER + 29.)),
+            Modifiers::none(),
+        );
+        assert!(view.read_with(cx, |view, _| view.showing_plan));
     }
 
     #[gpui::test]
@@ -975,7 +1028,7 @@ mod tests {
         cx.run_until_parked();
         let copy = point(
             WIDTH - px(INSET + HEADER_ROW_SIDE + 22.),
-            HEIGHT_PX * (1. - HEIGHT) - px(INSET) + px(HEADER_ROW_TOP + 22.),
+            sheet_top() + px(HEADER_ROW_TOP + 22.),
         );
         cx.simulate_click(copy, Modifiers::none());
         assert_eq!(
