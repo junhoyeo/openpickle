@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use chrono::{DateTime, Local};
 use gpui::{
     App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, ImageSource,
     ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point,
@@ -14,7 +15,7 @@ use gpui::{
 use openpickle_api::PhoneCallTranscript;
 
 use crate::{
-    model::{AttachmentKind, Part, Row, RowKind},
+    model::{AttachmentKind, Message, Part, Row, RowKind, append_message_rows},
     protocol::HandoffCard,
     theme,
     ui::{
@@ -197,27 +198,88 @@ impl ChatView {
 
     /// Replaces the rows. Rows before the first changed one keep their measured heights.
     pub fn set_rows(&mut self, rows: Vec<Row>, cx: &mut Context<Self>) {
-        let unchanged = self
-            .rows
+        self.replace_rows_from(0, rows, cx);
+    }
+
+    /// Reprojects only the messages starting at `start`, the end of the retained prefix.
+    pub(crate) fn project_rows(
+        &mut self,
+        start: usize,
+        starts: &mut Vec<usize>,
+        previous: Option<&Message>,
+        messages: &[Message],
+        now: DateTime<Local>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut rows = Vec::with_capacity(messages.len());
+        let joins_retained_row =
+            append_message_rows(&mut rows, starts, start, previous, messages, now);
+        if let Some(index) = start.checked_sub(1) {
+            let boundary = &mut self.rows[index];
+            if boundary.joined_below != joins_retained_row {
+                boundary.joined_below = joins_retained_row;
+                cx.notify();
+            }
+        }
+        rows.extend(self.activity_row().cloned());
+        self.replace_rows_from(start, rows, cx);
+    }
+
+    fn activity_row(&self) -> Option<&Row> {
+        self.rows
+            .last()
+            .filter(|row| matches!(row.kind, RowKind::Activity(_)))
+    }
+
+    /// Activity is a single nonselectable row after all messages.
+    pub(crate) fn set_activity(
+        &mut self,
+        activity: Option<Option<String>>,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self.activity_row();
+        let replacement = activity.map(Row::activity);
+        if current == replacement.as_ref() {
+            return;
+        }
+        let old_end = self.rows.len();
+        let start = old_end - usize::from(current.is_some());
+        self.rows.truncate(start);
+        self.rows.extend(replacement);
+        self.list.splice(start..old_end, self.rows.len() - start);
+        cx.notify();
+    }
+
+    fn replace_rows_from(&mut self, start: usize, rows: Vec<Row>, cx: &mut Context<Self>) {
+        let matched = self.rows[start..]
             .iter()
             .zip(&rows)
             .take_while(|(old, new)| old.same_as(new))
             .count();
-        if unchanged < self.rows.len() || unchanged < rows.len() {
-            self.list
-                .splice(unchanged..self.rows.len(), rows.len() - unchanged);
+        let unchanged = start + matched;
+        if unchanged == self.rows.len() && matched == rows.len() {
+            return;
         }
-        let selectable_unchanged = unchanged
-            + self.rows[unchanged..]
-                .iter()
-                .zip(&rows[unchanged..])
-                .take_while(|(old, new)| old.same_content_as(new))
-                .count();
+        let same_content = self.rows[unchanged..]
+            .iter()
+            .zip(&rows[matched..])
+            .take_while(|(old, new)| old.same_content_as(new))
+            .count();
         self.selection
             .borrow_mut()
-            .rows_changed(selectable_unchanged);
+            .rows_changed(unchanged + same_content);
+        if self
+            .found
+            .as_ref()
+            .is_some_and(|found| found.end > unchanged + same_content)
+        {
+            self.found = None;
+            self._found = None;
+        }
+        self.list
+            .splice(unchanged..self.rows.len(), rows.len() - matched);
         let mut missing = Vec::new();
-        for row in &rows {
+        for row in &rows[matched..] {
             if let RowKind::Part(Part::Files(files)) = &row.kind {
                 for file in &files.items {
                     let previewable = file.kind == AttachmentKind::Picture
@@ -228,7 +290,8 @@ impl ChatView {
                 }
             }
         }
-        self.rows = rows;
+        self.rows.truncate(unchanged);
+        self.rows.extend(rows.into_iter().skip(matched));
         if !missing.is_empty() {
             cx.emit(ChatEvent::LoadAttachments(missing));
         }
@@ -846,6 +909,55 @@ mod tests {
         wheel(cx, -1200.);
         let after = top_row(cx);
         assert!(after > 100, "scrolled down to row {after}");
+    }
+
+    #[gpui::test]
+    fn activity_and_grouped_appends_keep_selection_and_search_position(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx, &[]);
+        let now = Local::now();
+        let messages: Vec<_> = (1..=200)
+            .map(|seq| crate::convert::outgoing(seq.to_string(), "hello", seq, seq as f64))
+            .collect();
+        let suffix_at = messages.len() - 2;
+        let prefix = &messages[..suffix_at];
+        let mut starts = Vec::new();
+        view.update_in(cx, |view, window, cx| {
+            view.project_rows(0, &mut starts, None, prefix, now, cx);
+            view.selection.borrow_mut().select_all(&view.rows);
+            view.reveal(starts[35]..starts[36], window, cx);
+        });
+        cx.run_until_parked();
+        let selected = view.read_with(cx, |view, _| view.selection.borrow().text(&view.rows));
+        assert!(selected.is_some());
+        let top = view.read_with(cx, |view, _| view.list.logical_scroll_top().item_ix);
+        let found = starts[35]..starts[36];
+        view.update(cx, |view, cx| {
+            for activity in [Some(None), Some(Some("Working".into())), None, Some(None)] {
+                view.set_activity(activity, cx);
+                assert_eq!(view.selection.borrow().text(&view.rows), selected);
+                assert_eq!(view.found, Some(found.clone()));
+                assert_eq!(view.list.item_count(), view.rows.len());
+                assert_eq!(view.list.logical_scroll_top().item_ix, top);
+            }
+            let boundary = *starts.last().unwrap();
+            assert!(!view.rows[boundary].joined_below);
+            view.project_rows(
+                boundary + 1,
+                &mut starts,
+                prefix.last(),
+                &messages[suffix_at..],
+                now,
+                cx,
+            );
+            assert!(view.rows[boundary].joined_below);
+            assert_eq!(view.selection.borrow().text(&view.rows), selected);
+            assert_eq!(view.found, Some(found));
+            assert_eq!(view.list.logical_scroll_top().item_ix, top);
+            assert_eq!(view.list.item_count(), view.rows.len());
+            let (full_rows, full_starts) = crate::model::build_rows(&messages, Some(None), now);
+            assert_eq!(view.rows, full_rows);
+            assert_eq!(starts, full_starts);
+        });
     }
 
     #[gpui::test]
