@@ -1067,22 +1067,27 @@ impl PickleClient {
         Ok(())
     }
 
+    fn ensure_login_session_open(&self) -> Result<()> {
+        match &self.inner.bearer {
+            Bearer::Session { closing, .. } if closing.load(Ordering::Acquire) => {
+                Err(Error::SignedOut)
+            }
+            _ => Ok(()),
+        }
+    }
+
     async fn bearer_header(&self) -> Result<HeaderValue> {
         match &self.inner.bearer {
             Bearer::SignedOut => Err(Error::SignedOut),
             Bearer::Static(header) => Ok(header.clone()),
             Bearer::Provider(provider) => bearer_value(&provider()),
             Bearer::Session {
-                state,
-                on_rotate,
-                closing,
+                state, on_rotate, ..
             } => {
                 // Holding the lock across the refresh makes it single-flight: two concurrent
                 // refreshes would spend the same token twice. Waiters then see the new token.
                 let mut state = state.clone().lock_owned().await;
-                if closing.load(Ordering::Acquire) {
-                    return Err(Error::SignedOut);
-                }
+                self.ensure_login_session_open()?;
                 // Refresh a minute early so clock skew and slow requests do not meet an expired token.
                 if let Some(access) = &state.access
                     && access.exp - 60 > now_secs()
@@ -1099,6 +1104,9 @@ impl PickleClient {
                         let (refresh, fresh) = match state.unsaved.take() {
                             Some(refresh) => (refresh, false),
                             None => {
+                                // Saving a pending rotation can leave us needing another refresh;
+                                // closing must not spend that newly saved token.
+                                client.ensure_login_session_open()?;
                                 let refresh =
                                     client.refresh_login_session(&state.refresh_token).await?;
                                 state.refresh_token.clone_from(&refresh.login_session_token);
@@ -1123,7 +1131,9 @@ impl PickleClient {
                         return Ok(header);
                     }
                 });
-                refresh.await.unwrap_or(Err(Error::RefreshAborted))
+                let header = refresh.await.unwrap_or(Err(Error::RefreshAborted))?;
+                self.ensure_login_session_open()?;
+                Ok(header)
             }
         }
     }
