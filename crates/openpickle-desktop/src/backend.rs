@@ -680,7 +680,12 @@ async fn converse(
             .min();
         tokio::select! {
             command = commands.recv() => match command {
-                None | Some(Command::Quit) => return Ended::Closed,
+                None | Some(Command::Quit) => {
+                    // Background reads can have started a rotation. Keep the store alive until
+                    // it finishes, and stop their queued clones from starting another one.
+                    let _ = live.client.close_login_session().await;
+                    return Ended::Closed;
+                }
                 Some(Command::Send { room_id, id, text, offer }) => {
                     let sync_failure = if live.last_rooms.is_empty() {
                         match live.find_room().await {

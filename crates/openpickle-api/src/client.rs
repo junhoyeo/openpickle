@@ -3,7 +3,10 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::io;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -303,6 +306,7 @@ enum Bearer {
     Session {
         state: Arc<tokio::sync::Mutex<SessionState>>,
         on_rotate: RotateCallback,
+        closing: AtomicBool,
     },
 }
 
@@ -403,6 +407,7 @@ impl PickleClient {
                         unsaved: None,
                     })),
                     on_rotate: session.on_rotate,
+                    closing: AtomicBool::new(false),
                 }
             }
         };
@@ -1038,15 +1043,43 @@ impl PickleClient {
             .header("x-client-platform", &self.inner.profile.platform)
     }
 
+    /// Closes this client's login session to further authenticated calls across all clones.
+    /// Waits for a rotation that already started to finish storing its replacement token.
+    /// Unlike signing out, this does not revoke or erase the persisted session.
+    pub async fn close_login_session(&self) -> Result<()> {
+        let Bearer::Session {
+            state,
+            on_rotate,
+            closing,
+        } = &self.inner.bearer
+        else {
+            return Ok(());
+        };
+        closing.store(true, Ordering::Release);
+        let mut state = state.lock().await;
+        if let Some(refresh) = state.unsaved.as_ref() {
+            on_rotate(refresh).map_err(Error::Rotate)?;
+            state.unsaved = None;
+        }
+        Ok(())
+    }
+
     async fn bearer_header(&self) -> Result<HeaderValue> {
         match &self.inner.bearer {
             Bearer::SignedOut => Err(Error::SignedOut),
             Bearer::Static(header) => Ok(header.clone()),
             Bearer::Provider(provider) => bearer_value(&provider()),
-            Bearer::Session { state, on_rotate } => {
+            Bearer::Session {
+                state,
+                on_rotate,
+                closing,
+            } => {
                 // Holding the lock across the refresh makes it single-flight: two concurrent
                 // refreshes would spend the same token twice. Waiters then see the new token.
                 let mut state = state.clone().lock_owned().await;
+                if closing.load(Ordering::Acquire) {
+                    return Err(Error::SignedOut);
+                }
                 // Refresh a minute early so clock skew and slow requests do not meet an expired token.
                 if let Some(access) = &state.access
                     && access.exp - 60 > now_secs()

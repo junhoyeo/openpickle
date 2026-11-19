@@ -199,6 +199,50 @@ async fn a_rotation_that_could_not_be_stored_is_stored_before_anything_else() {
 }
 
 #[tokio::test]
+async fn closing_drains_an_in_flight_rotation_without_spending_another_token() {
+    let begun = Arc::new(tokio::sync::Notify::new());
+    let server = MockServer::start({
+        let begun = begun.clone();
+        move |request| {
+            assert_eq!(request.path, "/api/login-sessions/refresh");
+            begun.notify_one();
+            let access = jwt(300);
+            let mut reply = Reply::json(
+                200,
+                format!(
+                    r#"{{"login_session_jwt":"{access}","expires_at":"2026-11-23T00:00:00Z","login_session_token":"ls_next"}}"#
+                ),
+            );
+            reply.delay = Duration::from_millis(30);
+            reply
+        }
+    })
+    .await;
+    let stored = Arc::new(AtomicUsize::new(0));
+    let session = LoginSession::new("ls_first", {
+        let stored = stored.clone();
+        move |_| {
+            stored.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    });
+    let pickle = client(&server, Credentials::LoginSession(session));
+    let read = tokio::spawn({
+        let pickle = pickle.clone();
+        async move { pickle.sync().await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), begun.notified())
+        .await
+        .expect("local server did not receive the refresh");
+    read.abort();
+    let _ = read.await;
+    pickle.close_login_session().await.unwrap();
+    assert_eq!(stored.load(Ordering::SeqCst), 1);
+    assert!(matches!(pickle.sync().await, Err(Error::SignedOut)));
+    assert_eq!(server.take().len(), 1);
+}
+
+#[tokio::test]
 async fn a_token_the_server_calls_expired_is_refreshed_once_and_the_request_repeated() {
     let refreshes = Arc::new(AtomicUsize::new(0));
     // The seeded token looks valid to this clock, but the server rejects it.
