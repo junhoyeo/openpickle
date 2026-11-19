@@ -35,8 +35,8 @@ servers the iOS app does, with your own account.
 - **Friends and invites.** The menu leads to your friends, and Invite to your invite link, how
   many invites are left and who joined with it.
 - **Search.** Cmd-F (Ctrl-F on Windows), or the search button in the menu, searches your
-  messages on Pickle's server. In v1.0.0, a result jumps to its place in the conversation only
-  if that message is already loaded.
+  messages on Pickle's server. Select a result to jump to it; if it is not cached, the app
+  first loads the nearby messages.
 - **Select and copy.** Drag across messages to select text, or right-click for Copy, Copy Message
   and Select All. Select All includes loaded messages beyond what is on screen.
 - **Cached chat.** For a returning session, the app can show cached messages before the
@@ -55,11 +55,11 @@ servers the iOS app does, with your own account.
   <img src="docs/screenshots/sign-in.png" alt="Sign-in with a phone number" height="380" />
 </p>
 
-The published v1.0.0 desktop app does not offer account or settings edits, ticket use or
-purchases, direct microphone chat with Pickle, an in-app full-size attachment viewer, file
-uploads or sharing, website preview cards, reactions, request-card answers, or friend management.
-[Original-file downloads](#chat-links-and-attachment-previews) are available. See the
-[desktop README](crates/openpickle-desktop/README.md) for more detail.
+The current source displays quoted replies and reactions already present in received messages.
+It does not send reactions or request-card answers, upload or share files, generate website
+previews, or manage friends, tickets, or account settings. Direct microphone chat is not
+implemented. See the [desktop README](crates/openpickle-desktop/README.md) for details.
+The published v1.0.0 downloads predate the newer source changes.
 
 ## Searching your chat from coding agents
 
@@ -154,17 +154,17 @@ The notes on the API (endpoints, phone sign-in, login sessions, the event stream
   file card or its linked name opens a **thumbnail preview**. For a PDF this is its
   **first page**, not the original document. Loading failures show a retry action.
 - **Download** saves the original to Downloads even if it has no thumbnail. The app chooses a
-  free filename (such as `report (1).pdf`) rather than overwriting a file. Use **Show in Finder**
-  or **Show in folder** to find the saved file and open it outside the app.
+  free filename (such as `report (1).pdf`) rather than overwriting a file. A transfer can be
+  canceled from its file panel. Open a downloaded image at full size, or use **Show in Finder**
+  or **Show in folder** to find the saved file.
 
 ## Your data
 
 - The app stores a login session and a copy of your conversation under
   `~/Library/Application Support/openpickle` on macOS, readable by you only, or
-  `%APPDATA%\openpickle` on Windows, inside your user profile. In v1.0.0, there is no in-app
-  sign-out control; the app attempts to clear the session and its cache if Pickle says the
-  session is no longer valid. Removing `session.json` alone does not remove cached messages.
-  Files you save to Downloads are separate from this cache.
+  `%APPDATA%\openpickle` on Windows, inside your user profile. In current source, choose
+  **My Pickle → Sign out** to remove this desktop login and its local chat cache. This does not
+  sign your phone out. Files you saved to Downloads are separate and are not removed.
 - The login session holds a single-use refresh token that changes on every refresh. Only one
   copy of the app can use that data directory at a time. Do not copy the session file to
   another tool.

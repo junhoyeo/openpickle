@@ -66,8 +66,10 @@ current token. `expires_at` is 7 days after the refresh, so a session lasts as l
 refreshed at least once a week.
 
 A client built with `loginSession` refreshes a minute before each access token expires, one
-refresh at a time, and hands every new refresh token to `onRotate`. Store it: a lost token ends
-the login session. Two programs must not share one chain, because whichever refreshes second
+refresh at a time, and hands every new refresh token to `onRotate`. If persistence fails, the
+client retries saving that same replacement before making another refresh. An internally
+managed bearer rejected with `401 token_expired` is retried at most once. Store the refresh
+token: losing it ends the login session. Two programs must not share one chain, because whichever refreshes second
 holds a spent token. That is also why a refresh token copied out of the phone's traffic signs the
 phone out.
 
@@ -382,8 +384,8 @@ An event name outside this list arrives as `{ event: "unknown", name, data }`.
 ## CLI
 
 ```sh
-# A login session file: {"login_session_token": "ls_…"}. Every run refreshes once and writes the
-# next token back to the file, so do not run two commands at the same time.
+# A login session file: {"login_session_token": "ls_…"}. The CLI locks the file's session
+# for the full command, including a running events stream.
 export PICKLE_SESSION_FILE=~/.config/pickle/login-session.json
 bun src/cli.ts login +821012345678  # texts a code, asks for it, writes the session file
 # Or an access token from the app's Authorization header, valid for 5 minutes:
@@ -404,9 +406,10 @@ bun src/cli.ts get /api/secure/transfers
 bun src/cli.ts token                # claims and seconds left of PICKLE_TOKEN
 ```
 
-Never point `PICKLE_SESSION_FILE` at the desktop app's own login-session file or share that file
-with another process. Refresh tokens rotate on use, so sharing one chain can sign out the other
-client. Give this CLI its own login session file.
+Never point `PICKLE_SESSION_FILE` at the desktop app's own login-session file. Give this CLI
+its own file. The CLI refuses to run when its sibling `.lock` directory already exists; if a
+crash left it behind, remove it only after confirming no other CLI is using that session.
+`download` streams into a temporary file and only replaces the chosen output after success.
 
 ## Verification
 

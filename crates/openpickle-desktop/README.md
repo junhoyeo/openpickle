@@ -24,8 +24,9 @@ cargo run -p openpickle-desktop --example gallery -- app   # the whole window: m
 - **Sending**: a message shows at once and is replaced by the server's copy when it arrives.
 - **Archive** (the third tab, or Cmd-4, and in the menu): pictures and files from loaded
   conversation history, grouped by day, newest first. Media is a grid of three; a file is a row
-  with its preview, name, kind, pages and size. Opening one goes to that message in the chat.
-  Until the whole history has been read, an empty page says it is still reading.
+  with its preview, name, kind, pages and size. Files can open directly in a preview panel or
+  download from Archive; **Show in chat** still jumps to the source message. Backfill pauses
+  when you leave Archive and resumes when you reopen it.
 - **Explore** (the second tab, or Cmd-2): the offers the server lists, as the app shows them.
   "For you" previews each section, with See all, and lists the rest under "More to explore"; an
   area's chip lists that area's offers by rank. An offer opens a sheet with its steps, and
@@ -46,16 +47,15 @@ cargo run -p openpickle-desktop --example gallery -- app   # the whole window: m
   and the people who joined with it or invited you.
 - **Searching**: Cmd-F, or the menu button and then the search button. The server searches;
   the results show one line of each message with the match marked. Select a result with the
-  arrow keys and Enter, or click it. In v1.0.0, the conversation scrolls to the result only
-  when that message is already loaded. Search keeps its text and results when reopened.
+  arrow keys and Enter, or click it. An uncached result loads its nearby history before the
+  conversation scrolls to it. Search keeps its text and results when reopened.
 - **Selecting and copying**: drag across messages, or right-click for Copy, Copy Message and
   Select All. Cmd-C and Cmd-A work too when the composer has no selection or text of its own. A
   selection is read from the loaded conversation, not just from the rows on screen.
 
-In the published v1.0.0 app, the 3D World menu item is disabled. There is no direct microphone
-chat with Pickle, in-app full-size attachment viewer, upload or sharing action, website preview
-card, reaction display, or quoted reply. Request cards show their status but do not accept
-answers. Friends and invites show lists and let you copy an invite link; there is no
+The 3D World menu item is disabled. There is no direct microphone chat with Pickle, upload or
+sharing action, or website preview card. Existing reactions and quoted replies are displayed
+when available, but the desktop does not send reactions or answer request cards. Friends and invites show lists and let you copy an invite link; there is no
 friend-request management, friend detail page, contact import, or sharing through other apps.
 The desktop controls are in English; there is no full localization.
 
@@ -71,8 +71,9 @@ The desktop controls are in English; there is no full localization.
   **first page**, not the original document. Loading failures show a retry action.
 - **Download** saves the original to Downloads, even if there is no thumbnail. The app chooses
   a free filename (such as `report (1).pdf`) rather than overwriting an existing file. Use
-  **Show in Finder** or **Show in folder** to find the saved file and open it outside the app.
-  There is no separate Save As dialog or sharing action.
+  **Show in Finder** or **Show in folder** to find the saved file. Transfers show progress and
+  can be canceled. Open saved images inside the panel; selected safe document types can be
+  opened explicitly in the system application. There is no Save As or sharing action.
 
 ## Profile data and limits
 
