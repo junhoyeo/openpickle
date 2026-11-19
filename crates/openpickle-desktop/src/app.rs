@@ -20,7 +20,7 @@ use crate::{
     convert,
     model::{Message, Part, RoomInfo, Social, UNCONFIRMED_SEQ, build_rows},
     phone::CallSummary,
-    protocol::{Command, HandoffCard, RoomMetadata, Update},
+    protocol::{Command, HandoffCard, RoomMetadata, SearchRequest, Update},
     theme,
     ui::{
         Identity, OpenArchive, OpenChat, OpenExplore, OpenFriends, OpenPhoneCalls, OpenProfile,
@@ -81,6 +81,8 @@ pub struct Shell {
     /// The search screen. It is kept when it closes, so that opening it again shows the same
     /// search: a result is opened to read around it, and then usually the next one.
     search: Option<Entity<SearchView>>,
+    search_generation: u64,
+    pending_search: Option<u64>,
     /// The character's name and picture, for the header of every section.
     identity: Identity,
     /// The pictures on disk, which the sections draw from.
@@ -148,6 +150,8 @@ impl Shell {
             profile: None,
             over: None,
             search: None,
+            search_generation: 0,
+            pending_search: None,
             identity: Identity::default(),
             pictures: cx.new(|_| Pictures::default()),
             account_images: HashSet::new(),
@@ -293,7 +297,7 @@ impl Shell {
                             cx,
                         );
                     });
-                    if self.tab == Tab::Chat {
+                    if self.tab == Tab::Chat && !self.searching() {
                         window.focus(&chat.focus_handle(cx));
                     }
                 }
@@ -488,9 +492,40 @@ impl Shell {
                     drawer.update(cx, |drawer, cx| drawer.set_rooms(rooms, cx));
                 }
             }
-            Update::Found { query, results } => {
+            Update::Found { request, results } => {
+                if self.accept_search(&request)
+                    && let Some(search) = &self.search
+                {
+                    search.update(cx, |search, cx| search.found(results, cx));
+                }
+            }
+            Update::SearchResultOpened {
+                request,
+                seq,
+                result,
+            } => {
+                if !self.accept_search(&request) {
+                    return;
+                }
+                let reason = match result {
+                    Ok(messages) => {
+                        self.apply(
+                            Update::Upsert {
+                                room_id: request.room_id,
+                                messages,
+                            },
+                            window,
+                            cx,
+                        );
+                        if self.show_message(seq, window, cx) {
+                            return;
+                        }
+                        "This message can no longer be shown. Choose another result.".into()
+                    }
+                    Err(reason) => reason.into(),
+                };
                 if let Some(search) = &self.search {
-                    search.update(cx, |search, cx| search.found(&query, results, cx));
+                    search.update(cx, |search, cx| search.set_opening(reason, cx));
                 }
             }
             Update::Social(social) => {
@@ -554,6 +589,7 @@ impl Shell {
         self.profile = None;
         self.over = None;
         self.search = None;
+        self.pending_search = None;
         self.social = None;
         self.rooms.clear();
         self.calls.clear();
@@ -795,7 +831,9 @@ impl Shell {
                             ArchiveEvent::Menu => this.open_drawer(window, cx),
                             ArchiveEvent::Invite => this.open_invite(window, cx),
                             ArchiveEvent::Open(tab) => this.open_tab(*tab, window, cx),
-                            ArchiveEvent::ShowInChat(seq) => this.show_message(*seq, window, cx),
+                            ArchiveEvent::ShowInChat(seq) => {
+                                this.show_message(*seq, window, cx);
+                            }
                             ArchiveEvent::Load(paths) => {
                                 this.commands
                                     .send(Command::LoadAttachments(paths.clone()))
@@ -883,6 +921,7 @@ impl Shell {
             Some(Over::Task(_)) => {
                 self.commands.send(Command::WatchHandoff(None)).ok();
             }
+            Some(Over::Search) if !matches!(over, Some(Over::Search)) => self.cancel_search(),
             _ => {}
         }
         self.over = over;
@@ -1101,12 +1140,35 @@ impl Shell {
                 self._search_events = Some(cx.subscribe_in(
                     &search,
                     window,
-                    |this, _, event, window, cx| match event {
-                        SearchEvent::Query(query) => {
-                            this.commands.send(Command::Search(query.clone())).ok();
+                    |this, view, event, window, cx| {
+                        if !this.searching() || this.opening_room.is_some() {
+                            return;
                         }
-                        SearchEvent::Open(seq) => this.show_message(*seq, window, cx),
-                        SearchEvent::Close => this.close_over(window, cx),
+                        match event {
+                            SearchEvent::Edited => this.cancel_search(),
+                            SearchEvent::Query(query) => {
+                                if let Err(reason) = this.start_search(|request| Command::Search {
+                                    request,
+                                    query: query.clone(),
+                                }) {
+                                    view.update(cx, |view, cx| view.found(Err(reason), cx));
+                                }
+                            }
+                            SearchEvent::Open(seq) => {
+                                this.cancel_search();
+                                if this.show_message(*seq, window, cx) {
+                                    return;
+                                }
+                                let note = match this.start_search(|request| {
+                                    Command::OpenSearchResult { request, seq: *seq }
+                                }) {
+                                    Ok(()) => "Opening message…".into(),
+                                    Err(reason) => reason.into(),
+                                };
+                                view.update(cx, |view, cx| view.set_opening(note, cx));
+                            }
+                            SearchEvent::Close => this.close_over(window, cx),
+                        }
                     },
                 ));
                 self.search = Some(search.clone());
@@ -1115,15 +1177,57 @@ impl Shell {
         };
         window.focus(&search.focus_handle(cx));
         self._over_events = None;
+        let was_open = self.searching();
         self.set_over(Some(Over::Search));
+        if !was_open {
+            search.update(cx, |search, cx| search.reopen(cx));
+        }
         self.report_reading(window);
         cx.notify();
     }
 
-    /// Whether the search screen is open.
-    #[cfg(test)]
     fn searching(&self) -> bool {
         matches!(self.over, Some(Over::Search))
+    }
+
+    fn start_search(
+        &mut self,
+        command: impl FnOnce(SearchRequest) -> Command,
+    ) -> Result<(), String> {
+        if self.room_id.is_empty() {
+            return Err("Wait for the conversation to connect, then search again.".into());
+        }
+        self.search_generation += 1;
+        let id = self.search_generation;
+        let request = SearchRequest {
+            room_id: self.room_id.clone(),
+            id,
+        };
+        self.pending_search = None;
+        self.commands
+            .send(command(request))
+            .map_err(|_| "OpenPickle has stopped. Reopen the app to search.".to_owned())?;
+        self.pending_search = Some(id);
+        Ok(())
+    }
+
+    fn cancel_search(&mut self) {
+        if self.pending_search.take().is_some() {
+            self.commands.send(Command::CancelSearch).ok();
+        }
+    }
+
+    fn accept_search(&mut self, request: &SearchRequest) -> bool {
+        if self.searching()
+            && self.opening_room.is_none()
+            && self.room_id == request.room_id
+            && self.pending_search == Some(request.id)
+        {
+            self.pending_search = None;
+            true
+        } else {
+            false
+        }
     }
 
     /// Dispatch only supported links. Attachment targets must also belong to a message in
@@ -1227,18 +1331,22 @@ impl Shell {
         cx.notify();
     }
 
-    /// Goes to the chat at the message with this sequence number, and marks it for a moment.
-    /// A message that is not on this computer (yet) cannot be shown; nothing changes then.
-    fn show_message(&mut self, seq: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(index) = self.messages.iter().position(|message| message.seq == seq) else {
-            return;
+    /// Reveals a message already in the timeline. False means there is no row to scroll to.
+    fn show_message(&mut self, seq: u64, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(index) = self
+            .messages
+            .iter()
+            .position(|message| message.seq == seq && !message.parts.is_empty())
+        else {
+            return false;
         };
         let (Screen::Chat(chat), Some(&start)) = (&self.screen, self.row_starts.get(index)) else {
-            return;
+            return false;
         };
         let rows = start..start + self.messages[index].parts.len();
         chat.update(cx, |chat, cx| chat.reveal(rows, window, cx));
         self.open_tab(Tab::Chat, window, cx);
+        true
     }
 
     /// Shows the message at once and hands it to the backend, which may be busy for a while:
@@ -1702,65 +1810,176 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_search_result_opens_its_message_and_closes_the_search(cx: &mut gpui::TestAppContext) {
+    fn an_uncached_search_result_retries_then_reveals_its_hydrated_message(
+        cx: &mut gpui::TestAppContext,
+    ) {
         cx.update(crate::ui::bind_keys);
         let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
         let (updates, received) = futures::channel::mpsc::unbounded();
-        let part = Part::Task("내일 비 온대요".into());
-        let conversation = Update::Conversation {
-            room_id: "primary".into(),
-            is_character: true,
+        let row = |seq| Message {
+            parts: vec![Part::Task(format!("Message {seq}").into())],
+            ..message(&format!("message-{seq}"), seq)
+        };
+        let conversation = |room: &str| Update::Conversation {
+            room_id: room.into(),
+            is_character: room == "primary",
             can_send: true,
             name: "Pickle".into(),
             avatar: None,
-            messages: vec![Message {
-                parts: vec![part],
-                ..message("a", 1)
-            }],
+            messages: (100..200).map(row).collect(),
         };
-        updates.unbounded_send(conversation).unwrap();
+        updates.unbounded_send(conversation("primary")).unwrap();
         let (shell, cx) =
             cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
-
         cx.simulate_resize(gpui::size(gpui::px(440.), gpui::px(900.)));
 
         cx.simulate_keystrokes("secondary-f");
-        cx.simulate_input("비");
-        cx.simulate_keystrokes("enter");
-        let asked = std::iter::from_fn(|| sent.try_recv().ok()).find_map(|command| match command {
-            Command::Search(query) => Some(query),
-            _ => None,
-        });
-        assert_eq!(asked.as_deref(), Some("비"));
+        cx.simulate_input("old");
+        cx.simulate_keystrokes("enter enter");
+        let (first_query, query) = std::iter::from_fn(|| sent.try_recv().ok())
+            .find_map(|command| match command {
+                Command::Search { request, query } => Some((request, query)),
+                _ => None,
+            })
+            .unwrap();
+        let (current_query, second_query) = std::iter::from_fn(|| sent.try_recv().ok())
+            .find_map(|command| match command {
+                Command::Search { request, query } => Some((request, query)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!((query.as_str(), second_query.as_str()), ("old", "old"));
 
         let found = |seq| SearchResult {
             seq: Some(seq),
             label: "Chat".into(),
             date: "Nov 16".into(),
-            snippet: "내일 비 온대요".into(),
-            matches: vec![0..6, 7..10],
+            snippet: "An old message".into(),
+            matches: vec![3..6],
         };
-        // The first result is a message this computer does not have; the second one it has.
-        let results = Update::Found {
-            query: "비".into(),
-            results: Ok(vec![found(99), found(1)]),
-        };
-        updates.unbounded_send(results).unwrap();
+        // The same query text does not identify a request. Its earlier answer cannot open a row.
+        updates
+            .unbounded_send(Update::Found {
+                request: first_query,
+                results: Ok(vec![found(121)]),
+            })
+            .unwrap();
         cx.run_until_parked();
         let first = gpui::point(gpui::px(120.), gpui::px(75.));
         cx.simulate_click(first, gpui::Modifiers::none());
         shell.read_with(cx, |shell, _| assert!(shell.searching()));
-        cx.simulate_click(
-            first + gpui::point(gpui::px(0.), gpui::px(70.)),
-            gpui::Modifiers::none(),
-        );
-        shell.read_with(cx, |shell, _| assert!(!shell.searching()));
 
-        // Escape closes the search too.
-        cx.simulate_keystrokes("secondary-f");
+        updates
+            .unbounded_send(Update::Found {
+                request: current_query,
+                results: Ok(vec![found(50), found(121), found(25)]),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let lookup = |sent: &mut tokio::sync::mpsc::UnboundedReceiver<Command>, expected| {
+            std::iter::from_fn(|| sent.try_recv().ok())
+                .find_map(|command| match command {
+                    Command::OpenSearchResult { request, seq } => {
+                        assert_eq!((request.room_id.as_str(), seq), ("primary", expected));
+                        Some(request)
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        cx.simulate_click(first, gpui::Modifiers::none());
+        let failed = lookup(&mut sent, 50);
+        let failed_id = failed.id;
+        updates
+            .unbounded_send(Update::SearchResultOpened {
+                request: failed,
+                seq: 50,
+                result: Err("This message is no longer available. Choose another result.".into()),
+            })
+            .unwrap();
+        cx.run_until_parked();
         shell.read_with(cx, |shell, _| assert!(shell.searching()));
-        cx.simulate_keystrokes("escape");
+
+        cx.simulate_click(first, gpui::Modifiers::none());
+        let retried = lookup(&mut sent, 50);
+        updates
+            .unbounded_send(Update::SearchResultOpened {
+                request: SearchRequest {
+                    room_id: "primary".into(),
+                    id: failed_id,
+                },
+                seq: 50,
+                result: Ok(vec![row(50), row(51)]),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.searching());
+            assert!(shell.messages.iter().all(|message| message.seq >= 100));
+        });
+
+        updates
+            .unbounded_send(Update::SearchResultOpened {
+                request: retried,
+                seq: 50,
+                result: Ok(vec![row(52), row(50), row(48)]),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| {
+            assert!(!shell.searching());
+            assert_eq!(
+                shell.messages[..3]
+                    .iter()
+                    .map(|item| item.seq)
+                    .collect::<Vec<_>>(),
+                [48, 50, 52]
+            );
+            let Screen::Chat(chat) = &shell.screen else {
+                panic!("expected chat")
+            };
+            let (marked, top) = chat.read(cx).search_position();
+            let target = shell.row_starts[1];
+            assert_eq!(marked, Some(target));
+            assert!(
+                top <= target && target - top <= 2,
+                "top row {top}, target {target}"
+            );
+        });
+
+        // Reopening the same result needs no further network work.
+        cx.simulate_keystrokes("secondary-f");
+        cx.simulate_click(first, gpui::Modifiers::none());
         shell.read_with(cx, |shell, _| assert!(!shell.searching()));
+        assert!(
+            !std::iter::from_fn(|| sent.try_recv().ok())
+                .any(|command| matches!(command, Command::OpenSearchResult { .. }))
+        );
+
+        cx.simulate_keystrokes("secondary-f down down down enter");
+        let leaving = lookup(&mut sent, 25);
+        updates.unbounded_send(conversation("peer")).unwrap();
+        updates
+            .unbounded_send(Update::SearchResultOpened {
+                request: leaving,
+                seq: 25,
+                result: Ok(vec![row(25)]),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            std::iter::from_fn(|| sent.try_recv().ok())
+                .any(|command| matches!(command, Command::CancelSearch))
+        );
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.room_id, "peer");
+            assert!(!shell.searching());
+            assert!(shell.messages.iter().all(|message| message.seq >= 100));
+            let Screen::Chat(chat) = &shell.screen else {
+                panic!("expected chat")
+            };
+            assert_eq!(chat.read(cx).search_position().0, None);
+        });
     }
 
     #[test]

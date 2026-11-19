@@ -16,6 +16,12 @@ pub enum HandoffCard {
     Phone(PhoneCallTranscript),
 }
 
+/// An intent belongs to one room and one generation of the search screen's requests.
+pub struct SearchRequest {
+    pub room_id: String,
+    pub id: u64,
+}
+
 /// UI to backend. Neither side of the protocol can be printed with `{:?}`: a command may hold
 /// a phone number or a sign-in code, and both hold message text.
 pub enum Command {
@@ -62,8 +68,15 @@ pub enum Command {
     PreviewAttachment(String),
     /// Download one attachment of the open room, the file itself, into the Downloads folder.
     DownloadAttachment(String),
-    /// Search the messages for this text.
-    Search(String),
+    /// Search the messages for this text in the open character room.
+    Search {
+        request: SearchRequest,
+        query: String,
+    },
+    /// Resolve a search hit that is not in the timeline yet.
+    OpenSearchResult { request: SearchRequest, seq: u64 },
+    /// Discard queued search work and stop publishing its in-flight result.
+    CancelSearch,
     /// Whether the chat can be read now: the window is in front and shows the chat. Only
     /// then do new messages count as read.
     Active(bool),
@@ -118,10 +131,16 @@ pub enum Update {
         id: String,
         reason: String,
     },
-    /// What a search for `query` found, or why it could not be done.
+    /// What this search found, or why it could not be done.
     Found {
-        query: String,
+        request: SearchRequest,
         results: Result<Vec<SearchResult>, String>,
+    },
+    /// The context to apply before revealing an uncached hit, or why it could not be opened.
+    SearchResultOpened {
+        request: SearchRequest,
+        seq: u64,
+        result: Result<Vec<Message>, String>,
     },
     /// The friends and the invite link, or why they could not be read.
     Social(Result<Social, String>),

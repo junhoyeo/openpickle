@@ -17,6 +17,7 @@ use crate::{
 };
 
 pub enum SearchEvent {
+    Edited,
     /// Search the messages for this text.
     Query(String),
     /// Open the message with this sequence number.
@@ -34,6 +35,8 @@ enum State {
 
 pub struct SearchView {
     input: Entity<TextInput>,
+    /// Loading or failure for an individual result. Other results remain available.
+    opening: Option<SharedString>,
     /// What the last finished search found.
     results: Vec<SearchResult>,
     /// The result the arrow keys are on, which Enter opens.
@@ -54,6 +57,15 @@ impl SearchView {
         let input = cx.new(|cx| TextInput::new("Search", cx));
         let subscriptions = vec![cx.subscribe(&input, |this, _, event, cx| match event {
             InputEvent::Changed => {
+                this.results.clear();
+                this.chosen = None;
+                this.opening = None;
+                this.state = if this.query(cx).is_empty() {
+                    State::Idle
+                } else {
+                    State::Searching
+                };
+                cx.emit(SearchEvent::Edited);
                 this.pause = Some(cx.spawn(async move |this, cx| {
                     cx.background_executor().timer(Self::PAUSE).await;
                     this.update(cx, |this, cx| this.search(cx)).ok();
@@ -63,7 +75,7 @@ impl SearchView {
             }
             // Enter opens the result the arrow keys are on. Without one it searches at once.
             InputEvent::Submitted(_) => {
-                match this.chosen.and_then(|chosen| this.results[chosen].seq) {
+                match this.chosen.and_then(|chosen| this.results.get(chosen)?.seq) {
                     Some(seq) => cx.emit(SearchEvent::Open(seq)),
                     None => this.search(cx),
                 }
@@ -72,6 +84,7 @@ impl SearchView {
         })];
         Self {
             input,
+            opening: None,
             results: Vec::new(),
             chosen: None,
             state: State::Idle,
@@ -98,9 +111,10 @@ impl SearchView {
     fn search(&mut self, cx: &mut Context<Self>) {
         self.pause = None;
         let query = self.query(cx);
+        self.results.clear();
+        self.chosen = None;
+        self.opening = None;
         if query.is_empty() {
-            self.results.clear();
-            self.chosen = None;
             self.state = State::Idle;
         } else {
             self.state = State::Searching;
@@ -109,17 +123,8 @@ impl SearchView {
         cx.notify();
     }
 
-    /// Takes in what a search found, or why it failed. Searches are answered in the order
-    /// they were asked, so an answer for text that is no longer in the field is dropped.
-    pub fn found(
-        &mut self,
-        query: &str,
-        results: Result<Vec<SearchResult>, String>,
-        cx: &mut Context<Self>,
-    ) {
-        if query != self.query(cx) {
-            return;
-        }
+    /// Takes in the current search results. The shell matches the request generation first.
+    pub fn found(&mut self, results: Result<Vec<SearchResult>, String>, cx: &mut Context<Self>) {
         self.chosen = None;
         match results {
             Ok(results) => {
@@ -132,6 +137,20 @@ impl SearchView {
             }
         }
         cx.notify();
+    }
+
+    pub fn set_opening(&mut self, note: SharedString, cx: &mut Context<Self>) {
+        self.opening = Some(note);
+        cx.notify();
+    }
+
+    pub fn reopen(&mut self, cx: &mut Context<Self>) {
+        self.opening = None;
+        if matches!(self.state, State::Searching) {
+            self.search(cx);
+        } else {
+            cx.notify();
+        }
     }
 
     fn result(
@@ -186,7 +205,11 @@ impl SearchView {
             Some(seq) => row
                 .cursor_pointer()
                 .hover(|row| row.bg(theme::alpha(0xffffff, 0.04)))
-                .on_click(cx.listener(move |_, _, _, cx| cx.emit(SearchEvent::Open(seq)))),
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.results.get(index).and_then(|result| result.seq) == Some(seq) {
+                        cx.emit(SearchEvent::Open(seq));
+                    }
+                })),
             None => row,
         }
     }
@@ -198,8 +221,8 @@ impl Render for SearchView {
             State::Idle => Some("Search your messages".into()),
             State::Failed(reason) => Some(reason.clone()),
             State::Found if self.results.is_empty() => Some("No results".into()),
-            State::Searching if self.results.is_empty() => Some(SharedString::from("Searching...")),
-            State::Found | State::Searching => None,
+            State::Searching => Some("Searching…".into()),
+            State::Found => None,
         };
         let results = div()
             .id("results")
@@ -284,6 +307,18 @@ impl Render for SearchView {
             .flex_col()
             .items_center()
             .child(results)
+            .when_some(self.opening.clone(), |view, note| {
+                view.child(
+                    div()
+                        .w_full()
+                        .max_w(theme::COLUMN_MAX)
+                        .px(px(20.))
+                        .py(px(8.))
+                        .text_size(theme::LABEL)
+                        .text_color(theme::color(theme::TEXT_FAINT))
+                        .child(note),
+                )
+            })
             .child(
                 div()
                     .w_full()
@@ -325,9 +360,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_search_goes_out_when_the_typing_pauses_and_a_stale_answer_is_dropped(
-        cx: &mut TestAppContext,
-    ) {
+    fn search_debounces_typing_and_opens_a_visible_result(cx: &mut TestAppContext) {
         cx.update(crate::ui::bind_keys);
         let (view, cx) = cx.add_window_view(|window, cx| {
             let view = SearchView::new(cx);
@@ -352,13 +385,7 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(*asked.borrow(), ["비가"]);
 
-        // The answer for what was typed first arrives late and is not shown.
-        view.update(cx, |view, cx| {
-            view.found("비", Ok(vec![result(1), result(2)]), cx)
-        });
         view.read_with(cx, |view, _| assert!(view.results.is_empty()));
-        view.update(cx, |view, cx| view.found("비가", Ok(vec![result(3)]), cx));
-        view.read_with(cx, |view, _| assert_eq!(view.results, [result(3)]));
 
         // The arrow keys choose a result and Enter opens it.
         let opened = Rc::new(RefCell::new(Vec::new()));
@@ -372,7 +399,7 @@ mod tests {
             .detach();
         });
         view.update(cx, |view, cx| {
-            view.found("비가", Ok(vec![result(3), result(2), result(1)]), cx)
+            view.found(Ok(vec![result(3), result(2), result(1)]), cx)
         });
         cx.simulate_keystrokes("down down down down up enter");
         assert_eq!(*opened.borrow(), [2]);
@@ -382,7 +409,7 @@ mod tests {
         cx.simulate_resize(gpui::size(gpui::px(440.), gpui::px(900.)));
         view.update(cx, |view, cx| {
             let thirty = (1..=30).map(result).collect();
-            view.found("비가", Ok(thirty), cx)
+            view.found(Ok(thirty), cx)
         });
         cx.run_until_parked();
         let first_row = gpui::point(gpui::px(120.), gpui::px(75.));

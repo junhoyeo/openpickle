@@ -792,9 +792,9 @@ fn main() {
                 std::thread::spawn(move || {
                     while let Some(command) = asked.blocking_recv() {
                         let update = match command {
-                            Command::Search(query) => Update::Found {
+                            Command::Search { request, query } => Update::Found {
                                 results: Ok(search(&messages, &query)),
-                                query,
+                                request,
                             },
                             Command::LoadSocial => Update::Social(Ok(sample_social())),
                             Command::LoadProfile => Update::Profile(Ok(sample_profile())),

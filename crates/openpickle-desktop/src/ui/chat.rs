@@ -84,6 +84,7 @@ pub struct ChatView {
     scrolled_at: Option<Instant>,
     /// The rows of the message a search result opened, marked for a moment.
     found: Option<Range<usize>>,
+    reveal_generation: u64,
     _found: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -149,6 +150,7 @@ impl ChatView {
             menu: None,
             scrolled_at: None,
             found: None,
+            reveal_generation: 0,
             _found: None,
             _subscriptions: subscriptions,
         }
@@ -182,6 +184,7 @@ impl ChatView {
         self.selection.borrow_mut().release();
         self.menu = None;
         self.found = None;
+        self.reveal_generation += 1;
         self._found = None;
         self.requested_pictures.clear();
         // The cards are asked for again when they are next drawn.
@@ -288,10 +291,17 @@ impl ChatView {
         // The message would sit right under the header. The end of what came before it is
         // brought into view as well, which takes two frames: the list only knows the heights
         // of the rows above once it has drawn at the new place.
-        cx.on_next_frame(window, |_, window, cx| {
-            cx.on_next_frame(window, |this, _, cx| {
-                this.scroll_by(-FOUND_CONTEXT);
-                cx.notify();
+        self.reveal_generation += 1;
+        let generation = self.reveal_generation;
+        cx.on_next_frame(window, move |this, window, cx| {
+            if this.reveal_generation != generation {
+                return;
+            }
+            cx.on_next_frame(window, move |this, _, cx| {
+                if this.reveal_generation == generation {
+                    this.scroll_by(-FOUND_CONTEXT);
+                    cx.notify();
+                }
             });
             cx.notify();
         });
@@ -305,6 +315,14 @@ impl ChatView {
             .ok();
         }));
         cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_position(&self) -> (Option<usize>, usize) {
+        (
+            self.found.as_ref().map(|rows| rows.start),
+            self.list.logical_scroll_top().item_ix,
+        )
     }
 
     /// Escape closes the menu of a right click, or else drops the selection.
