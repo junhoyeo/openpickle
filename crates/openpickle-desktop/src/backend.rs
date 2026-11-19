@@ -244,7 +244,7 @@ async fn sign_in(
             | Command::WatchPhoneCall(_)
             | Command::EndPhoneCall { .. }
             | Command::OffersShown(_)
-            | Command::LoadArchive
+            | Command::WatchArchive(_)
             | Command::LoadAttachments(_)
             | Command::PreviewAttachment(_)
             | Command::Active(_) => continue,
@@ -583,6 +583,62 @@ const CARD_HANDOFFS_FRESH: Duration = Duration::from_secs(10);
 /// started is listed within seconds, one from long ago never is.
 const CARD_UNLISTED_WAIT: Duration = Duration::from_secs(30);
 
+type ArchiveRequest = Pin<Box<dyn std::future::Future<Output = ArchivePage> + Send>>;
+
+struct ArchivePage {
+    room_id: String,
+    before: i64,
+    result: openpickle_api::Result<openpickle_api::HistoryPage>,
+}
+
+#[derive(Default)]
+struct ArchiveLoad {
+    /// The cursor of the next page, including when the view closes or the request fails.
+    before: Option<i64>,
+    complete: bool,
+    request: Option<ArchiveRequest>,
+    /// A projection for this opening. Backward pages normally add to its tail.
+    attachments: Vec<Attachment>,
+}
+
+impl ArchiveLoad {
+    fn pause(&mut self) {
+        self.request = None;
+        self.attachments = Vec::new();
+    }
+
+    fn add_attachments(&mut self, mut additions: Vec<Attachment>) {
+        additions.sort_by_key(|attachment| std::cmp::Reverse(attachment.seq));
+        for attachment in additions {
+            let start = self
+                .attachments
+                .partition_point(|known| known.seq > attachment.seq);
+            let end = self
+                .attachments
+                .partition_point(|known| known.seq >= attachment.seq);
+            if let Some(index) = self.attachments[start..end]
+                .iter()
+                .position(|known| known.path == attachment.path)
+            {
+                self.attachments[start + index] = attachment;
+            } else {
+                self.attachments.insert(end, attachment);
+            }
+        }
+    }
+}
+
+async fn next_archive_page(request: &mut Option<ArchiveRequest>) -> ArchivePage {
+    match request {
+        Some(request) => request.await,
+        None => std::future::pending().await,
+    }
+}
+
+fn backward_cursor(before: i64, page: &openpickle_api::HistoryPage) -> Option<i64> {
+    (page.has_more && page.next_before < before).then_some(page.next_before)
+}
+
 struct Live {
     client: PickleClient,
     store: Store,
@@ -597,8 +653,7 @@ struct Live {
     download_dir: PathBuf,
     /// Whether the window is in front; only then does reading count as "seen".
     active: bool,
-    /// Whether the history on this computer reaches back to the first message.
-    history_complete: bool,
+    archive: ArchiveLoad,
     /// The room with the character, which the app starts in.
     character_room: String,
     /// Another room the window switched to. While it is set, the stream's chat events for
@@ -681,7 +736,7 @@ fn start_conversation(
         download_dir: download_dir(),
         // The window says when it comes to the front.
         active: false,
-        history_complete: false,
+        archive: ArchiveLoad::default(),
         character_room: String::new(),
         room_override: None,
         last_rooms: Vec::new(),
@@ -708,7 +763,14 @@ async fn converse(
         Ok(live) => live,
         Err(ended) => return ended,
     };
-    let mut events: Option<EventStream> = None;
+    conversation_loop(&mut live, commands, None).await
+}
+
+async fn conversation_loop(
+    live: &mut Live,
+    commands: &mut Commands<Command>,
+    mut events: Option<EventStream>,
+) -> Ended {
     let mut connect_at = Instant::now();
     let mut opened_at = Instant::now();
     let mut backoff = Backoff::default();
@@ -861,21 +923,14 @@ async fn converse(
                     }
                 }
                 Some(Command::OpenRoom(room_id)) => {
+                    live.archive.pause();
                     if let Err(error) = live.open_room_and_report(room_id).await
                         && session_is_gone(&error)
                     {
                         return Ended::SignedOut;
                     }
                 }
-                Some(Command::LoadArchive) => {
-                    if let Err(error) = live.read_archive().await {
-                        if session_is_gone(&error) {
-                            return Ended::SignedOut;
-                        }
-                        // What was read is shown; the rest is read on the next opening.
-                        live.show_archive(false);
-                    }
-                }
+                Some(Command::WatchArchive(room_id)) => live.watch_archive(room_id.as_deref()),
                 Some(Command::LoadAttachments(paths)) => live.fetch_attachments(paths),
                 Some(Command::PreviewAttachment(path)) => {
                     if let Err(error) = live.preview_attachment(path).await
@@ -898,6 +953,13 @@ async fn converse(
                     live.mark_read().await;
                 }
                 Some(Command::RequestCode(_) | Command::VerifyCode(_)) => {}
+            },
+            page = next_archive_page(&mut live.archive.request), if live.archive.request.is_some() => {
+                if let Err(error) = live.finish_archive_page(page)
+                    && session_is_gone(&error)
+                {
+                    return Ended::SignedOut;
+                }
             },
             _ = tokio::time::sleep_until(phone_deadline.unwrap_or_else(Instant::now)), if phone_deadline.is_some() => {
                 let now = Instant::now();
@@ -1397,50 +1459,122 @@ impl Live {
             .map(drop)
     }
 
-    /// Lists the conversation's pictures and files. The history on this computer usually
-    /// starts where the app was first opened; the messages before it are read page by page,
-    /// logged like any other, and the list is shown again after each page.
-    async fn read_archive(&mut self) -> openpickle_api::Result<()> {
-        if self.conversation.room_id.is_empty() {
-            self.find_room().await?;
+    fn watch_archive(&mut self, room_id: Option<&str>) {
+        let Some(room_id) = room_id else {
+            self.archive.pause();
+            return;
+        };
+        if room_id.is_empty()
+            || room_id != self.conversation.room_id
+            || self.archive.request.is_some()
+        {
+            return;
         }
-        self.show_archive(self.history_complete);
-        while !self.history_complete {
-            let before = self.conversation.first_seq().unwrap_or(i64::MAX);
-            let page = self
-                .client
-                .get_history_page(&self.conversation.room_id, before, ARCHIVE_PAGE)
-                .await?;
-            // A page that reaches back no further than what is known ends the reading.
-            let older = page.messages.iter().any(|item| item.seq < before);
-            self.history_complete = !page.has_more || !older;
-            if let Some(log) = &mut self.conversation.log {
-                let mut records: Vec<Record> = page
-                    .messages
-                    .iter()
-                    .cloned()
-                    .map(|item| Record::Item(Box::new(item)))
-                    .collect();
-                records.extend(page.card_states.iter().cloned().map(Record::Card));
-                log.append(&records);
+        self.archive.attachments = self.conversation.attachments();
+        self.show_archive();
+        if !self.archive.complete {
+            let before = self
+                .archive
+                .before
+                .or_else(|| self.conversation.first_seq())
+                .unwrap_or(i64::MAX);
+            self.request_archive_page(before);
+        }
+    }
+
+    /// The select loop owns this future. Other ready branches can run while the GET is pending;
+    /// dropping the future cancels that read without applying anything to a different room.
+    fn request_archive_page(&mut self, before: i64) {
+        self.archive.before = Some(before);
+        let room_id = self.conversation.room_id.clone();
+        let client = self.client.clone();
+        self.archive.request = Some(Box::pin(async move {
+            let result = client
+                .get_history_page(&room_id, before, BACKWARD_PAGE_SIZE)
+                .await;
+            ArchivePage {
+                room_id,
+                before,
+                result,
             }
-            let changed = self.conversation.apply(page.messages, page.card_states);
-            if !changed.is_empty() {
-                self.send(Update::Upsert {
-                    room_id: self.conversation.room_id.clone(),
-                    messages: changed,
-                });
-            }
-            self.show_archive(self.history_complete);
+        }));
+    }
+
+    fn finish_archive_page(&mut self, page: ArchivePage) -> openpickle_api::Result<()> {
+        if page.room_id != self.conversation.room_id
+            || self.archive.before != Some(page.before)
+            || self.archive.request.is_none()
+        {
+            return Ok(());
+        }
+        self.archive.request = None;
+        // A failure leaves the requested cursor intact for the next opening.
+        let before = page.before;
+        let page = page.result?;
+        let next = backward_cursor(before, &page);
+        self.archive.complete = !page.has_more;
+        let attachments = self.apply_archive_page(before, page);
+        if self.archive.complete {
+            // Include any live or delta messages received since the Archive opened.
+            self.archive.attachments = self.conversation.attachments();
+            self.show_archive();
+        } else if !attachments.is_empty() {
+            self.archive.add_attachments(attachments);
+            self.show_archive();
+        }
+        if let Some(next) = next {
+            self.request_archive_page(next);
         }
         Ok(())
     }
 
-    fn show_archive(&mut self, complete: bool) {
+    fn apply_archive_page(
+        &mut self,
+        before: i64,
+        mut page: openpickle_api::HistoryPage,
+    ) -> Vec<Attachment> {
+        // The timeline may have received a fresh copy while this GET was in progress. A backward
+        // page must neither admit out-of-range items nor replace a copy already fetched normally.
+        page.messages
+            .retain(|item| item.seq < before && !self.conversation.items.contains_key(&item.id));
+        page.card_states.retain(|state| {
+            self.conversation
+                .card_states
+                .get(&state.id)
+                .is_none_or(|known| known.seq < state.seq)
+        });
+        let attachments = page
+            .messages
+            .iter()
+            .flat_map(convert::attachments)
+            .collect();
+        if let Some(log) = &mut self.conversation.log {
+            let mut records: Vec<Record> = page
+                .messages
+                .iter()
+                .cloned()
+                .map(|item| Record::Item(Box::new(item)))
+                .collect();
+            records.extend(page.card_states.iter().cloned().map(Record::Card));
+            if !records.is_empty() {
+                log.append(&records);
+            }
+        }
+        let changed = self.conversation.apply(page.messages, page.card_states);
+        if !changed.is_empty() {
+            self.send(Update::Upsert {
+                room_id: self.conversation.room_id.clone(),
+                messages: changed,
+            });
+        }
+        attachments
+    }
+
+    fn show_archive(&self) {
         self.send(Update::Archive {
             room_id: self.conversation.room_id.clone(),
-            attachments: self.conversation.attachments(),
-            complete,
+            attachments: self.archive.attachments.clone(),
+            complete: self.archive.complete,
         });
     }
 
@@ -1952,7 +2086,7 @@ impl Live {
     }
 
     fn reset_room_state(&mut self) {
-        self.history_complete = false;
+        self.archive = ArchiveLoad::default();
         self.history_refresh = None;
         self.marked_read = 0;
     }
@@ -2218,8 +2352,8 @@ impl PictureFetches {
     }
 }
 
-/// How many messages the Archive reads back at a time, as the app does.
-const ARCHIVE_PAGE: u32 = 250;
+/// How many messages the Archive asks for in one request, as the app does.
+const BACKWARD_PAGE_SIZE: u32 = 250;
 
 /// Downloads pictures, a few at a time.
 struct Downloads {
@@ -2652,7 +2786,7 @@ mod tests {
             handoff_cards: HandoffCards::default(),
             download_dir: store.cache_path("downloads"),
             active: false,
-            history_complete: false,
+            archive: ArchiveLoad::default(),
             character_room: "primary".to_owned(),
             room_override: None,
             last_rooms: vec![
@@ -2673,6 +2807,128 @@ mod tests {
 
     fn drain(received: &mut futures::channel::mpsc::UnboundedReceiver<Update>) {
         while received.try_recv().is_ok() {}
+    }
+
+    #[test]
+    fn archive_resumes_its_server_cursor_and_stops_if_it_does_not_advance() {
+        let server = HistoryServer::start();
+        let (mut live, mut received) = fixture_live("archive-cursor", &server);
+        let item = |id: &str, seq: i64| {
+            serde_json::from_value::<HistoryItem>(serde_json::json!({
+                "role": "user", "id": id, "text": id, "at": 10.0, "seq": seq,
+            }))
+            .unwrap()
+        };
+        live.conversation
+            .items
+            .insert("latest".into(), item("latest", 100));
+        live.conversation.synced = 100;
+        live.watch_archive(Some("primary"));
+        assert_eq!(live.archive.before, Some(100));
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Update::Archive {
+                complete: false,
+                ..
+            }
+        ));
+
+        let page = |room_id: &str, before, messages, next_before, has_more| ArchivePage {
+            room_id: room_id.into(),
+            before,
+            result: Ok(openpickle_api::HistoryPage {
+                v: 1,
+                messages,
+                reactions: vec![],
+                card_states: vec![],
+                has_more,
+                next_before,
+            }),
+        };
+        let stale = page("peer", 100, vec![item("peer-only", 90)], 90, true);
+        live.finish_archive_page(stale).unwrap();
+        assert!(!live.conversation.items.contains_key("peer-only"));
+        assert!(live.archive.request.is_some());
+
+        // The page cursor is authoritative, not the minimum message sequence in the page.
+        let first = page(
+            "primary",
+            100,
+            vec![item("out-of-range", 100), item("older", 96)],
+            90,
+            true,
+        );
+        live.finish_archive_page(first).unwrap();
+        assert_eq!(live.archive.before, Some(90));
+        assert_eq!(live.conversation.synced, 100);
+        assert!(
+            matches!(received.try_recv().unwrap(), Update::Upsert { messages, .. }
+            if messages.iter().map(|message| message.seq).eq([96]))
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "a text-only continuation needs no Archive snapshot"
+        );
+
+        live.watch_archive(None);
+        assert!(live.archive.request.is_none());
+        live.watch_archive(Some("primary"));
+        assert_eq!(live.archive.before, Some(90));
+        assert!(live.archive.request.is_some());
+        let stuck = page(
+            "primary",
+            90,
+            vec![item("still-older", 89), item("older", 88)],
+            90,
+            true,
+        );
+        live.finish_archive_page(stuck).unwrap();
+        assert!(live.archive.request.is_none());
+        assert!(!live.archive.complete);
+        assert!(live.conversation.items.contains_key("still-older"));
+        assert_eq!(live.conversation.items["older"].seq, 96);
+    }
+
+    #[tokio::test]
+    async fn a_pending_archive_read_does_not_delay_events_timers_or_opening_another_room() {
+        let server = HistoryServer::start();
+        let (mut live, mut updates) = fixture_live("archive-interrupt", &server);
+        let (commands, mut receiver) = unbounded_channel();
+        let (events, incoming) = futures::channel::mpsc::unbounded();
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped, dropped_rx) = tokio::sync::oneshot::channel::<()>();
+        live.archive.before = Some(100);
+        live.archive.request = Some(Box::pin(async move {
+            let _dropped_on_cancel = dropped;
+            started.send(()).unwrap();
+            std::future::pending().await
+        }));
+        live.handoff_watch = Some(HandoffWatch {
+            path: "handoffs/done-task".into(),
+            next_refresh: Some(Instant::now()),
+        });
+        let (ended, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                conversation_loop(&mut live, &mut receiver, Some(Box::pin(incoming))),
+                async {
+                    started_rx.await.unwrap();
+                    events.unbounded_send(Ok(PickleEvent::Chat(ChatEvent::Pending { on: true }))).unwrap();
+                    let (mut activity, mut timer) = (false, false);
+                    while !activity || !timer {
+                        match updates.next().await.unwrap() {
+                            Update::Activity { room_id, activity: Some(None) } if room_id == "primary" => activity = true,
+                            Update::Handoff { result: Ok(_), .. } => timer = true,
+                            _ => {}
+                        }
+                    }
+                    commands.send(Command::OpenRoom("peer".into())).ok().unwrap();
+                    assert!(dropped_rx.await.is_err(), "the old room's pending read was dropped");
+                    assert!(matches!(updates.next().await, Some(Update::Conversation { room_id, .. }) if room_id == "peer"));
+                    commands.send(Command::Quit).ok().unwrap();
+                }
+            )
+        }).await.expect("the pending Archive GET must not block the conversation loop");
+        assert!(matches!(ended, Ended::Closed));
     }
 
     #[tokio::test]
@@ -2755,7 +3011,7 @@ mod tests {
         let (mut live, mut received) = fixture_live("roster-permissions", &server);
         live.find_room().await.unwrap();
         live.open_room("peer").await.unwrap();
-        live.history_complete = true;
+        live.archive.complete = true;
         live.marked_read = 1;
         let cursor_before = live.conversation.synced;
         drain(&mut received);
@@ -2790,7 +3046,7 @@ mod tests {
         assert_eq!(live.conversation.room_id, "peer");
         assert_eq!(live.conversation.synced, cursor_before);
         assert_eq!(live.marked_read, 1);
-        assert!(live.history_complete);
+        assert!(live.archive.complete);
         assert_eq!(
             live.send_block_reason("peer"),
             Some("Not sent. This room is read-only.")
@@ -3006,12 +3262,12 @@ mod tests {
         let server = HistoryServer::start();
         let (mut live, mut received) = fixture_live("isolation", &server);
 
-        live.history_complete = true;
+        live.archive.complete = true;
         live.marked_read = 41;
         live.open_room("peer").await.unwrap();
         assert_eq!(live.conversation.room_id, "peer");
         assert_eq!(live.room_override.as_deref(), Some("peer"));
-        assert!(!live.history_complete);
+        assert!(!live.archive.complete);
         assert_eq!(live.marked_read, 0);
         assert_eq!(
             live.store.cached::<String>("room.json").as_deref(),
@@ -3058,12 +3314,12 @@ mod tests {
         ));
 
         // Empty OpenRoom returns to the character conversation and resets per-room state.
-        live.history_complete = true;
+        live.archive.complete = true;
         live.marked_read = 87;
         live.open_room("").await.unwrap();
         assert_eq!(live.conversation.room_id, "primary");
         assert!(live.room_override.is_none());
-        assert!(!live.history_complete);
+        assert!(!live.archive.complete);
         assert_eq!(live.marked_read, 0);
         assert_eq!(
             live.store.cached::<String>("room.json").as_deref(),
