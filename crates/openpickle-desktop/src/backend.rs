@@ -33,7 +33,7 @@ use crate::{
     model::{Attachment, Message},
     phone::CallSummary,
     profile::ProfileData,
-    protocol::{Command, Update},
+    protocol::{Command, RoomMetadata, Update},
     store::{Session, Store},
 };
 
@@ -572,6 +572,9 @@ struct Live {
     room_override: Option<String>,
     /// The rooms as last listed by `sync`; this is the authority for room links and send access.
     last_rooms: Vec<openpickle_api::Room>,
+    roster_rev: Option<i64>,
+    roster_refresh: Option<ReconcileWork>,
+    history_refresh: Option<ReconcileWork>,
     /// Becomes false before this account ends, so detached picture tasks cannot recreate a
     /// signed-out account's cache.
     account_active: Arc<AtomicBool>,
@@ -652,6 +655,9 @@ async fn converse(
         character_room: String::new(),
         room_override: None,
         last_rooms: Vec::new(),
+        roster_rev: None,
+        roster_refresh: None,
+        history_refresh: None,
         account_active: account_active.clone(),
         shown_from_disk: HashSet::new(),
         pictures: PictureFetches::new(account_active),
@@ -678,6 +684,7 @@ async fn converse(
             .chain(cards_deadline)
             .chain(handoff_deadline)
             .min();
+        let reconcile_at = live.reconcile_at();
         tokio::select! {
             command = commands.recv() => match command {
                 None | Some(Command::Quit) => return Ended::Closed,
@@ -863,18 +870,19 @@ async fn converse(
             },
             event = next_event(&mut events), if events.is_some() => match event {
                 Some(Ok(PickleEvent::Retry(delay))) => backoff.server_asks(delay),
-                Some(Ok(event)) => {
-                    if let Err(error) = live.handle(event).await
-                        && session_is_gone(&error)
-                    {
-                        return Ended::SignedOut;
-                    }
-                }
+                Some(Ok(event)) => live.handle(event),
                 // The stream ended or broke: catch up and open it again after a wait.
                 Some(Err(_)) | None => {
                     events = None;
                     backoff.stream_ended(opened_at.elapsed());
                     connect_at = Instant::now() + backoff.next();
+                }
+            },
+            _ = tokio::time::sleep_until(reconcile_at.unwrap_or_else(Instant::now)), if events.is_some() && reconcile_at.is_some() => {
+                if let Err(error) = live.reconcile().await
+                    && session_is_gone(&error)
+                {
+                    return Ended::SignedOut;
                 }
             },
             _ = tokio::time::sleep_until(connect_at), if events.is_none() => match live.connect().await {
@@ -975,6 +983,34 @@ impl Backoff {
     }
 }
 
+/// A coalesced server watermark and the next attempt to reach it. New events raise the
+/// watermark without postponing an already scheduled attempt or bypassing its backoff.
+struct ReconcileWork {
+    through: i64,
+    at: Instant,
+    backoff: Backoff,
+}
+
+impl ReconcileWork {
+    const ROSTER_COALESCE: Duration = Duration::from_millis(100);
+
+    fn queue(pending: &mut Option<Self>, through: i64, delay: Duration) {
+        if let Some(work) = pending {
+            work.through = work.through.max(through);
+        } else {
+            *pending = Some(Self {
+                through,
+                at: Instant::now() + delay,
+                backoff: Backoff::default(),
+            });
+        }
+    }
+
+    fn defer(&mut self) {
+        self.at = Instant::now() + self.backoff.next();
+    }
+}
+
 async fn next_event(
     events: &mut Option<EventStream>,
 ) -> Option<openpickle_api::Result<PickleEvent>> {
@@ -1025,44 +1061,119 @@ impl Live {
         Ok(events)
     }
 
-    /// Refreshes the authoritative room roster without changing or republishing the visible
-    /// conversation. Room-opening uses this while its target is still staged.
-    async fn refresh_rooms(&mut self) -> openpickle_api::Result<Option<String>> {
+    /// Refreshes the authoritative roster and reconciles the visible room. An explicit room
+    /// open still stages its target separately while the current room remains authorized.
+    async fn find_room(&mut self) -> openpickle_api::Result<()> {
         let rooms = self.client.sync().await?;
+        if self.roster_rev.is_some_and(|rev| rooms.rev < rev) {
+            return Ok(());
+        }
+        let first_roster = self.roster_rev.is_none();
+        let before = self.room_metadata(&self.conversation.room_id);
         let character_room = rooms
             .rooms
             .iter()
             .find(|room| room.kind == "character")
             .map(|room| room.room_id.clone());
-        self.show_rooms(&rooms);
-        if let Some(character_room) = &character_room {
-            self.character_room = character_room.clone();
-            // This cache is intentionally always the primary room. A launch must never reopen a
-            // peer room before `sync` can validate that the current account may see it.
-            self.store.cache("room.json", character_room).ok();
+        if first_roster
+            || character_room.as_deref().unwrap_or_default() != self.character_room.as_str()
+        {
+            // Offline startup may only reopen the primary room. `None` clears the pointer when
+            // the authoritative roster no longer names one (existing string caches still work).
+            self.store.cache("room.json", &character_room).ok();
         }
-        Ok(character_room)
+        self.character_room = character_room.unwrap_or_default();
+        self.roster_rev = Some(rooms.rev);
+        if self
+            .roster_refresh
+            .as_ref()
+            .is_some_and(|work| work.through <= rooms.rev)
+        {
+            self.roster_refresh = None;
+        }
+        self.show_rooms(&rooms);
+
+        let wanted = self
+            .room_override
+            .as_ref()
+            .filter(|wanted| self.known_room(wanted).is_some())
+            .cloned()
+            .unwrap_or_else(|| self.character_room.clone());
+        self.room_override = (wanted != self.character_room).then(|| wanted.clone());
+        if wanted != self.conversation.room_id {
+            // Never continue displaying a room absent from the authoritative roster, even if
+            // no primary room is available. Publish the fallback before requesting its history.
+            self.conversation = if wanted.is_empty() {
+                Conversation::default()
+            } else {
+                Conversation::load(&self.store, &wanted)
+            };
+            self.reset_room_state();
+            self.send_update_for(&wanted);
+        } else {
+            let after = self.room_metadata(&wanted);
+            if first_roster || before != after {
+                self.send(Update::RoomMetadata(after));
+            }
+        }
+        if let Some(room) = self.known_room(&wanted) {
+            self.queue_history(room.last_seq);
+        }
+        Ok(())
     }
 
-    /// Asks the server which room is the one with the character. When it is not the open one
-    /// (the first launch, or another account), opens it with what the disk has for it.
-    async fn find_room(&mut self) -> openpickle_api::Result<()> {
-        if let Some(character_room) = self.refresh_rooms().await? {
-            let wanted = self
-                .room_override
-                .as_ref()
-                .filter(|wanted| self.known_room(wanted).is_some())
-                .cloned()
-                .unwrap_or_else(|| character_room.clone());
-            self.room_override = (wanted != character_room).then(|| wanted.clone());
-            if wanted != self.conversation.room_id {
-                self.conversation = Conversation::load(&self.store, &wanted);
-                self.reset_room_state();
+    fn queue_history(&mut self, last_seq: i64) {
+        if last_seq > self.conversation.synced {
+            ReconcileWork::queue(&mut self.history_refresh, last_seq, Duration::ZERO);
+        }
+    }
+
+    fn reconcile_at(&self) -> Option<Instant> {
+        self.roster_refresh
+            .iter()
+            .chain(&self.history_refresh)
+            .map(|work| work.at)
+            .min()
+    }
+
+    async fn reconcile(&mut self) -> openpickle_api::Result<()> {
+        if self
+            .roster_refresh
+            .as_ref()
+            .is_some_and(|work| work.at <= Instant::now())
+        {
+            if let Err(error) = self.find_room().await
+                && session_is_gone(&error)
+            {
+                return Err(error);
             }
-            // `sync` is the authority for membership and permissions. Publish it even when the
-            // cached room was already open, so startup cannot leave the composer disabled or
-            // accidentally preserve stale write access.
-            self.send_update_for(&wanted);
+            if let Some(work) = &mut self.roster_refresh {
+                // This also covers a successful sync response that is behind the SSE revision.
+                work.defer();
+            }
+        }
+        if let Some(work) = &self.history_refresh
+            && work.at <= Instant::now()
+        {
+            let through = work.through;
+            let retry = if self.conversation.synced >= through {
+                false
+            } else {
+                match self.catch_up().await {
+                    Ok(()) => self.conversation.synced < through,
+                    Err(error) if session_is_gone(&error) => return Err(error),
+                    Err(error) => !error.api().is_some_and(|api| {
+                        (400..500).contains(&api.status) && !matches!(api.status, 408 | 429)
+                    }),
+                }
+            };
+            if retry {
+                if let Some(work) = &mut self.history_refresh {
+                    work.defer();
+                }
+            } else {
+                self.history_refresh = None;
+            }
         }
         Ok(())
     }
@@ -1117,7 +1228,7 @@ impl Live {
         }
     }
 
-    async fn handle(&mut self, event: PickleEvent) -> openpickle_api::Result<()> {
+    fn handle(&mut self, event: PickleEvent) {
         match event {
             PickleEvent::Usage(usage) => {
                 if let Some(data) = &mut self.profile {
@@ -1200,13 +1311,21 @@ impl Live {
                 let RoomEvent::Advanced {
                     room_id, last_seq, ..
                 } = *room;
-                if room_id == self.conversation.room_id && last_seq > self.conversation.synced {
-                    self.catch_up().await?;
+                if room_id == self.conversation.room_id && self.known_room(&room_id).is_some() {
+                    self.queue_history(last_seq);
+                }
+            }
+            PickleEvent::Sync(sync) => {
+                if self.roster_rev.is_none_or(|rev| sync.rev > rev) {
+                    ReconcileWork::queue(
+                        &mut self.roster_refresh,
+                        sync.rev,
+                        ReconcileWork::ROSTER_COALESCE,
+                    );
                 }
             }
             _ => {}
         }
-        Ok(())
     }
 
     /// Sends a message the UI already shows. The server's copy, which carries the same id,
@@ -1785,6 +1904,7 @@ impl Live {
 
     fn reset_room_state(&mut self) {
         self.history_complete = false;
+        self.history_refresh = None;
         self.marked_read = 0;
     }
 
@@ -1812,7 +1932,7 @@ impl Live {
     async fn open_room(&mut self, requested: &str) -> Result<(), OpenRoomError> {
         let mut refreshed = false;
         if self.last_rooms.is_empty() || self.character_room.is_empty() {
-            self.refresh_rooms().await.map_err(OpenRoomError::Session)?;
+            self.find_room().await.map_err(OpenRoomError::Session)?;
             refreshed = true;
         }
         let mut wanted = if requested.is_empty() {
@@ -1823,7 +1943,7 @@ impl Live {
         if (wanted.is_empty() || self.known_room(&wanted).is_none()) && !refreshed {
             // A link can name a room created after the last event or reconnect. Refresh the
             // authoritative roster once before deciding that the account cannot open it.
-            self.refresh_rooms().await.map_err(OpenRoomError::Session)?;
+            self.find_room().await.map_err(OpenRoomError::Session)?;
             wanted = if requested.is_empty() {
                 self.character_room.clone()
             } else {
@@ -1855,14 +1975,14 @@ impl Live {
         Ok(())
     }
 
-    /// The conversation update for a validated room: the character room carries the primary
-    /// identity; a peer room carries the title and permissions from `sync`.
-    fn send_update_for(&self, room_id: &str) {
+    fn room_metadata(&self, room_id: &str) -> RoomMetadata {
         let room = self.known_room(room_id);
         let is_character = room.is_some_and(|room| room.kind == "character");
         let can_send = room.is_some_and(|room| !room.observer);
         let (name, avatar) = if is_character {
             (self.display_name(), self.avatar_path())
+        } else if room_id.is_empty() {
+            ("No conversation".to_owned(), None)
         } else {
             (
                 room.map(|room| {
@@ -1880,8 +2000,26 @@ impl Live {
                 None,
             )
         };
-        self.send(Update::Conversation {
+        RoomMetadata {
             room_id: room_id.to_owned(),
+            is_character,
+            can_send,
+            name,
+            avatar,
+        }
+    }
+
+    /// Full snapshot for a room switch or an explicit room-open acknowledgment.
+    fn send_update_for(&self, room_id: &str) {
+        let RoomMetadata {
+            room_id,
+            is_character,
+            can_send,
+            name,
+            avatar,
+        } = self.room_metadata(room_id);
+        self.send(Update::Conversation {
+            room_id,
             is_character,
             can_send,
             name,
@@ -1907,7 +2045,7 @@ impl Live {
         let head = self.conversation.head_seq();
         if self.active
             && head > self.marked_read
-            && !self.conversation.room_id.is_empty()
+            && self.known_room(&self.conversation.room_id).is_some()
             && self
                 .client
                 .mark_read(&self.conversation.room_id, head)
@@ -2168,7 +2306,7 @@ mod tests {
     use std::{
         io::{Read, Write},
         net::{TcpListener, TcpStream},
-        sync::Mutex,
+        sync::{Mutex, atomic::AtomicI64},
         thread,
     };
 
@@ -2177,6 +2315,7 @@ mod tests {
         address: std::net::SocketAddr,
         requests: Arc<Mutex<Vec<String>>>,
         rooms: Arc<Mutex<Vec<openpickle_api::Room>>>,
+        roster_rev: Arc<AtomicI64>,
         fail_sync_once: Arc<AtomicBool>,
         fail_handoffs_once: Arc<AtomicBool>,
         tasks_ended: Arc<AtomicBool>,
@@ -2204,6 +2343,8 @@ mod tests {
             let active = Arc::new(AtomicBool::new(true));
             let server_requests = requests.clone();
             let server_rooms = rooms.clone();
+            let roster_rev = Arc::new(AtomicI64::new(1));
+            let server_roster_rev = roster_rev.clone();
             let server_fail_sync_once = fail_sync_once.clone();
             let server_fail_handoffs_once = fail_handoffs_once.clone();
             let server_tasks_ended = tasks_ended.clone();
@@ -2233,7 +2374,7 @@ mod tests {
                                 "200 OK",
                                 serde_json::json!({
                                     "rooms": server_rooms.lock().unwrap().clone(),
-                                    "rev": 1,
+                                    "rev": server_roster_rev.load(Ordering::Acquire),
                                 })
                                 .to_string(),
                             )
@@ -2360,6 +2501,7 @@ mod tests {
                 address,
                 requests,
                 rooms,
+                roster_rev,
                 fail_sync_once,
                 fail_handoffs_once,
                 tasks_ended,
@@ -2469,6 +2611,9 @@ mod tests {
                 fixture_room("peer", "character_pair", false),
                 fixture_room("observer", "character_pair", true),
             ],
+            roster_rev: None,
+            roster_refresh: None,
+            history_refresh: None,
             account_active: account_active.clone(),
             shown_from_disk: HashSet::new(),
             pictures: PictureFetches::new(account_active),
@@ -2510,6 +2655,163 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn room_advance_retries_from_the_applied_cursor_without_another_event() {
+        let server = HistoryServer::start();
+        server.fail_second_history_page_once();
+        let (mut live, mut received) = fixture_live("quiet-retry", &server);
+        live.handle(PickleEvent::Room(Box::new(RoomEvent::Advanced {
+            room_id: "primary".into(),
+            last_seq: 2,
+            room: fixture_room("primary", "character", false),
+        })));
+        live.reconcile().await.unwrap();
+        assert_eq!(live.conversation.synced, 1);
+        assert!(live.reconcile_at().is_some_and(|at| at > Instant::now()));
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Update::Upsert { room_id, messages })
+                if room_id == "primary" && messages[0].seq == 1
+        ));
+
+        // Make the retry deadline due without introducing another SSE event or a real delay.
+        live.history_refresh.as_mut().unwrap().at = Instant::now();
+        live.reconcile().await.unwrap();
+        assert_eq!(live.conversation.synced, 2);
+        assert!(live.reconcile_at().is_none());
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Update::Upsert { room_id, messages })
+                if room_id == "primary" && messages[0].seq == 2
+        ));
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|target| target.contains("after_seq=1"))
+                .count(),
+            2
+        );
+    }
+
+    fn sync_event(rev: i64) -> PickleEvent {
+        PickleEvent::Sync(openpickle_api::events::SyncEvent { rev })
+    }
+
+    #[tokio::test]
+    async fn newer_roster_updates_permissions_after_coalescing_and_sync_lag() {
+        let server = HistoryServer::start();
+        let (mut live, mut received) = fixture_live("roster-permissions", &server);
+        live.find_room().await.unwrap();
+        live.open_room("peer").await.unwrap();
+        live.history_complete = true;
+        live.marked_read = 1;
+        let cursor_before = live.conversation.synced;
+        drain(&mut received);
+
+        live.handle(sync_event(1));
+        assert!(live.reconcile_at().is_none());
+        live.handle(sync_event(2));
+        let first_deadline = live.reconcile_at().unwrap();
+        live.handle(sync_event(4));
+        live.handle(sync_event(3));
+        assert_eq!(live.reconcile_at(), Some(first_deadline));
+        assert_eq!(live.roster_refresh.as_ref().unwrap().through, 4);
+
+        // An old snapshot and then a request failure must leave the newest revision pending.
+        live.roster_refresh.as_mut().unwrap().at = Instant::now();
+        live.reconcile().await.unwrap();
+        assert_eq!(live.roster_refresh.as_ref().unwrap().through, 4);
+        server.fail_next_sync();
+        live.roster_refresh.as_mut().unwrap().at = Instant::now();
+        live.reconcile().await.unwrap();
+        assert_eq!(live.roster_rev, Some(1));
+        assert_eq!(live.roster_refresh.as_ref().unwrap().through, 4);
+
+        let mut peer = fixture_room("peer", "character_pair", true);
+        peer.title = "Renamed peer".into();
+        server.set_rooms(vec![fixture_room("primary", "character", false), peer]);
+        server.roster_rev.store(4, Ordering::Release);
+        live.roster_refresh.as_mut().unwrap().at = Instant::now();
+        live.reconcile().await.unwrap();
+        assert_eq!(live.roster_rev, Some(4));
+        assert!(live.reconcile_at().is_none());
+        assert_eq!(live.conversation.room_id, "peer");
+        assert_eq!(live.conversation.synced, cursor_before);
+        assert_eq!(live.marked_read, 1);
+        assert!(live.history_complete);
+        assert_eq!(
+            live.send_block_reason("peer"),
+            Some("Not sent. This room is read-only.")
+        );
+        let updates: Vec<_> = std::iter::from_fn(|| received.try_recv().ok()).collect();
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            Update::RoomMetadata(RoomMetadata { room_id, name, can_send: false, .. })
+                if room_id == "peer" && name == "Renamed peer"
+        )));
+        assert!(
+            !updates
+                .iter()
+                .any(|update| matches!(update, Update::Conversation { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn revoked_room_falls_back_and_drops_its_scheduled_history() {
+        let server = HistoryServer::start();
+        let (mut live, mut received) = fixture_live("roster-revocation", &server);
+        live.find_room().await.unwrap();
+        live.open_room("peer").await.unwrap();
+        drain(&mut received);
+        server.requests.lock().unwrap().clear();
+
+        live.handle(PickleEvent::Room(Box::new(RoomEvent::Advanced {
+            room_id: "peer".into(),
+            last_seq: 10,
+            room: fixture_room("peer", "character_pair", false),
+        })));
+        server.set_rooms(vec![fixture_room("primary", "character", false)]);
+        server.roster_rev.store(2, Ordering::Release);
+        live.handle(sync_event(2));
+        live.roster_refresh.as_mut().unwrap().at = Instant::now();
+        live.reconcile().await.unwrap();
+        assert_eq!(live.conversation.room_id, "primary");
+        assert!(live.room_override.is_none());
+        assert!(live.history_refresh.is_none());
+        assert!(live.send_block_reason("peer").is_some());
+        assert!(matches!(received.try_recv(), Ok(Update::Rooms(_))));
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Update::Conversation { room_id, can_send: true, .. }) if room_id == "primary"
+        ));
+        assert!(
+            !server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|req| req.contains("/rooms/peer/"))
+        );
+
+        // If the primary is removed too, there is no authorized fallback to load from disk.
+        live.catch_up().await.unwrap();
+        drain(&mut received);
+        server.set_rooms(Vec::new());
+        server.roster_rev.store(3, Ordering::Release);
+        live.handle(sync_event(3));
+        live.roster_refresh.as_mut().unwrap().at = Instant::now();
+        live.reconcile().await.unwrap();
+        assert!(live.conversation.room_id.is_empty());
+        assert!(live.store.cached::<String>("room.json").is_none());
+        assert!(matches!(received.try_recv(), Ok(Update::Rooms(_))));
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Update::Conversation { room_id, messages, can_send: false, .. })
+                if room_id.is_empty() && messages.is_empty()
+        ));
     }
 
     #[tokio::test]
@@ -2578,7 +2880,8 @@ mod tests {
         ));
         assert!(matches!(
             cached_updates.next().await,
-            Some(Update::Conversation { room_id, can_send: true, .. }) if room_id == "primary"
+            Some(Update::RoomMetadata(RoomMetadata { room_id, can_send: true, .. }))
+                if room_id == "primary"
         ));
     }
 
@@ -2684,12 +2987,8 @@ mod tests {
             seq: 99,
             channel: "fixture".to_owned(),
             prev_seq: None,
-        }))
-        .await
-        .unwrap();
-        live.handle(PickleEvent::Chat(ChatEvent::Pending { on: true }))
-            .await
-            .unwrap();
+        }));
+        live.handle(PickleEvent::Chat(ChatEvent::Pending { on: true }));
         assert!(!live.conversation.items.contains_key("unscoped"));
         assert!(received.try_recv().is_err());
 
@@ -2700,9 +2999,8 @@ mod tests {
             room_id: "peer".to_owned(),
             last_seq: 2,
             room: peer,
-        })))
-        .await
-        .unwrap();
+        })));
+        live.reconcile().await.unwrap();
         assert_eq!(live.conversation.synced, 2);
         assert!(matches!(
             received.next().await,

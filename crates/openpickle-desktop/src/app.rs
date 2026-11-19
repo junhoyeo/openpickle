@@ -16,7 +16,7 @@ use crate::{
     convert,
     model::{Message, Part, RoomInfo, Social, UNCONFIRMED_SEQ, build_rows},
     phone::CallSummary,
-    protocol::{Command, HandoffCard, Update},
+    protocol::{Command, HandoffCard, RoomMetadata, Update},
     theme,
     ui::{
         Identity, OpenArchive, OpenChat, OpenExplore, OpenFriends, OpenPhoneCalls, OpenProfile,
@@ -283,6 +283,38 @@ impl Shell {
                     }
                 }
             }
+            Update::RoomMetadata(RoomMetadata {
+                room_id,
+                is_character,
+                can_send,
+                name,
+                avatar,
+            }) => {
+                if room_id == self.room_id {
+                    self.is_character = is_character;
+                    self.can_send = can_send;
+                    let avatar = avatar.map(ImageSource::from);
+                    self.room_header = Identity {
+                        name: name.clone().into(),
+                        avatar: avatar.clone(),
+                    };
+                    if is_character {
+                        self.set_identity(name, avatar, cx);
+                    }
+                    if let Screen::Chat(chat) = &self.screen {
+                        chat.update(cx, |chat, cx| {
+                            chat.set_can_send(can_send && self.opening_room.is_none(), cx);
+                            chat.set_identity(
+                                self.room_header.name.clone(),
+                                self.room_header.avatar.clone(),
+                                cx,
+                            );
+                        });
+                    }
+                    self.show_active_task(cx);
+                    self.refresh_room_avatar(cx);
+                }
+            }
             Update::Identity { name, avatar } => {
                 self.set_identity(name, avatar.map(ImageSource::from), cx);
             }
@@ -516,15 +548,16 @@ impl Shell {
         if self.is_character {
             return;
         }
-        if let Some(room) = self.rooms.iter().find(|room| room.room_id == self.room_id)
-            && let Some(avatar) = self.pictures.read(cx).get(&room.picture)
-        {
-            self.room_header.avatar = Some(avatar.clone());
-            if let Screen::Chat(chat) = &self.screen {
-                chat.update(cx, |chat, cx| {
-                    chat.set_identity(self.room_header.name.clone(), Some(avatar), cx)
-                });
-            }
+        let avatar = self
+            .rooms
+            .iter()
+            .find(|room| room.room_id == self.room_id)
+            .and_then(|room| self.pictures.read(cx).get(&room.picture));
+        self.room_header.avatar = avatar.clone();
+        if let Screen::Chat(chat) = &self.screen {
+            chat.update(cx, |chat, cx| {
+                chat.set_identity(self.room_header.name.clone(), avatar, cx)
+            });
         }
     }
 
@@ -1691,6 +1724,61 @@ mod tests {
             _ => None,
         });
         assert_eq!(send, Some(("primary".into(), "unsent draft".into())));
+    }
+
+    #[gpui::test]
+    fn room_metadata_preserves_chat_state_and_pending_room_open(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::ui::bind_keys);
+        let (commands, _sent) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, received) = futures::channel::mpsc::unbounded();
+        updates
+            .unbounded_send(Update::Conversation {
+                room_id: "peer".into(),
+                is_character: false,
+                can_send: true,
+                name: "Peer".into(),
+                avatar: None,
+                messages: vec![message("existing", 1)],
+            })
+            .unwrap();
+        let (shell, cx) =
+            cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
+        cx.simulate_input("unfinished draft");
+        shell.update_in(cx, |shell, window, cx| {
+            shell.apply(
+                Update::Activity {
+                    room_id: "peer".into(),
+                    activity: Some(None),
+                },
+                window,
+                cx,
+            );
+            shell.open_room("other", window, cx);
+        });
+        let metadata = |room_id: &str, can_send| {
+            Update::RoomMetadata(RoomMetadata {
+                room_id: room_id.into(),
+                is_character: false,
+                can_send,
+                name: "Renamed".into(),
+                avatar: None,
+            })
+        };
+        updates.unbounded_send(metadata("peer", false)).unwrap();
+        updates.unbounded_send(metadata("other", true)).unwrap();
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(&*shell.room_header.name, "Renamed");
+            assert_eq!(shell.opening_room.as_deref(), Some("other"));
+            assert!(!shell.can_send);
+            assert_eq!(shell.activity, Some(None));
+            assert_eq!(shell.messages.len(), 1);
+            assert_eq!(shell.messages[0].id, "existing");
+            let Screen::Chat(chat) = &shell.screen else {
+                panic!("chat should remain open");
+            };
+            assert_eq!(chat.read(cx).draft(cx), "unfinished draft");
+        });
     }
 
     #[gpui::test]

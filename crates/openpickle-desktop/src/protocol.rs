@@ -71,6 +71,15 @@ pub enum Command {
     Quit,
 }
 
+#[derive(PartialEq, Eq)]
+pub struct RoomMetadata {
+    pub room_id: String,
+    pub is_character: bool,
+    pub can_send: bool,
+    pub name: String,
+    pub avatar: Option<PathBuf>,
+}
+
 /// Backend to UI.
 pub enum Update {
     /// There is no login session; show the sign-in screen.
@@ -89,6 +98,8 @@ pub enum Update {
         avatar: Option<PathBuf>,
         messages: Vec<Message>,
     },
+    /// The open room's roster metadata changed without replacing its conversation.
+    RoomMetadata(RoomMetadata),
     /// The character's name or picture changed (or was just downloaded).
     Identity {
         name: String,
