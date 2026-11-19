@@ -264,25 +264,38 @@ impl Row {
         }
     }
 
-    /// Whether two rows draw the same thing. Parts are compared by identity, which is enough
-    /// because a message's parts are parsed once and shared from then on.
+    /// Whether a row can keep its measured height.
     pub fn same_as(&self, other: &Row) -> bool {
-        let same_kind = match (&self.kind, &other.kind) {
+        self.same_content_as(other)
+            && self.side == other.side
+            && self.joined_above == other.joined_above
+            && self.joined_below == other.joined_below
+    }
+
+    /// Layout changes alone do not invalidate a text selection.
+    pub(crate) fn same_content_as(&self, other: &Row) -> bool {
+        match (&self.kind, &other.kind) {
             (RowKind::Part(a), RowKind::Part(b)) => match (a, b) {
                 (Part::Bubble(a), Part::Bubble(b)) => Arc::ptr_eq(a, b),
                 (Part::Card(a), Part::Card(b)) => Arc::ptr_eq(a, b),
                 (Part::Request(a), Part::Request(b)) => Arc::ptr_eq(a, b),
                 (Part::Task(a), Part::Task(b)) => Arc::ptr_eq(a, b),
                 (Part::Files(a), Part::Files(b)) => Arc::ptr_eq(a, b),
-                (Part::RoomLink { .. }, Part::RoomLink { .. }) => a == b,
+                (Part::RoomLink { .. }, Part::RoomLink { .. })
+                | (Part::PhoneTask { .. }, Part::PhoneTask { .. }) => a == b,
                 _ => false,
             },
             (a, b) => a == b,
-        };
-        same_kind
-            && self.side == other.side
-            && self.joined_above == other.joined_above
-            && self.joined_below == other.joined_below
+        }
+    }
+
+    pub(crate) fn activity(label: Option<String>) -> Self {
+        Self {
+            kind: RowKind::Activity(label),
+            side: Side::Theirs,
+            joined_above: false,
+            joined_below: false,
+        }
     }
 }
 
@@ -306,9 +319,24 @@ pub fn build_rows(
     activity: Option<Option<&str>>,
     now: DateTime<Local>,
 ) -> (Vec<Row>, Vec<usize>) {
-    let mut rows: Vec<Row> = Vec::with_capacity(messages.len() * 2);
-    let mut starts: Vec<usize> = Vec::with_capacity(messages.len());
-    let mut previous: Option<&Message> = None;
+    let mut rows = Vec::with_capacity(messages.len() * 2);
+    let mut starts = Vec::with_capacity(messages.len());
+    append_message_rows(&mut rows, &mut starts, 0, None, messages, now);
+    rows.extend(activity.map(|label| Row::activity(label.map(str::to_owned))));
+    (rows, starts)
+}
+
+/// Lays out a message suffix, keeping its row starts absolute. Returns whether its first
+/// row joins the last retained row, whose bottom corners can change without remeasuring it.
+pub(crate) fn append_message_rows(
+    rows: &mut Vec<Row>,
+    starts: &mut Vec<usize>,
+    row_offset: usize,
+    mut previous: Option<&Message>,
+    messages: &[Message],
+    now: DateTime<Local>,
+) -> bool {
+    let mut joins_retained_row = false;
     for message in messages {
         let gap = previous.map_or(f64::INFINITY, |previous| message.at - previous.at);
         let stamped = gap >= TIMESTAMP_GAP_S;
@@ -320,7 +348,7 @@ pub fn build_rows(
                 joined_below: false,
             });
         }
-        starts.push(rows.len());
+        starts.push(row_offset + rows.len());
         // A call's card stands apart: it joins neither the message before it nor the next.
         let is_call = |message: &Message| {
             message
@@ -334,8 +362,12 @@ pub fn build_rows(
             && previous.is_some_and(|previous| previous.side == message.side && !is_call(previous));
         for (index, part) in message.parts.iter().enumerate() {
             let joined_above = index > 0 || continues;
-            if joined_above && let Some(above) = rows.last_mut() {
-                above.joined_below = true;
+            if joined_above {
+                if let Some(above) = rows.last_mut() {
+                    above.joined_below = true;
+                } else {
+                    joins_retained_row = true;
+                }
             }
             rows.push(Row {
                 kind: RowKind::Part(part.clone()),
@@ -346,15 +378,7 @@ pub fn build_rows(
         }
         previous = Some(message);
     }
-    if let Some(label) = activity {
-        rows.push(Row {
-            kind: RowKind::Activity(label.map(str::to_owned)),
-            side: Side::Theirs,
-            joined_above: false,
-            joined_below: false,
-        });
-    }
-    (rows, starts)
+    joins_retained_row
 }
 
 /// `Today 10:08 PM`, `Yesterday 9:12 AM`, `Nov 12, 9:12 AM`.

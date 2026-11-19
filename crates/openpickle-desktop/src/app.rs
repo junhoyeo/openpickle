@@ -1,9 +1,12 @@
 //! The root view: shows sign-in or the signed-in sections, and applies what the backend
 //! reports.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use chrono::Local;
+use chrono::{Local, NaiveDate};
 use futures::{StreamExt, channel::mpsc::UnboundedReceiver};
 use gpui::{
     AnyView, Context, Entity, Focusable, FontWeight, ImageSource, SharedString, Subscription, Task,
@@ -14,7 +17,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::{
     content::LinkTarget,
     convert,
-    model::{Message, Part, RoomInfo, Social, UNCONFIRMED_SEQ, build_rows},
+    model::{Message, Part, RoomInfo, Social, UNCONFIRMED_SEQ},
     phone::CallSummary,
     protocol::{Command, HandoffCard, Update},
     theme,
@@ -92,6 +95,8 @@ pub struct Shell {
     pending_phone_task: Option<String>,
     /// The open conversation, oldest first.
     messages: Vec<Message>,
+    /// Lookup by message ID without scanning history. Vec indexes would shift on insertion.
+    message_seqs: HashMap<String, u64>,
     room_id: String,
     is_character: bool,
     can_send: bool,
@@ -105,9 +110,9 @@ pub struct Shell {
     sent: u64,
     /// The offers that messages on their way ask for, by the message's id.
     offers_asked: std::collections::HashMap<String, String>,
-    activity: Option<Option<String>>,
     /// For each message, the index of its first row in the chat's list.
     row_starts: Vec<usize>,
+    row_date: Option<NaiveDate>,
     _screen_events: Option<Subscription>,
     _section_events: Vec<Subscription>,
     _over_events: Option<Subscription>,
@@ -149,6 +154,7 @@ impl Shell {
             active_task: None,
             pending_phone_task: None,
             messages: Vec::new(),
+            message_seqs: HashMap::new(),
             room_id: String::new(),
             is_character: true,
             can_send: false,
@@ -160,8 +166,8 @@ impl Shell {
             notice: None,
             sent: 0,
             offers_asked: std::collections::HashMap::new(),
-            activity: None,
             row_starts: Vec::new(),
+            row_date: None,
             _screen_events: None,
             _section_events: Vec::new(),
             _over_events: None,
@@ -171,11 +177,21 @@ impl Shell {
         };
         // The backend started before the window did, so the cached conversation is usually
         // waiting already. Applying it here puts it in the very first frame.
-        while let Ok(update) = updates.try_recv() {
+        let mut next = updates.try_recv().ok();
+        while let Some(mut update) = next {
+            next = coalesce_upserts(&mut update, &mut updates);
             shell.apply(update, window, cx);
+            next = next.or_else(|| updates.try_recv().ok());
         }
         shell._updates = cx.spawn_in(window, async move |this, cx| {
-            while let Some(update) = updates.next().await {
+            let mut next = None;
+            loop {
+                let first = match next.take() {
+                    Some(update) => Some(update),
+                    None => updates.next().await,
+                };
+                let Some(mut update) = first else { break };
+                next = coalesce_upserts(&mut update, &mut updates);
                 let applied = this.update_in(cx, |this, window, cx| this.apply(update, window, cx));
                 if applied.is_err() {
                     break;
@@ -189,6 +205,7 @@ impl Shell {
         match update {
             Update::SignedOut => {
                 self.messages.clear();
+                self.message_seqs.clear();
                 self.forget_account();
                 self.pictures.update(cx, |pictures, cx| {
                     *pictures = Pictures::default();
@@ -242,8 +259,7 @@ impl Shell {
                 self.can_send = can_send;
                 self.opening_room = None;
                 self.notice = None;
-                open_conversation(&mut self.messages, messages);
-                self.activity = None;
+                self.message_seqs = open_conversation(&mut self.messages, messages);
                 self.show_chat(window, cx);
                 self.room_header = Identity {
                     name: name.clone().into(),
@@ -259,6 +275,7 @@ impl Shell {
                             chat.switch_room(can_send, &draft, cx);
                         }
                         chat.set_can_send(can_send, cx);
+                        chat.set_activity(None, cx);
                         chat.set_identity(
                             self.room_header.name.clone(),
                             self.room_header.avatar.clone(),
@@ -271,7 +288,7 @@ impl Shell {
                 }
                 self.show_active_task(cx);
                 self.refresh_room_avatar(cx);
-                self.refresh_rows(cx);
+                self.refresh_rows(0, cx);
                 if self.tab == Tab::Archive {
                     self.commands.send(Command::LoadArchive).ok();
                 }
@@ -288,10 +305,15 @@ impl Shell {
             }
             Update::Upsert { room_id, messages } => {
                 if room_id == self.room_id {
-                    for message in messages {
-                        upsert(&mut self.messages, message);
+                    let first_changed = messages
+                        .into_iter()
+                        .filter_map(|message| {
+                            upsert(&mut self.messages, &mut self.message_seqs, message)
+                        })
+                        .min();
+                    if let Some(first_changed) = first_changed {
+                        self.refresh_rows(first_changed, cx);
                     }
-                    self.refresh_rows(cx);
                 }
             }
             Update::SendFailed {
@@ -300,10 +322,11 @@ impl Shell {
                 reason,
             } => {
                 if room_id == self.room_id {
-                    mark_not_sent(&mut self.messages, &id, &reason);
-                    self.refresh_rows(cx);
+                    if let Some(index) = mark_not_sent(&mut self.messages, &id, &reason) {
+                        self.refresh_rows(index, cx);
+                    }
                 } else if let Some(pending) = self.pending.get_mut(&room_id) {
-                    mark_not_sent(pending, &id, &reason);
+                    let _ = mark_not_sent(pending, &id, &reason);
                 }
                 if let (Some(offer), Some(explore)) = (self.offers_asked.remove(&id), &self.explore)
                 {
@@ -311,9 +334,10 @@ impl Shell {
                 }
             }
             Update::Activity { room_id, activity } => {
-                if room_id == self.room_id {
-                    self.activity = activity;
-                    self.refresh_rows(cx);
+                if room_id == self.room_id
+                    && let Screen::Chat(chat) = &self.screen
+                {
+                    chat.update(cx, |chat, cx| chat.set_activity(activity, cx));
                 }
             }
             Update::RoomOpenFailed { room_id, reason } => {
@@ -1141,7 +1165,7 @@ impl Shell {
             .duration_since(UNIX_EPOCH)
             .map_or(0., |elapsed| elapsed.as_secs_f64());
         let message = convert::outgoing(id.clone(), text, UNCONFIRMED_SEQ + self.sent, now);
-        upsert(&mut self.messages, message);
+        let first_changed = upsert(&mut self.messages, &mut self.message_seqs, message);
         if let Some(offer) = &offer {
             self.offers_asked.insert(id.clone(), offer.clone());
         }
@@ -1152,62 +1176,134 @@ impl Shell {
             offer,
         };
         if self.commands.send(command).is_err() {
-            mark_not_sent(&mut self.messages, &id, "Not sent. OpenPickle has stopped.");
+            let _ = mark_not_sent(&mut self.messages, &id, "Not sent. OpenPickle has stopped.");
         }
-        self.refresh_rows(cx);
+        if let Some(first_changed) = first_changed {
+            self.refresh_rows(first_changed, cx);
+        }
     }
 
-    fn refresh_rows(&mut self, cx: &mut Context<Self>) {
+    fn refresh_rows(&mut self, first_changed: usize, cx: &mut Context<Self>) {
         if let Screen::Chat(chat) = &self.screen {
-            let (rows, starts) = build_rows(
-                &self.messages,
-                self.activity.as_ref().map(|label| label.as_deref()),
-                Local::now(),
-            );
-            self.row_starts = starts;
-            chat.update(cx, |chat, cx| chat.set_rows(rows, cx));
+            let now = Local::now();
+            let date = now.date_naive();
+            // A change of date can affect older timestamp labels too.
+            let first_changed = if self.row_date == Some(date) {
+                first_changed
+            } else {
+                0
+            };
+            self.row_date = Some(date);
+            let previous = first_changed
+                .checked_sub(1)
+                .map(|index| &self.messages[index]);
+            let start = previous.map_or(0, |message| {
+                self.row_starts[first_changed - 1] + message.parts.len()
+            });
+            self.row_starts.truncate(first_changed);
+            chat.update(cx, |chat, cx| {
+                chat.project_rows(
+                    start,
+                    &mut self.row_starts,
+                    previous,
+                    &self.messages[first_changed..],
+                    now,
+                    cx,
+                );
+            });
         }
     }
 }
 
+/// Combines adjacent upserts that are already queued. Returns the first different update
+/// without applying it out of order (e.g. a room switch, send failure, or search completion).
+fn coalesce_upserts(update: &mut Update, queue: &mut UnboundedReceiver<Update>) -> Option<Update> {
+    let Update::Upsert { room_id, messages } = update else {
+        return None;
+    };
+    while let Ok(next) = queue.try_recv() {
+        match next {
+            Update::Upsert {
+                room_id: next_room,
+                messages: more,
+            } if *room_id == next_room => {
+                messages.extend(more);
+            }
+            other => return Some(other),
+        }
+    }
+    None
+}
+
 /// Shows another conversation, or the same one read again. Messages that are still on their
 /// way to the server belong to neither yet, so they stay.
-fn open_conversation(messages: &mut Vec<Message>, conversation: Vec<Message>) {
+fn open_conversation(
+    messages: &mut Vec<Message>,
+    conversation: Vec<Message>,
+) -> HashMap<String, u64> {
     let unconfirmed: Vec<Message> = messages
         .drain(..)
         .filter(|message| message.seq > UNCONFIRMED_SEQ)
         .collect();
     *messages = conversation;
+    let mut seqs: HashMap<_, _> = messages
+        .iter()
+        .map(|message| (message.id.clone(), message.seq))
+        .collect();
     for message in unconfirmed {
-        if !messages.iter().any(|known| known.id == message.id) {
-            upsert(messages, message);
+        if !seqs.contains_key(&message.id) {
+            let _ = upsert(messages, &mut seqs, message);
         }
     }
+    seqs
 }
 
 /// Says under a message that it did not reach the server. A message the server has confirmed
 /// in the meantime did reach it, and stays as it is.
-fn mark_not_sent(messages: &mut [Message], id: &str, reason: &str) {
-    if let Some(message) = messages
+fn mark_not_sent(messages: &mut [Message], id: &str, reason: &str) -> Option<usize> {
+    let (index, message) = messages
         .iter_mut()
-        .rfind(|message| message.id == id && message.seq > UNCONFIRMED_SEQ)
-    {
-        message.parts.push(Part::Task(reason.into()));
-    }
+        .enumerate()
+        .rev()
+        .take_while(|(_, message)| message.seq > UNCONFIRMED_SEQ)
+        .find(|(_, message)| message.id == id)?;
+    message.parts.push(Part::Task(reason.into()));
+    Some(index)
 }
 
 /// Replaces the message with the same id, or inserts a new one, keeping the list ordered by
-/// sequence number. Messages still being sent carry the highest numbers, so they stay last.
-fn upsert(messages: &mut Vec<Message>, message: Message) {
-    if let Some(index) = messages.iter().rposition(|known| known.id == message.id) {
+/// sequence number and returning the first affected index. Pending messages sort last.
+fn upsert(
+    messages: &mut Vec<Message>,
+    seqs: &mut HashMap<String, u64>,
+    message: Message,
+) -> Option<usize> {
+    let old = seqs.get(&message.id).and_then(|&seq| {
+        let start = messages.partition_point(|known| known.seq < seq);
+        messages[start..]
+            .iter()
+            .take_while(|known| known.seq == seq)
+            .position(|known| known.id == message.id)
+            .map(|index| start + index)
+    });
+    if let Some(index) = old {
+        if messages[index] == message {
+            return None;
+        }
         if messages[index].seq == message.seq {
             messages[index] = message;
-            return;
+            return Some(index);
         }
         messages.remove(index);
     }
-    let index = messages.partition_point(|known| known.seq <= message.seq);
+    let index = if messages.last().is_none_or(|known| known.seq <= message.seq) {
+        messages.len()
+    } else {
+        messages.partition_point(|known| known.seq <= message.seq)
+    };
+    seqs.insert(message.id.clone(), message.seq);
     messages.insert(index, message);
+    Some(old.map_or(index, |old| old.min(index)))
 }
 
 impl Render for Shell {
@@ -1591,27 +1687,34 @@ mod tests {
     fn a_message_on_its_way_survives_the_conversation_arriving_and_is_then_confirmed() {
         // Typed while the backend was still connecting.
         let mut messages = vec![message("typed", UNCONFIRMED_SEQ + 1)];
-        open_conversation(&mut messages, vec![message("a", 1), message("b", 2)]);
+        let mut seqs = open_conversation(&mut messages, vec![message("a", 1), message("b", 2)]);
         assert_eq!(
             messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
             ["a", "b", "typed"]
         );
 
         // The server's copy takes its place. A failure reported after that is stale.
-        upsert(&mut messages, message("typed", 3));
-        mark_not_sent(&mut messages, "typed", "Not sent.");
+        assert_eq!(
+            upsert(&mut messages, &mut seqs, message("typed", 3)),
+            Some(2)
+        );
+        assert_eq!(mark_not_sent(&mut messages, "typed", "Not sent."), None);
         assert_eq!(messages.last(), Some(&message("typed", 3)));
 
         // Reading the conversation again does not bring a confirmed message back as pending.
         let mut messages = vec![message("typed", UNCONFIRMED_SEQ + 1)];
-        open_conversation(&mut messages, vec![message("a", 1), message("typed", 2)]);
+        let seqs = open_conversation(&mut messages, vec![message("a", 1), message("typed", 2)]);
+        assert_eq!(seqs["typed"], 2);
         assert_eq!(messages, [message("a", 1), message("typed", 2)]);
     }
 
     #[test]
     fn a_message_that_was_not_sent_says_so() {
         let mut messages = vec![message("a", 1), message("typed", UNCONFIRMED_SEQ + 1)];
-        mark_not_sent(&mut messages, "typed", "Not sent. Check your connection.");
+        assert_eq!(
+            mark_not_sent(&mut messages, "typed", "Not sent. Check your connection."),
+            Some(1),
+        );
         assert_eq!(
             messages[1].parts,
             [Part::Task("Not sent. Check your connection.".into())]
@@ -1621,16 +1724,25 @@ mod tests {
 
     #[test]
     fn upsert_orders_by_seq_and_confirms_pending_messages() {
-        let mut messages = vec![message("a", 1), message("c", 5)];
-        upsert(&mut messages, message("b", 3));
-        upsert(&mut messages, message("sent", u64::MAX));
-        upsert(&mut messages, message("d", 7));
+        let mut messages = Vec::new();
+        let mut seqs = open_conversation(&mut messages, vec![message("a", 1), message("c", 5)]);
+        assert_eq!(upsert(&mut messages, &mut seqs, message("b", 3)), Some(1));
+        assert_eq!(
+            upsert(&mut messages, &mut seqs, message("sent", u64::MAX)),
+            Some(3)
+        );
+        assert_eq!(upsert(&mut messages, &mut seqs, message("d", 7)), Some(3));
+        assert_eq!(upsert(&mut messages, &mut seqs, message("d", 7)), None);
         assert_eq!(
             messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
             ["a", "b", "c", "d", "sent"]
         );
         // The server confirms the pending message with its real sequence number.
-        upsert(&mut messages, message("sent", 6));
+        assert_eq!(
+            upsert(&mut messages, &mut seqs, message("sent", 6)),
+            Some(3)
+        );
+        assert_eq!(seqs["sent"], 6);
         assert_eq!(
             messages
                 .iter()
@@ -1638,6 +1750,56 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("a", 1), ("b", 3), ("c", 5), ("sent", 6), ("d", 7)]
         );
+    }
+
+    #[gpui::test]
+    fn an_upsert_batch_keeps_search_row_starts_when_confirming_a_pending_message(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, received) = futures::channel::mpsc::unbounded();
+        let shown = |id: &str, seq| convert::outgoing(id.into(), id, seq, seq as f64);
+        updates
+            .unbounded_send(Update::Conversation {
+                room_id: "primary".into(),
+                is_character: true,
+                can_send: true,
+                name: "Pickle".into(),
+                avatar: None,
+                messages: vec![shown("first", 1), shown("third", 7200)],
+            })
+            .unwrap();
+        let (shell, cx) =
+            cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
+        shell.update(cx, |shell, cx| shell.send("pending", None, cx));
+        let id = std::iter::from_fn(|| sent.try_recv().ok())
+            .find_map(|command| match command {
+                Command::Send { id, .. } => Some(id),
+                _ => None,
+            })
+            .unwrap();
+        updates
+            .unbounded_send(Update::Upsert {
+                room_id: "primary".into(),
+                messages: vec![
+                    shown("latest", 7202),
+                    convert::outgoing(id.clone(), "pending", 7201, 7201.),
+                ],
+            })
+            .unwrap();
+        updates
+            .unbounded_send(Update::Upsert {
+                room_id: "primary".into(),
+                messages: vec![shown("second", 2)],
+            })
+            .unwrap();
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            let seqs: Vec<_> = shell.messages.iter().map(|message| message.seq).collect();
+            assert_eq!(seqs, [1, 2, 7200, 7201, 7202]);
+            assert_eq!(shell.messages[3].id, id);
+            assert_eq!(shell.row_starts, [1, 2, 4, 5, 6]);
+        });
     }
 
     #[gpui::test]
