@@ -23,6 +23,7 @@ pub enum ProfileEvent {
     Open(Tab),
     Invite,
     Reload,
+    SignOut,
     Link(String),
 }
 
@@ -148,7 +149,15 @@ impl ProfileView {
                     );
             }
         }
-        content
+        content.child(
+            card()
+                .id("sign-out")
+                .cursor_pointer()
+                .hover(|card| card.bg(theme::alpha(0xffffff, 0.065)))
+                .text_color(theme::color(theme::DANGER))
+                .child("Sign out on this computer")
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(ProfileEvent::SignOut))),
+        )
     }
 
     fn usage_summary(
