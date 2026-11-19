@@ -94,7 +94,6 @@ impl SearchReads {
         self.started = false;
         (request, reply, std::mem::take(&mut self.wanted))
     }
-
 }
 
 const CONTEXT_LIMIT: u32 = 32;
