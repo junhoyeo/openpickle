@@ -7,7 +7,7 @@
 use std::{
     fmt,
     fs::{self, File, OpenOptions, TryLockError},
-    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -33,6 +33,13 @@ impl fmt::Debug for Session {
 #[derive(Clone, Debug)]
 pub struct Store {
     root: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LogStatus {
+    Clean,
+    TornTail,
+    Corrupt,
 }
 
 impl Store {
@@ -103,19 +110,62 @@ impl Store {
         write_atomically(&self.cache_path(name), &serde_json::to_vec(value)?)
     }
 
-    /// Every record of an append-only log, oldest first. A line that is not a record is
-    /// skipped: one cut short by a crash, or one whose bytes are not text.
-    pub fn log<T: DeserializeOwned>(&self, name: &str) -> Vec<T> {
-        let Ok(file) = File::open(self.cache_path(name)) else {
-            return Vec::new();
+    /// Visits valid records in order. The visitor's second argument is true after a
+    /// malformed, newline-terminated record. A malformed unterminated tail has no later
+    /// records to invalidate, but must be removed before appending.
+    pub(crate) fn read_log<T: DeserializeOwned>(
+        &self,
+        name: &str,
+        mut visit: impl FnMut(T, bool),
+    ) -> io::Result<LogStatus> {
+        let file = match File::open(self.cache_path(name)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(LogStatus::Clean),
+            Err(error) => return Err(error),
         };
-        // Lines are split as bytes. Reading them as text would stop at the first line that
-        // is not UTF-8 and lose every record after it.
-        BufReader::new(file)
-            .split(b'\n')
-            .map_while(Result::ok)
-            .filter_map(|line| serde_json::from_slice(&line).ok())
-            .collect()
+        scan_log(file, |record, _, after_gap| {
+            visit(record, after_gap);
+            Ok(())
+        })
+    }
+
+    /// Removes unreadable lines and records rejected by `keep`. Retained lines are copied
+    /// as-is so repair does not strip fields unknown to this version of the app.
+    pub(crate) fn repair_log<T: DeserializeOwned>(
+        &self,
+        name: &str,
+        mut keep: impl FnMut(&T, bool) -> bool,
+    ) -> io::Result<()> {
+        let path = self.cache_path(name);
+        let source = File::open(&path)?;
+        let temporary = path.with_extension("repair");
+        let mut repaired = BufWriter::new(
+            private(OpenOptions::new().write(true).create(true).truncate(true)).open(&temporary)?,
+        );
+        let result = (|| {
+            scan_log(source, |record, line, after_gap| {
+                if keep(&record, after_gap) {
+                    repaired.write_all(line)?;
+                }
+                Ok(())
+            })?;
+            repaired.flush()?;
+            repaired.get_ref().sync_all()
+        })();
+        drop(repaired);
+        let result = result.and_then(|()| fs::rename(&temporary, &path));
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    #[cfg(test)]
+    pub fn log<T: DeserializeOwned>(&self, name: &str) -> Vec<T> {
+        let mut records = Vec::new();
+        self.read_log(name, |record, _| records.push(record))
+            .unwrap();
+        records
     }
 
     pub fn append_log<T: Serialize>(&self, name: &str, records: &[T]) -> io::Result<()> {
@@ -155,6 +205,26 @@ impl Store {
     fn read_json<T: DeserializeOwned>(&self, path: &Path) -> Option<T> {
         serde_json::from_slice(&fs::read(path).ok()?).ok()
     }
+}
+
+fn scan_log<T: DeserializeOwned>(
+    file: File,
+    mut visit: impl FnMut(T, &[u8], bool) -> io::Result<()>,
+) -> io::Result<LogStatus> {
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut status = LogStatus::Clean;
+    // Read bytes, not text: invalid UTF-8 in one row must not hide later rows.
+    while reader.read_until(b'\n', &mut line)? != 0 {
+        match serde_json::from_slice(&line) {
+            Ok(record) => visit(record, &line, status == LogStatus::Corrupt)?,
+            Err(_) if line.ends_with(b"\n") => status = LogStatus::Corrupt,
+            Err(_) if status == LogStatus::Clean => status = LogStatus::TornTail,
+            Err(_) => {}
+        }
+        line.clear();
+    }
+    Ok(status)
 }
 
 /// Files are readable by their owner only.
@@ -248,7 +318,14 @@ mod tests {
         bytes.extend_from_slice(b"\xff\xfe{\"cut\n");
         fs::write(&path, bytes).unwrap();
         store.append_log("room.jsonl", &[3]).unwrap();
-        assert_eq!(store.log::<i32>("room.jsonl"), [1, 2, 3]);
+        let mut records = Vec::new();
+        let status = store
+            .read_log::<i32>("room.jsonl", |record, after_gap| {
+                records.push((record, after_gap));
+            })
+            .unwrap();
+        assert_eq!(status, LogStatus::Corrupt);
+        assert_eq!(records, [(1, false), (2, false), (3, true)]);
     }
 
     #[test]
