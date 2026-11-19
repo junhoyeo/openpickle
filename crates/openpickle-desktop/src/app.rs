@@ -1,13 +1,17 @@
 //! The root view: shows sign-in or the signed-in sections, and applies what the backend
 //! reports.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use chrono::Local;
 use futures::{StreamExt, channel::mpsc::UnboundedReceiver};
 use gpui::{
-    AnyView, Context, Entity, Focusable, FontWeight, ImageSource, SharedString, Subscription, Task,
-    Window, div, prelude::*, px,
+    AnyView, Context, Entity, Focusable, FontWeight, ImageSource, PromptButton, PromptLevel,
+    SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -42,6 +46,8 @@ enum Screen {
     Login(Entity<LoginView>),
     /// Signed in. The chat always exists; the other sections are made when first opened.
     Chat(Entity<ChatView>),
+    /// The user confirmed local sign-out; the backend is clearing the account.
+    SigningOut,
     /// The backend stopped; the text says why.
     Failed(SharedString),
 }
@@ -79,6 +85,8 @@ pub struct Shell {
     identity: Identity,
     /// The pictures on disk, which the sections draw from.
     pictures: Entity<Pictures>,
+    /// GPUI caches decoded images by path, and a different account can reuse the same path.
+    account_images: HashSet<PathBuf>,
     /// The friends and the invite link as last read.
     social: Option<Social>,
     /// The other chat rooms as last listed.
@@ -142,6 +150,7 @@ impl Shell {
             search: None,
             identity: Identity::default(),
             pictures: cx.new(|_| Pictures::default()),
+            account_images: HashSet::new(),
             social: None,
             rooms: Vec::new(),
             calls: Vec::new(),
@@ -186,14 +195,33 @@ impl Shell {
     }
 
     fn apply(&mut self, update: Update, window: &mut Window, cx: &mut Context<Self>) {
+        // An operation already in flight can finish before the backend sees SignOut.
+        if matches!(self.screen, Screen::SigningOut)
+            && !matches!(update, Update::SignedOut | Update::Failed(_))
+        {
+            return;
+        }
+        match &update {
+            Update::Conversation {
+                avatar: Some(path), ..
+            }
+            | Update::Identity {
+                avatar: Some(path), ..
+            }
+            | Update::AttachmentPreview {
+                result: Ok(path), ..
+            } => {
+                self.account_images.insert(path.clone());
+            }
+            Update::Pictures(pictures) => {
+                self.account_images
+                    .extend(pictures.iter().map(|(_, path)| path.clone()));
+            }
+            _ => {}
+        }
         match update {
             Update::SignedOut => {
-                self.messages.clear();
-                self.forget_account();
-                self.pictures.update(cx, |pictures, cx| {
-                    *pictures = Pictures::default();
-                    cx.notify();
-                });
+                self.forget_account(cx);
                 self.show_login(window, cx)
             }
             Update::CodeSent => {
@@ -475,17 +503,15 @@ impl Shell {
                 self.refresh_room_avatar(cx);
             }
             Update::Failed(reason) => {
-                self.forget_account();
-                self._screen_events = None;
+                self.forget_account(cx);
                 self.screen = Screen::Failed(reason.into());
                 cx.notify();
             }
         }
     }
 
-    /// Drops what belongs to the signed-in account besides the conversation: the other
-    /// sections, what is open on top, and the search with what it found.
-    fn forget_account(&mut self) {
+    /// Drops every local projection of the signed-in account before another one can open.
+    fn forget_account(&mut self, cx: &mut Context<Self>) {
         self.tab = Tab::Chat;
         self.explore = None;
         self.friends = None;
@@ -499,6 +525,17 @@ impl Shell {
         self.tasks.clear();
         self.active_task = None;
         self.pending_phone_task = None;
+        self.messages.clear();
+        self.identity = Identity::default();
+        self.room_header = Identity::default();
+        self.pictures = cx.new(|_| Pictures::default());
+        for path in self.account_images.drain() {
+            ImageSource::from(path).remove_asset(cx);
+        }
+        self.activity = None;
+        self.row_starts.clear();
+        self.sent = 0;
+        self.is_character = true;
         self.drafts.clear();
         self.pending.clear();
         self.offers_asked.clear();
@@ -507,6 +544,7 @@ impl Shell {
         self.after_primary = None;
         self.notice = None;
         self.can_send = false;
+        self._screen_events = None;
         self._section_events.clear();
         self._over_events = None;
         self._search_events = None;
@@ -557,6 +595,39 @@ impl Shell {
         if let Some(Over::Phone(phone)) = &self.over {
             phone.update(cx, |phone, cx| phone.set_identity(identity.clone(), cx));
         }
+    }
+
+    fn confirm_sign_out(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Screen::Chat(chat) = &self.screen else {
+            return;
+        };
+        let account_view = chat.entity_id();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Sign out on this computer?",
+            Some("This removes the saved sign-in and cached conversations from OpenPickle. Your Pickle account and files saved to Downloads will not change."),
+            &[PromptButton::cancel("Cancel"), PromptButton::new("Sign out")],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if !matches!(answer.await, Ok(1)) {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                if !matches!(&this.screen, Screen::Chat(chat) if chat.entity_id() == account_view) {
+                    return;
+                }
+                this.forget_account(cx);
+                this.screen = if this.commands.send(Command::SignOut).is_ok() {
+                    Screen::SigningOut
+                } else {
+                    Screen::Failed("Could not sign out: the backend already stopped.".into())
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn show_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -708,6 +779,7 @@ impl Shell {
                             ProfileEvent::Menu => this.open_drawer(window, cx),
                             ProfileEvent::Invite => this.open_invite(window, cx),
                             ProfileEvent::Open(tab) => this.open_tab(*tab, window, cx),
+                            ProfileEvent::SignOut => this.confirm_sign_out(window, cx),
                             ProfileEvent::Reload => {
                                 this.commands.send(Command::LoadProfile).ok();
                             }
@@ -1238,6 +1310,13 @@ impl Render for Shell {
             }));
         match &self.screen {
             Screen::Starting => screen,
+            Screen::SigningOut => screen
+                .flex()
+                .items_center()
+                .justify_center()
+                .font_family(theme::FONT)
+                .text_color(theme::color(theme::TEXT_MUTED))
+                .child("Signing out…"),
             Screen::Login(login) => screen.child(login.clone()),
             Screen::Chat(_) => {
                 let over: Option<AnyView> = match &self.over {
@@ -1365,6 +1444,60 @@ mod tests {
         shell.read_with(cx, |shell, _| {
             let parts = &shell.messages.last().unwrap().parts;
             assert_eq!(parts.last(), Some(&Part::Task("Not sent.".into())));
+        });
+    }
+
+    #[gpui::test]
+    fn local_sign_out_waits_for_confirmation_and_does_not_reopen_the_old_chat(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::ui::bind_keys);
+        let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, received) = futures::channel::mpsc::unbounded();
+        let old_conversation = || Update::Conversation {
+            room_id: "previous".into(),
+            is_character: true,
+            can_send: true,
+            name: "Previous Pickle".into(),
+            avatar: None,
+            messages: vec![message("old", 1)],
+        };
+        updates.unbounded_send(old_conversation()).unwrap();
+        let (shell, cx) =
+            cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
+        shell.update_in(cx, |shell, window, cx| {
+            shell.open_tab(Tab::Profile, window, cx)
+        });
+        let profile = shell.read_with(cx, |shell, _| shell.profile.clone().unwrap());
+        profile.update(cx, |_, cx| cx.emit(ProfileEvent::SignOut));
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(
+            std::iter::from_fn(|| sent.try_recv().ok())
+                .all(|command| !matches!(command, Command::SignOut))
+        );
+
+        profile.update(cx, |_, cx| cx.emit(ProfileEvent::SignOut));
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Sign out");
+        cx.run_until_parked();
+        assert!(
+            std::iter::from_fn(|| sent.try_recv().ok())
+                .any(|command| matches!(command, Command::SignOut))
+        );
+        updates.unbounded_send(old_conversation()).unwrap();
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(matches!(shell.screen, Screen::SigningOut));
+            assert!(shell.profile.is_none());
+            assert!(shell.messages.is_empty());
+            assert_eq!(shell.identity.name.as_ref(), "Pickle");
+        });
+        updates.unbounded_send(Update::SignedOut).unwrap();
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(matches!(shell.screen, Screen::Login(_)))
         });
     }
 

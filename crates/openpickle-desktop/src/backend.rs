@@ -111,7 +111,7 @@ pub fn start() -> Result<Backend, StartError> {
 
 /// Why the backend stopped doing what it was doing.
 enum Ended {
-    /// The server no longer knows the login session.
+    /// The user asked to sign out locally, or the server no longer knows the login session.
     SignedOut,
     /// The UI is gone.
     Closed,
@@ -136,10 +136,23 @@ impl OpenRoomError {
 }
 
 async fn run(store: Store, mut commands: Commands<Command>, updates: Updates<Update>) {
-    let mut signed_in = store.session().map(|session| (session, None));
+    let mut saved_session = match store.session() {
+        Ok(session) => session,
+        // Sign-in can recover a damaged credential. No cache is displayed, and a new login
+        // must clear it before saving the new credential.
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => None,
+        Err(error) => {
+            updates
+                .unbounded_send(Update::Failed(format!(
+                    "Could not read the local login session: {error}"
+                )))
+                .ok();
+            return;
+        }
+    };
     let ended = loop {
-        let (session, access_token) = match signed_in.take() {
-            Some(signed_in) => signed_in,
+        let (session, access_token) = match saved_session.take() {
+            Some(session) => (session, None),
             None => {
                 updates.unbounded_send(Update::SignedOut).ok();
                 match sign_in(&store, &mut commands, &updates).await {
@@ -149,12 +162,11 @@ async fn run(store: Store, mut commands: Commands<Command>, updates: Updates<Upd
             }
         };
         match converse(&store, session, access_token, &mut commands, &updates).await {
-            // Without this, the next person to sign in would see the old conversations.
             Ended::SignedOut => {
+                // `converse` has dropped Live, disabling detached writes for this account.
                 if let Err(error) = store.sign_out() {
                     break Ended::Failed(format!(
-                        "Pickle ended this login session, but its data on this computer could \
-                         not be cleared: {error}"
+                        "Could not clear the login and cache on this computer: {error}"
                     ));
                 }
             }
@@ -179,8 +191,11 @@ async fn sign_in(
     commands: &mut Commands<Command>,
     updates: &Updates<Update>,
 ) -> Result<(Session, String), Ended> {
-    let client =
-        PickleClient::new(ClientOptions::default()).map_err(|error| cannot_start(&error))?;
+    let client = PickleClient::new(ClientOptions::default()).map_err(|error| {
+        Ended::Failed(format!(
+            "Could not set up the connection to Pickle: {error}"
+        ))
+    })?;
     let mut pending_id = None;
     while let Some(command) = commands.recv().await {
         let failure = match command {
@@ -202,10 +217,10 @@ async fn sign_in(
                             // iOS reports an upper-case UUID as its device id.
                             device_id: uuid::Uuid::new_v4().to_string().to_uppercase(),
                         };
-                        match store.save_session(&session) {
+                        match store.start_session(&session) {
                             Ok(()) => return Ok((session, issued.login_session_jwt)),
                             Err(error) => {
-                                format!("Signed in, but the session could not be saved: {error}")
+                                format!("Could not finish signing in on this computer: {error}")
                             }
                         }
                     }
@@ -214,7 +229,8 @@ async fn sign_in(
                 None => "Ask for a code first.".to_owned(),
             },
             Command::Quit => break,
-            Command::Send { .. }
+            Command::SignOut
+            | Command::Send { .. }
             | Command::Search(_)
             | Command::OpenRoom(_)
             | Command::LoadSocial
@@ -614,13 +630,12 @@ fn save_refresh_if_active(
     })
 }
 
-async fn converse(
+fn start_conversation(
     store: &Store,
     session: Session,
     access_token: Option<String>,
-    commands: &mut Commands<Command>,
     updates: &Updates<Update>,
-) -> Ended {
+) -> Result<Live, Ended> {
     let device_id = session.device_id.clone();
     let account_active = Arc::new(AtomicBool::new(true));
     let rotate_store = store.clone();
@@ -641,10 +656,7 @@ async fn converse(
         ..Default::default()
     };
     // A failure here is local: only the server can say that the login session is gone.
-    let client = match PickleClient::new(options) {
-        Ok(client) => client,
-        Err(error) => return cannot_start(&error),
-    };
+    let client = PickleClient::new(options).map_err(|error| cannot_start(&error))?;
 
     // First paint comes from the disk; the network is asked afterwards.
     let room_id: Option<String> = store.cached("room.json");
@@ -653,7 +665,7 @@ async fn converse(
         .map(|room_id| Conversation::load(store, room_id))
         .unwrap_or_default();
     let identity: Identity = store.cached("identity.json").unwrap_or_default();
-    let mut live = Live {
+    let live = Live {
         client,
         store: store.clone(),
         updates: updates.clone(),
@@ -676,7 +688,20 @@ async fn converse(
         marked_read: 0,
     };
     live.send_startup_conversation();
+    Ok(live)
+}
 
+async fn converse(
+    store: &Store,
+    session: Session,
+    access_token: Option<String>,
+    commands: &mut Commands<Command>,
+    updates: &Updates<Update>,
+) -> Ended {
+    let mut live = match start_conversation(store, session, access_token, updates) {
+        Ok(live) => live,
+        Err(ended) => return ended,
+    };
     let mut events: Option<EventStream> = None;
     let mut connect_at = Instant::now();
     let mut opened_at = Instant::now();
@@ -704,6 +729,7 @@ async fn converse(
                     let _ = live.client.close_login_session().await;
                     return Ended::Closed;
                 }
+                Some(Command::SignOut) => return Ended::SignedOut,
                 Some(Command::Send { room_id, id, text, offer }) => {
                     let sync_failure = if live.last_rooms.is_empty() {
                         match live.find_room().await {
@@ -2867,6 +2893,78 @@ mod tests {
     }
 
     #[test]
+    fn startup_keeps_the_saved_accounts_cache_but_never_reuses_it_for_a_new_login() {
+        for malformed in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "openpickle-test-account-cache-{}-{malformed}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let store = Store::at(root.clone()).unwrap();
+            let previous = Session {
+                login_session_token: "fixture-old-user".into(),
+                device_id: "fixture-old-device".into(),
+            };
+            store.save_session(&previous).unwrap();
+            store.cache("room.json", &"previous-room").unwrap();
+            store
+                .cache(
+                    "identity.json",
+                    &Identity {
+                        name: "Previous Pickle".into(),
+                        avatar_file: Some("avatar.png".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            store.cache_bytes("avatar.png", b"fixture avatar").unwrap();
+            let old_row: HistoryItem = serde_json::from_value(serde_json::json!({
+                "role": "user", "id": "previous-row", "text": "Old message", "at": 1.0, "seq": 1
+            }))
+            .unwrap();
+            store
+                .append_log(
+                    "room-previous-room.jsonl",
+                    &[Record::Item(Box::new(old_row))],
+                )
+                .unwrap();
+            let (updates, mut received) = futures::channel::mpsc::unbounded();
+            let restored = store.session().unwrap().unwrap();
+            assert!(start_conversation(&store, restored, None, &updates).is_ok());
+            assert!(matches!(
+                received.try_recv().unwrap(),
+                Update::Conversation { room_id, name, avatar: Some(_), messages, can_send: false, .. }
+                if room_id == "previous-room" && name == "Previous Pickle" && messages.len() == 1
+            ));
+
+            let credential = root.join("session.json");
+            if malformed {
+                std::fs::write(&credential, b"synthetic malformed login").unwrap();
+            } else {
+                std::fs::remove_file(&credential).unwrap();
+            }
+            let fresh = Session {
+                login_session_token: "fixture-new-user".into(),
+                device_id: "fixture-new-device".into(),
+            };
+            store.start_session(&fresh).unwrap();
+            assert!(
+                start_conversation(&store, fresh, Some("fixture-access".into()), &updates).is_ok()
+            );
+            assert!(matches!(
+                received.try_recv().unwrap(),
+                Update::Conversation { room_id, name, avatar: None, messages, can_send: false, .. }
+                if room_id.is_empty() && name == "Pickle" && messages.is_empty()
+            ));
+            assert!(
+                Conversation::load(&store, "previous-room")
+                    .messages()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
     fn a_late_session_rotation_cannot_recreate_a_signed_out_account() {
         let root = std::env::temp_dir().join(format!(
             "openpickle-test-late-rotation-{}",
@@ -2889,7 +2987,7 @@ mod tests {
         };
 
         save_refresh_if_active(&store, &active, "fixture-device", &refresh).unwrap();
-        assert!(store.session().is_none());
+        assert!(store.session().unwrap().is_none());
     }
 
     #[tokio::test]

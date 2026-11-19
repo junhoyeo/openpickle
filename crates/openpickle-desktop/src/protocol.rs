@@ -67,6 +67,8 @@ pub enum Command {
     /// Whether the chat can be read now: the window is in front and shows the chat. Only
     /// then do new messages count as read.
     Active(bool),
+    /// Forget the session and cached account data on this computer. Does not call the server.
+    SignOut,
     /// The app is quitting: stop after the network call in flight, if there is one.
     Quit,
 }

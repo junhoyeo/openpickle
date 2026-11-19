@@ -79,10 +79,30 @@ impl Store {
         }
     }
 
-    pub fn session(&self) -> Option<Session> {
-        self.read_json(&self.root.join("session.json"))
+    /// Missing is normal. A malformed credential is not usable, and other read errors must
+    /// not quietly turn into a new login attempt. Never include the credential bytes in errors.
+    pub fn session(&self) -> io::Result<Option<Session>> {
+        let bytes = match fs::read(self.root.join("session.json")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid local login session");
+        let session: Session = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        if session.login_session_token.trim().is_empty() || session.device_id.trim().is_empty() {
+            return Err(invalid());
+        }
+        Ok(Some(session))
     }
 
+    /// A newly issued session may be for a different account. Establish an empty cache before
+    /// persisting it, so even a restart cannot open the old account's conversations under it.
+    pub fn start_session(&self, session: &Session) -> io::Result<()> {
+        self.sign_out()?;
+        self.save_session(session)
+    }
+
+    /// Persists a replacement credential for the same account, preserving its cache.
     pub fn save_session(&self, session: &Session) -> io::Result<()> {
         write_atomically(
             &self.root.join("session.json"),
@@ -93,11 +113,11 @@ impl Store {
     /// Forgets the login session and everything cached for it. The next person to sign in on
     /// this computer account must not be shown the previous conversations.
     pub fn sign_out(&self) -> io::Result<()> {
-        match fs::remove_file(self.root.join("session.json")) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
-            _ => {}
-        }
-        fs::remove_dir_all(self.root.join("cache"))?;
+        let credential = self.root.join("session.json");
+        remove_if_present(fs::remove_file(&credential))?;
+        // A failed atomic write can have left a second copy of the credential.
+        remove_if_present(fs::remove_file(credential.with_extension("tmp")))?;
+        remove_if_present(fs::remove_dir_all(self.root.join("cache")))?;
         Self::at(self.root.clone()).map(drop)
     }
 
@@ -227,6 +247,13 @@ fn scan_log<T: DeserializeOwned>(
     Ok(status)
 }
 
+fn remove_if_present(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
 /// Files are readable by their owner only.
 fn private(options: &mut OpenOptions) -> &mut OpenOptions {
     #[cfg(unix)]
@@ -268,20 +295,55 @@ mod tests {
     #[test]
     fn session_round_trips() {
         let store = store("session");
-        assert_eq!(store.session(), None);
+        assert_eq!(store.session().unwrap(), None);
         let session = Session {
             login_session_token: "ls_test".into(),
             device_id: "device".into(),
         };
         store.save_session(&session).unwrap();
-        assert_eq!(store.session(), Some(session.clone()));
+        assert_eq!(store.session().unwrap(), Some(session.clone()));
         let replacement = Session {
             login_session_token: "ls_next".into(),
             device_id: "device".into(),
         };
         store.save_session(&replacement).unwrap();
-        assert_eq!(store.session(), Some(replacement));
+        assert_eq!(store.session().unwrap(), Some(replacement));
         assert!(!format!("{session:?}").contains("ls_test"));
+    }
+
+    #[test]
+    fn local_login_distinguishes_missing_malformed_and_read_errors() {
+        let store = store("session-errors");
+        let path = store.root.join("session.json");
+        assert_eq!(store.session().unwrap(), None);
+        for bytes in [
+            b"synthetic-malformed-credential".as_slice(),
+            br#"{"login_session_token":" ","device_id":"fixture"}"#,
+        ] {
+            fs::write(&path, bytes).unwrap();
+            let error = store.session().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), "invalid local login session");
+        }
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let error = store.session().unwrap_err();
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+        assert_ne!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn fresh_login_is_not_saved_when_the_old_cache_cannot_be_cleared() {
+        let store = store("blocked-cache-clear");
+        let path = store.root.join("cache");
+        fs::remove_dir(&path).unwrap();
+        fs::write(&path, b"not a directory").unwrap();
+        let session = Session {
+            login_session_token: "fixture-new-user".into(),
+            device_id: "fixture-device".into(),
+        };
+        assert!(store.start_session(&session).is_err());
+        assert_eq!(store.session().unwrap(), None);
     }
 
     #[cfg(unix)]
@@ -339,10 +401,16 @@ mod tests {
             .unwrap();
         store.cache("room.json", &"room").unwrap();
         store.append_log("room.jsonl", &[1]).unwrap();
+        let scratch = store.root.join("session.tmp");
+        fs::write(&scratch, b"fixture refresh scratch").unwrap();
         store.sign_out().unwrap();
-        assert_eq!(store.session(), None);
+        assert_eq!(store.session().unwrap(), None);
+        assert!(!scratch.exists());
         assert_eq!(store.cached::<String>("room.json"), None);
         assert!(store.log::<u32>("room.jsonl").is_empty());
+        // A repeated cleanup also works after a partial removal.
+        fs::remove_dir(store.root.join("cache")).unwrap();
+        store.sign_out().unwrap();
         // The store is still usable for the next sign-in.
         store.cache("room.json", &"next").unwrap();
     }
