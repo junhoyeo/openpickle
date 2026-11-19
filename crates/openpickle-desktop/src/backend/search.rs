@@ -2,7 +2,9 @@
 
 use std::{future::Future, pin::Pin};
 
-use openpickle_api::{CardState, Error, HistoryItem, HistoryPage, PickleClient};
+use openpickle_api::{
+    CardState, Error, HistoryDelta, HistoryItem, HistoryPage, PickleClient, Reaction,
+};
 
 use super::{Conversation, Live, explain, session_is_gone};
 use crate::{
@@ -115,6 +117,7 @@ const MISSING: &str =
 pub(super) struct SearchContext {
     items: Vec<HistoryItem>,
     card_states: Vec<CardState>,
+    reactions: Vec<Reaction>,
 }
 
 /// No scan from the cached tail: history/page is exclusive, so target + 1 includes the target.
@@ -147,17 +150,7 @@ async fn lookup(
         }
         Err(_) => None,
     };
-    let backward = backward?;
-    let (newer_items, newer_cards) = newer
-        .map(|delta| (delta.items, delta.card_states))
-        .unwrap_or_default();
-    Ok(SearchContext::around(
-        target,
-        before,
-        backward,
-        newer_items,
-        newer_cards,
-    ))
+    Ok(SearchContext::around(target, before, backward?, newer))
 }
 
 impl SearchContext {
@@ -165,9 +158,11 @@ impl SearchContext {
         target: i64,
         before: i64,
         older: HistoryPage,
-        newer_items: Vec<HistoryItem>,
-        newer_cards: Vec<CardState>,
+        newer: Option<HistoryDelta>,
     ) -> Option<Self> {
+        let (newer_items, newer_cards, newer_reactions) = newer
+            .map(|delta| (delta.items, delta.card_states, delta.reactions))
+            .unwrap_or_default();
         let mut items: Vec<_> = older
             .messages
             .into_iter()
@@ -183,6 +178,7 @@ impl SearchContext {
         items.iter().any(|item| item.seq == target).then(|| Self {
             items,
             card_states: older.card_states.into_iter().chain(newer_cards).collect(),
+            reactions: older.reactions.into_iter().chain(newer_reactions).collect(),
         })
     }
 }
@@ -199,13 +195,20 @@ impl Conversation {
                 self.search_context.insert(id);
             }
         }
+        ids.sort_unstable();
+        ids.dedup();
         for state in context.card_states {
-            if self.search_context.contains(&state.id) && ids.contains(&state.id) {
+            if self.search_context.contains(&state.id) && ids.binary_search(&state.id).is_ok() {
                 self.card_states.entry(state.id.clone()).or_insert(state);
             }
         }
-        ids.sort_unstable();
-        ids.dedup();
+        for reaction in context.reactions {
+            if ids.binary_search(&reaction.target_id).is_ok() {
+                // Like a regular history read, keep the first record for a sequence number.
+                // Do not log the sparse lookup; normal pagination can still persist the record.
+                self.remember_reaction(reaction);
+            }
+        }
         ids.iter()
             .filter_map(|id| self.items.get(id))
             .map(|item| self.message(item))
@@ -310,14 +313,31 @@ mod tests {
         }
     }
 
+    fn delta(items: Vec<HistoryItem>, reactions: Vec<Reaction>) -> HistoryDelta {
+        HistoryDelta {
+            v: 1,
+            items,
+            reactions,
+            card_states: Vec::new(),
+            next_after: 150,
+            has_more: false,
+            head_seq: 150,
+            log_epoch: String::new(),
+            projection_version: 1,
+            read_seq: 0,
+        }
+    }
+
     #[test]
     fn context_requires_the_exact_target_even_when_nearby_messages_exist() {
         let absent = SearchContext::around(
             50,
             51,
             page(vec![item("too-new", 51), item("older", 44)]),
-            vec![item("wrong-direction", 50), item("newer", 57)],
-            Vec::new(),
+            Some(delta(
+                vec![item("wrong-direction", 50), item("newer", 57)],
+                Vec::new(),
+            )),
         );
         assert!(absent.is_none());
 
@@ -325,8 +345,7 @@ mod tests {
             i64::MAX,
             i64::MAX,
             page(vec![item("older", i64::MAX - 2)]),
-            vec![item("target", i64::MAX)],
-            Vec::new(),
+            Some(delta(vec![item("target", i64::MAX)], Vec::new())),
         )
         .unwrap();
         assert_eq!(at_limit.items.len(), 2);
@@ -343,8 +362,10 @@ mod tests {
             50,
             51,
             page(vec![item("target", 50), item("older", 44)]),
-            vec![item("known", 119), item("ahead", 121)],
-            Vec::new(),
+            Some(delta(
+                vec![item("known", 119), item("ahead", 121)],
+                Vec::new(),
+            )),
         )
         .unwrap();
         let hydrated = conversation.apply_search_context(context);
@@ -363,6 +384,67 @@ mod tests {
         assert_eq!(conversation.first_seq(), Some(44));
         assert_eq!(conversation.head_seq(), 121);
         assert!(!conversation.search_context.contains("older"));
+    }
+
+    #[test]
+    fn search_context_hydrates_selected_reactions_without_overwriting_live_records() {
+        let reaction = |seq, target_id: &str, actor: &str, emoji: &str| Reaction {
+            seq,
+            target_id: target_id.into(),
+            part: 0,
+            actor: actor.into(),
+            emoji: emoji.into(),
+            at: 1.0,
+        };
+        let mut conversation = Conversation::default();
+        conversation.apply(
+            vec![item("newer", 120), item("unrelated", 115)],
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(
+            conversation
+                .hear_reaction(reaction(132, "newer", "user", "🎉"))
+                .is_some()
+        );
+
+        let shared = reaction(130, "target", "user", "👍");
+        let mut older = page(vec![item("target", 50), item("out-of-range", 51)]);
+        older.reactions = vec![
+            shared.clone(),
+            reaction(129, "target", "assistant", "👍"),
+            reaction(128, "out-of-range", "user", "👍"),
+        ];
+        let newer = delta(
+            vec![item("newer", 119), item("neighbor", 121)],
+            vec![
+                shared,
+                reaction(132, "newer", "user", "👎"),
+                reaction(133, "unrelated", "user", "👍"),
+                reaction(134, "neighbor", "user", "❤️"),
+            ],
+        );
+        let context = SearchContext::around(50, 51, older, Some(newer)).unwrap();
+        let messages = conversation.apply_search_context(context);
+
+        let badges = |seq| {
+            messages
+                .iter()
+                .find(|message| message.seq == seq)
+                .unwrap()
+                .decorations
+                .reactions
+                .as_deref()
+                .unwrap()
+        };
+        assert_eq!(badges(50)[0].emoji, "👍");
+        assert_eq!(badges(50)[0].count, 2);
+        assert_eq!(conversation.reactions["target"].len(), 2);
+        assert_eq!(badges(120)[0].emoji, "🎉");
+        assert_eq!(badges(120).len(), 1);
+        assert_eq!(badges(121)[0].emoji, "❤️");
+        assert!(!conversation.reactions.contains_key("unrelated"));
+        assert!(!conversation.reactions.contains_key("out-of-range"));
     }
 
     #[tokio::test]
