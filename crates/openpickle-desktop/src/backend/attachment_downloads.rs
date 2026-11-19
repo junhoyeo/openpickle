@@ -22,6 +22,8 @@ use tokio::{
 
 use crate::protocol::Update;
 
+mod rename_noreplace;
+
 const ACTIVE_LIMIT: usize = 2;
 // Includes active jobs; the rest wait for a permit without opening connections or files.
 const JOB_LIMIT: usize = 10;
@@ -301,11 +303,22 @@ async fn save_download(
     }
 }
 
-struct PartialFile(PathBuf);
+struct PartialFile {
+    path: PathBuf,
+    moved: bool,
+}
+
+impl PartialFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path, moved: false }
+    }
+}
 
 impl Drop for PartialFile {
     fn drop(&mut self) {
-        fs::remove_file(&self.0).ok();
+        if !self.moved {
+            fs::remove_file(&self.path).ok();
+        }
     }
 }
 
@@ -328,7 +341,7 @@ fn write_download<B: AsRef<[u8]>>(
         options.mode(0o600);
     }
     let file = options.open(&temporary)?;
-    let partial = PartialFile(temporary);
+    let partial = PartialFile::new(temporary);
     // Move the file in so it is closed before the cleanup guard runs, even after write errors.
     let write = move || -> io::Result<bool> {
         let mut file = file;
@@ -350,12 +363,20 @@ fn write_download<B: AsRef<[u8]>>(
     if !write()? || !begin(phase, Phase::Publishing) {
         return Ok(None);
     }
-    publish(folder, name, &partial.0).map(Some)
+    publish(folder, name, partial).map(Some)
 }
 
-/// A hard link in the same directory exposes the complete file and fails atomically if the
-/// chosen name already exists; existence checks followed by rename could overwrite another file.
-fn publish(folder: &Path, name: &str, temporary: &Path) -> io::Result<PathBuf> {
+fn publish(folder: &Path, name: &str, partial: PartialFile) -> io::Result<PathBuf> {
+    publish_with(folder, name, partial, |from, to| fs::hard_link(from, to))
+}
+
+/// Both publication methods expose only the complete file and fail atomically on collisions.
+fn publish_with(
+    folder: &Path,
+    name: &str,
+    mut partial: PartialFile,
+    mut hard_link: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> io::Result<PathBuf> {
     let name: String = Path::new(name)
         .file_name()
         .and_then(|name| name.to_str())
@@ -371,14 +392,27 @@ fn publish(folder: &Path, name: &str, temporary: &Path) -> io::Result<PathBuf> {
         Some(dot) if dot > 0 => name.split_at(dot),
         _ => (name.as_str(), ""),
     };
+    let mut use_rename = false;
     for count in 0.. {
         let file = if count == 0 {
             folder.join(&name)
         } else {
             folder.join(format!("{stem} ({count}){extension}"))
         };
-        match fs::hard_link(temporary, &file) {
-            Ok(()) => return Ok(file),
+        if !use_rename {
+            match hard_link(&partial.path, &file) {
+                Ok(()) => return Ok(file),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                // Filesystems without hard links (e.g. exFAT) can report different errors.
+                Err(_) => use_rename = true,
+            }
+        }
+        match rename_noreplace::rename(&partial.path, &file) {
+            Ok(()) => {
+                // The old name is free for reuse; the guard must not remove it now.
+                partial.moved = true;
+                return Ok(file);
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
@@ -581,14 +615,56 @@ mod tests {
         fs::write(&temporary, b"complete").unwrap();
         let existing = folder.0.join("report.pdf");
         fs::write(&existing, b"original").unwrap();
-        let published = publish(&folder.0, "../../report.pdf", &temporary).unwrap();
+        let published = publish(
+            &folder.0,
+            "../../report.pdf",
+            PartialFile::new(temporary.clone()),
+        )
+        .unwrap();
         assert_eq!(published, folder.0.join("report (1).pdf"));
         assert_eq!(fs::read(published).unwrap(), b"complete");
         assert_eq!(fs::read(existing).unwrap(), b"original");
+        assert!(!temporary.exists());
+
+        fs::write(&temporary, b"complete").unwrap();
         assert_eq!(
-            publish(&folder.0, "..", &temporary).unwrap(),
+            publish(&folder.0, "..", PartialFile::new(temporary)).unwrap(),
             folder.0.join("attachment")
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn publish_without_hard_links_preserves_collisions_and_moves_the_staged_file() {
+        let folder = Folder::new();
+        fs::create_dir_all(&folder.0).unwrap();
+        let temporary = folder.0.join(".staged.part");
+        let first = folder.0.join("report.pdf");
+        let second = folder.0.join("report (1).pdf");
+        fs::write(&temporary, b"complete").unwrap();
+        fs::write(&first, b"original").unwrap();
+        fs::write(&second, b"previous download").unwrap();
+
+        let mut link_attempts = 0;
+        let published = publish_with(
+            &folder.0,
+            "report.pdf",
+            PartialFile::new(temporary.clone()),
+            |from, to| {
+                link_attempts += 1;
+                assert_eq!(from, temporary);
+                assert_eq!(to, first);
+                Err(io::ErrorKind::Unsupported.into())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(link_attempts, 1);
+        assert_eq!(published, folder.0.join("report (2).pdf"));
+        assert_eq!(fs::read(published).unwrap(), b"complete");
+        assert_eq!(fs::read(first).unwrap(), b"original");
+        assert_eq!(fs::read(second).unwrap(), b"previous download");
+        assert!(!temporary.exists());
     }
 
     #[tokio::test]
