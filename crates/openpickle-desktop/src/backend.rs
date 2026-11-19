@@ -37,6 +37,10 @@ use crate::{
     store::{Session, Store},
 };
 
+mod search;
+
+use search::{SearchJob, SearchReads};
+
 type EventStream = Pin<Box<dyn Stream<Item = openpickle_api::Result<PickleEvent>> + Send>>;
 
 /// Why the backend could not start.
@@ -215,7 +219,9 @@ async fn sign_in(
             },
             Command::Quit => break,
             Command::Send { .. }
-            | Command::Search(_)
+            | Command::Search { .. }
+            | Command::OpenSearchResult { .. }
+            | Command::CancelSearch
             | Command::OpenRoom(_)
             | Command::LoadSocial
             | Command::LoadExplore
@@ -322,6 +328,8 @@ impl HistoryLog {
 struct Conversation {
     room_id: String,
     items: HashMap<String, HistoryItem>,
+    /// Sparse search neighbors are not logged and cannot advance either history cursor.
+    search_context: HashSet<String>,
     card_states: HashMap<String, CardState>,
     /// Sequence number up to which `history/delta` has been read.
     synced: i64,
@@ -362,9 +370,14 @@ impl Conversation {
         items.into_iter().flat_map(convert::attachments).collect()
     }
 
-    /// The oldest message on this computer, which is where reading back starts.
+    /// The oldest regular history item, where reading back starts. A search can have
+    /// loaded an isolated older window without covering the messages that lead up to it.
     fn first_seq(&self) -> Option<i64> {
-        self.items.values().map(|item| item.seq).min()
+        self.items
+            .values()
+            .filter(|item| !self.search_context.contains(&item.id))
+            .map(|item| item.seq)
+            .min()
     }
 
     /// Every message, oldest first.
@@ -384,6 +397,7 @@ impl Conversation {
         }
         for item in items {
             changed.push(item.id.clone());
+            self.search_context.remove(&item.id);
             self.items.insert(item.id.clone(), item);
         }
         changed.sort();
@@ -425,6 +439,7 @@ impl Conversation {
     fn head_seq(&self) -> i64 {
         self.items
             .values()
+            .filter(|item| !self.search_context.contains(&item.id))
             .map(|item| item.seq)
             .max()
             .unwrap_or(0)
@@ -663,7 +678,9 @@ async fn converse(
     let mut connect_at = Instant::now();
     let mut opened_at = Instant::now();
     let mut backoff = Backoff::default();
+    let mut search = SearchReads::default();
     loop {
+        search.start_next(&live.client, &live.conversation.room_id);
         let watch_deadline = live
             .phone_watch
             .as_ref()
@@ -680,7 +697,11 @@ async fn converse(
             .min();
         tokio::select! {
             command = commands.recv() => match command {
-                None | Some(Command::Quit) => return Ended::Closed,
+                None | Some(Command::Quit) => {
+                    // Preserve an already polled read's credential refresh; do not start queued work.
+                    search.finish_on_quit().await;
+                    return Ended::Closed;
+                }
                 Some(Command::Send { room_id, id, text, offer }) => {
                     let sync_failure = if live.last_rooms.is_empty() {
                         match live.find_room().await {
@@ -706,18 +727,9 @@ async fn converse(
                         live.send(Update::SendFailed { room_id, id, reason });
                     }
                 }
-                Some(Command::Search(query)) => {
-                    let results = match live.client.search_messages(&query).await {
-                        Ok(found) => Ok(found
-                            .items
-                            .into_iter()
-                            .map(|item| convert::search_result(item, &live.conversation.room_id))
-                            .collect()),
-                        Err(error) if session_is_gone(&error) => return Ended::SignedOut,
-                        Err(error) => Err(explain(&error)),
-                    };
-                    live.send(Update::Found { query, results });
-                }
+                Some(Command::Search { request, query }) => search.queue(request, SearchJob::Query(query)),
+                Some(Command::OpenSearchResult { request, seq }) => search.queue(request, SearchJob::Open(seq)),
+                Some(Command::CancelSearch) => search.cancel(),
                 Some(Command::LoadSocial) => {
                     if let Some(cached) = live.cached_once::<SocialSnapshot>("social.json") {
                         live.show_social(&cached);
@@ -805,6 +817,7 @@ async fn converse(
                     }
                 }
                 Some(Command::OpenRoom(room_id)) => {
+                    search.cancel();
                     if let Err(error) = live.open_room_and_report(room_id).await
                         && session_is_gone(&error)
                     {
@@ -843,6 +856,11 @@ async fn converse(
                 }
                 Some(Command::RequestCode(_) | Command::VerifyCode(_)) => {}
             },
+            (request, reply, wanted) = search.next(), if search.is_active() => {
+                if live.finish_search(request, reply, wanted).is_err() {
+                    return Ended::SignedOut;
+                }
+            }
             _ = tokio::time::sleep_until(phone_deadline.unwrap_or_else(Instant::now)), if phone_deadline.is_some() => {
                 let now = Instant::now();
                 if watch_deadline.is_some_and(|at| at <= now)
