@@ -260,6 +260,13 @@ impl Shell {
                 messages,
             } => {
                 let changed_room = room_id != self.room_id;
+                let awaiting_other_room = self.opening_room.as_deref().is_some_and(|requested| {
+                    if requested.is_empty() {
+                        !is_character || room_id.is_empty()
+                    } else {
+                        requested != room_id
+                    }
+                });
                 if changed_room {
                     if let Screen::Chat(chat) = &self.screen {
                         self.drafts
@@ -285,8 +292,10 @@ impl Shell {
                 self.room_id = room_id;
                 self.is_character = is_character;
                 self.can_send = can_send;
-                self.opening_room = None;
-                self.notice = None;
+                if !awaiting_other_room {
+                    self.opening_room = None;
+                    self.notice = None;
+                }
                 self.message_seqs = open_conversation(&mut self.messages, messages);
                 self.show_chat(window, cx);
                 self.room_header = Identity {
@@ -300,9 +309,9 @@ impl Shell {
                     let draft = self.drafts.get(&self.room_id).cloned().unwrap_or_default();
                     chat.update(cx, |chat, cx| {
                         if changed_room {
-                            chat.switch_room(can_send, &draft, cx);
+                            chat.switch_room(can_send && !awaiting_other_room, &draft, cx);
                         }
-                        chat.set_can_send(can_send, cx);
+                        chat.set_can_send(can_send && !awaiting_other_room, cx);
                         chat.set_activity(None, cx);
                         chat.set_identity(
                             self.room_header.name.clone(),
@@ -323,7 +332,10 @@ impl Shell {
                         .ok();
                 }
                 self.report_reading(window);
-                if is_character && let Some(action) = self.after_primary.take() {
+                if is_character
+                    && !awaiting_other_room
+                    && let Some(action) = self.after_primary.take()
+                {
                     match action {
                         PrimaryAction::Search => self.open_search(window, cx),
                         PrimaryAction::Ask { text, offer } => self.send(&text, Some(offer), cx),
@@ -2663,6 +2675,48 @@ mod tests {
         shell.read_with(cx, |shell, _| assert_eq!(shell.tab, Tab::Archive));
         cx.simulate_keystrokes("secondary-1");
         assert_eq!(archive_watches(), vec![None]);
+    }
+
+    #[gpui::test]
+    fn a_fallback_snapshot_does_not_acknowledge_an_open_for_a_different_room(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (commands, _sent) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, received) = futures::channel::mpsc::unbounded();
+        let conversation = |room: &str| Update::Conversation {
+            room_id: room.into(),
+            is_character: room == "primary",
+            can_send: true,
+            name: room.into(),
+            avatar: None,
+            messages: vec![],
+        };
+        updates.unbounded_send(conversation("old-peer")).unwrap();
+        let (shell, cx) =
+            cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
+        shell.update_in(cx, |shell, window, cx| {
+            shell.open_room("new-peer", window, cx)
+        });
+        updates.unbounded_send(conversation("primary")).unwrap();
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.room_id, "primary");
+            assert_eq!(shell.opening_room.as_deref(), Some("new-peer"));
+        });
+        updates
+            .unbounded_send(Update::RoomOpenFailed {
+                room_id: "new-peer".into(),
+                reason: "No longer available".into(),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.opening_room.is_none());
+            assert_eq!(
+                shell.notice.as_deref().map(|notice| notice.as_ref()),
+                Some("No longer available")
+            );
+        });
     }
 
     #[gpui::test]
