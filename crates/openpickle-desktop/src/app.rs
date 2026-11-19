@@ -644,7 +644,6 @@ impl Shell {
         for path in self.account_images.drain() {
             ImageSource::from(path).remove_asset(cx);
         }
-        self.activity = None;
         self.row_starts.clear();
         self.sent = 0;
         self.is_character = true;
@@ -872,7 +871,9 @@ impl Shell {
                             ArchiveEvent::Menu => this.open_drawer(window, cx),
                             ArchiveEvent::Invite => this.open_invite(window, cx),
                             ArchiveEvent::Open(tab) => this.open_tab(*tab, window, cx),
-                            ArchiveEvent::ShowInChat(seq) => this.show_message(*seq, window, cx),
+                            ArchiveEvent::ShowInChat(seq) => {
+                                this.show_message(*seq, window, cx);
+                            }
                             ArchiveEvent::PreviewFile(path) | ArchiveEvent::DownloadFile(path) => {
                                 this.open_archive_file(
                                     path,

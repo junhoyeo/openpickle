@@ -368,12 +368,12 @@ pub fn build_rows(
 
 /// Lays out a message suffix, keeping its row starts absolute. Returns whether its first
 /// row joins the last retained row, whose bottom corners can change without remeasuring it.
-pub(crate) fn append_message_rows(
+pub(crate) fn append_message_rows<'a>(
     rows: &mut Vec<Row>,
     starts: &mut Vec<usize>,
     row_offset: usize,
-    mut previous: Option<&Message>,
-    messages: &[Message],
+    mut previous: Option<&'a Message>,
+    messages: &'a [Message],
     now: DateTime<Local>,
 ) -> bool {
     let mut joins_retained_row = false;

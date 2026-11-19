@@ -176,8 +176,8 @@ test("a late token_expired response reuses the other request's new bearer", asyn
   expect(refreshes).toEqual(["ls_start", "ls_1"]);
   const [slowFirst, fastFirst, fastRetry, slowRetry] = requests;
   expect(requests).toHaveLength(4);
-  expect(slowFirst).toEqual(["/slow?q=test%20query", fastFirst?.[1], '{"id":"stable"}']);
-  expect(slowRetry).toEqual(["/slow?q=test%20query", fastRetry?.[1], '{"id":"stable"}']);
+  expect(slowFirst).toEqual(["/slow?q=test%20query", fastFirst![1], '{"id":"stable"}']);
+  expect(slowRetry).toEqual(["/slow?q=test%20query", fastRetry![1], '{"id":"stable"}']);
   expect(slowRetry?.[1]).not.toBe(slowFirst?.[1]);
 });
 
