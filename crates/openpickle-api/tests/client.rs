@@ -199,47 +199,57 @@ async fn a_rotation_that_could_not_be_stored_is_stored_before_anything_else() {
 }
 
 #[tokio::test]
-async fn closing_drains_an_in_flight_rotation_without_spending_another_token() {
-    let begun = Arc::new(tokio::sync::Notify::new());
-    let server = MockServer::start({
-        let begun = begun.clone();
-        move |request| {
-            assert_eq!(request.path, "/api/login-sessions/refresh");
-            begun.notify_one();
-            let access = jwt(300);
-            let mut reply = Reply::json(
-                200,
-                format!(
-                    r#"{{"login_session_jwt":"{access}","expires_at":"2026-11-23T00:00:00Z","login_session_token":"ls_next"}}"#
-                ),
-            );
-            reply.delay = Duration::from_millis(30);
-            reply
+async fn closing_drains_an_in_flight_rotation_without_sending_the_waiting_request() {
+    for cancel_request in [false, true] {
+        let begun = Arc::new(tokio::sync::Notify::new());
+        let server = MockServer::start({
+            let begun = begun.clone();
+            move |request| {
+                if request.path != "/api/login-sessions/refresh" {
+                    return Reply::json(200, SYNC);
+                }
+                begun.notify_one();
+                let access = jwt(300);
+                let mut reply = Reply::json(
+                    200,
+                    format!(
+                        r#"{{"login_session_jwt":"{access}","expires_at":"2026-11-23T00:00:00Z","login_session_token":"ls_next"}}"#
+                    ),
+                );
+                reply.delay = Duration::from_millis(30);
+                reply
+            }
+        })
+        .await;
+        let stored = Arc::new(AtomicUsize::new(0));
+        let session = LoginSession::new("ls_first", {
+            let stored = stored.clone();
+            move |_| {
+                stored.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+        let pickle = client(&server, Credentials::LoginSession(session));
+        let read = tokio::spawn({
+            let pickle = pickle.clone();
+            async move { pickle.sync().await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), begun.notified())
+            .await
+            .expect("local server did not receive the refresh");
+        if cancel_request {
+            read.abort();
         }
-    })
-    .await;
-    let stored = Arc::new(AtomicUsize::new(0));
-    let session = LoginSession::new("ls_first", {
-        let stored = stored.clone();
-        move |_| {
-            stored.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+        pickle.close_login_session().await.unwrap();
+        if cancel_request {
+            assert!(matches!(read.await, Err(error) if error.is_cancelled()));
+        } else {
+            assert!(matches!(read.await.unwrap(), Err(Error::SignedOut)));
         }
-    });
-    let pickle = client(&server, Credentials::LoginSession(session));
-    let read = tokio::spawn({
-        let pickle = pickle.clone();
-        async move { pickle.sync().await }
-    });
-    tokio::time::timeout(Duration::from_secs(2), begun.notified())
-        .await
-        .expect("local server did not receive the refresh");
-    read.abort();
-    let _ = read.await;
-    pickle.close_login_session().await.unwrap();
-    assert_eq!(stored.load(Ordering::SeqCst), 1);
-    assert!(matches!(pickle.sync().await, Err(Error::SignedOut)));
-    assert_eq!(server.take().len(), 1);
+        assert_eq!(stored.load(Ordering::SeqCst), 1);
+        assert!(matches!(pickle.sync().await, Err(Error::SignedOut)));
+        assert_eq!(server.take().len(), 1);
+    }
 }
 
 #[tokio::test]

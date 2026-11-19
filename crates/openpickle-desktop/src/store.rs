@@ -114,11 +114,13 @@ impl Store {
     /// this computer account must not be shown the previous conversations.
     pub fn sign_out(&self) -> io::Result<()> {
         let credential = self.root.join("session.json");
-        remove_if_present(fs::remove_file(&credential))?;
-        // A failed atomic write can have left a second copy of the credential.
-        remove_if_present(fs::remove_file(credential.with_extension("tmp")))?;
-        remove_if_present(fs::remove_dir_all(self.root.join("cache")))?;
-        Self::at(self.root.clone()).map(drop)
+        let removed = remove_if_present(fs::remove_file(&credential));
+        // A failed atomic write can have left a second copy of the credential. Keep clearing
+        // the cache even if either removal fails, but do not accept a new login on error.
+        let scratch = remove_if_present(fs::remove_file(credential.with_extension("tmp")));
+        let cache = remove_if_present(fs::remove_dir_all(self.root.join("cache")))
+            .and_then(|()| Self::at(self.root.clone()).map(drop));
+        removed.and(scratch).and(cache)
     }
 
     /// A cached value, or `None` when it is missing or unreadable.
@@ -413,6 +415,22 @@ mod tests {
         store.sign_out().unwrap();
         // The store is still usable for the next sign-in.
         store.cache("room.json", &"next").unwrap();
+    }
+
+    #[test]
+    fn a_failed_scratch_removal_does_not_leave_the_old_cache() {
+        let store = store("blocked-scratch-removal");
+        let session = Session {
+            login_session_token: "fixture-old-user".into(),
+            device_id: "fixture-device".into(),
+        };
+        store.save_session(&session).unwrap();
+        store.cache("room.json", &"old room").unwrap();
+        fs::create_dir(store.root.join("session.tmp")).unwrap();
+
+        assert!(store.sign_out().is_err());
+        assert!(store.session().unwrap().is_none());
+        assert!(store.cached::<String>("room.json").is_none());
     }
 
     #[test]
