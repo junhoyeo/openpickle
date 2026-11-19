@@ -290,7 +290,7 @@ mod tests {
             synced: 120,
             ..Default::default()
         };
-        conversation.apply(vec![item("known", 120)], Vec::new());
+        conversation.apply(vec![item("known", 120)], Vec::new(), Vec::new());
         let context = SearchContext::around(
             50,
             51,
@@ -307,7 +307,11 @@ mod tests {
         assert_eq!(conversation.synced, 120);
 
         // A normal history page can still cover and persist the same items later.
-        conversation.apply(vec![item("older", 44), item("ahead", 121)], Vec::new());
+        conversation.apply(
+            vec![item("older", 44), item("ahead", 121)],
+            Vec::new(),
+            Vec::new(),
+        );
         assert_eq!(conversation.first_seq(), Some(44));
         assert_eq!(conversation.head_seq(), 121);
         assert!(!conversation.search_context.contains("older"));

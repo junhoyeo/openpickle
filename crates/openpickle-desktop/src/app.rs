@@ -2243,7 +2243,8 @@ mod tests {
             author: Some("Pickle"),
             snippet: "Earlier words".into(),
         }));
-        upsert(&mut messages, decorated);
+        let mut seqs = HashMap::from([("m".to_owned(), 1)]);
+        assert_eq!(upsert(&mut messages, &mut seqs, decorated), Some(0));
         let (after, new_starts) = build_rows(&messages, None, now);
         assert_eq!(starts, new_starts);
         let start = starts[0];

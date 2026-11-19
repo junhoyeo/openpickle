@@ -841,8 +841,8 @@ fn main() {
                                 result: Ok(()),
                             },
                             Command::LoadExplore => Update::Explore(Ok(sample_explore())),
-                            Command::LoadArchive => Update::Archive {
-                                room_id: "primary".into(),
+                            Command::WatchArchive(Some(room_id)) => Update::Archive {
+                                room_id,
                                 attachments: sample_archive(),
                                 complete: true,
                             },
@@ -876,11 +876,14 @@ fn main() {
                                 result: Err("No thumbnail exists for this sample file.".into()),
                             },
                             // Nothing is written: the sample only shows where a file would be.
-                            Command::DownloadAttachment(path) => Update::AttachmentDownloaded {
-                                result: Ok(std::path::Path::new("/Users/sample/Downloads")
-                                    .join(path.rsplit('/').next().unwrap_or_default())),
-                                path,
-                            },
+                            Command::DownloadAttachment { room_id, path } => {
+                                Update::AttachmentDownloaded {
+                                    result: Ok(std::path::Path::new("/Users/sample/Downloads")
+                                        .join(path.rsplit('/').next().unwrap_or_default())),
+                                    room_id,
+                                    path,
+                                }
+                            }
                             _ => continue,
                         };
                         updates.unbounded_send(update).ok();
