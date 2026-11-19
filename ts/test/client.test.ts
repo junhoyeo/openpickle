@@ -1,4 +1,8 @@
 import { expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm, rmdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { PickleApiError, PickleClient, decodeAccessToken } from "../src/client.ts";
 import type {
   ExploreSectionsScreen,
@@ -29,12 +33,13 @@ test("asks the token function for a token on every request", async () => {
 });
 
 test("turns an error response into PickleApiError with the server's reason", async () => {
-  const { fetch } = recorder(401, '{"detail":"token_expired"}');
+  const { calls, fetch } = recorder(401, '{"detail":"token_expired"}');
   const pickle = new PickleClient({ accessToken: "expired", fetch });
   const error = await pickle.getCharacter().catch((e: unknown) => e);
   expect(error).toBeInstanceOf(PickleApiError);
   expect((error as PickleApiError).status).toBe(401);
   expect((error as PickleApiError).detail).toBe("token_expired");
+  expect(calls).toHaveLength(1);
 });
 
 test("refreshes a login session once for concurrent requests and hands over the next token", async () => {
@@ -58,6 +63,201 @@ test("refreshes a login session once for concurrent requests and hands over the 
   await pickle.sync();
   expect(paths.filter((p) => p === "/api/login-sessions/refresh")).toHaveLength(1);
   expect(rotated).toEqual(["ls_2"]);
+});
+
+function rotatedSession(token: string, exp = Date.now() / 1000 + 300) {
+  const claims = btoa(JSON.stringify({ exp })).replace(/=+$/, "");
+  return Response.json({ login_session_jwt: `h.${claims}.s`, expires_at: "", login_session_token: token });
+}
+
+const tokenExpired = () => Response.json({ detail: "token_expired" }, { status: 401 });
+const rotationPath = "/api/login-sessions/refresh";
+
+function requestAuthorization(init: RequestInit) {
+  return new Headers(init.headers).get("authorization");
+}
+
+function refreshToken(init: RequestInit) {
+  return JSON.parse(String(init.body)).login_session_token as string;
+}
+
+test("retains an unsaved rotation and retries persistence before sending a bearer", async () => {
+  const steps: string[] = [];
+  const saveError = new Error("synthetic save failure");
+  let saves = 0;
+  const pickle = new PickleClient({
+    loginSession: {
+      token: "ls_start",
+      onRotate: (refresh) => {
+        steps.push(`save ${refresh.login_session_token}`);
+        if (++saves === 1) throw saveError;
+      },
+    },
+    fetch: async (url, init) => {
+      if (new URL(url).pathname === rotationPath) {
+        steps.push(`refresh ${refreshToken(init)}`);
+        return rotatedSession("ls_next");
+      }
+      steps.push("send request");
+      return Response.json({});
+    },
+  });
+
+  const results = await Promise.allSettled([pickle.sync(), pickle.sync()]);
+  expect(results).toEqual([
+    { status: "rejected", reason: saveError },
+    { status: "rejected", reason: saveError },
+  ]);
+  expect(steps).toEqual(["refresh ls_start", "save ls_next"]);
+  await Promise.all([pickle.sync(), pickle.sync()]);
+  expect(steps).toEqual(["refresh ls_start", "save ls_next", "save ls_next", "send request", "send request"]);
+});
+
+test("persists an aged-out retained rotation before using its refresh token", async () => {
+  const steps: string[] = [];
+  const saveError = new Error("synthetic save failure");
+  let saves = 0;
+  const pickle = new PickleClient({
+    loginSession: {
+      token: "ls_start",
+      onRotate: (refresh) => {
+        steps.push(`save ${refresh.login_session_token}`);
+        if (++saves === 1) throw saveError;
+      },
+    },
+    fetch: async (url, init) => {
+      if (new URL(url).pathname === rotationPath) {
+        const token = refreshToken(init);
+        steps.push(`refresh ${token}`);
+        return token === "ls_start" ? rotatedSession("ls_aged", 1) : rotatedSession("ls_fresh");
+      }
+      steps.push("send request");
+      return Response.json({});
+    },
+  });
+
+  expect(await pickle.sync().catch((e: unknown) => e)).toBe(saveError);
+  await pickle.sync();
+  expect(steps).toEqual(["refresh ls_start", "save ls_aged", "save ls_aged", "refresh ls_aged", "save ls_fresh", "send request"]);
+});
+
+test("a late token_expired response reuses the other request's new bearer", async () => {
+  const refreshes: string[] = [];
+  const requests: [string, string | null, RequestInit["body"]][] = [];
+  let returnLate!: (response: Response) => void;
+  const lateResponse = new Promise<Response>((resolve) => { returnLate = resolve; });
+  let markStarted!: () => void;
+  const lateStarted = new Promise<void>((resolve) => { markStarted = resolve; });
+  const pickle = new PickleClient({
+    loginSession: { token: "ls_start", onRotate: () => {} },
+    fetch: async (url, init) => {
+      const { pathname, search } = new URL(url);
+      if (pathname === rotationPath) {
+        refreshes.push(refreshToken(init));
+        return rotatedSession(`ls_${refreshes.length}`, Date.now() / 1000 + 300 + refreshes.length);
+      }
+      requests.push([pathname + search, requestAuthorization(init), init.body]);
+      if (refreshes.length > 1) return Response.json({});
+      if (pathname === "/slow") {
+        markStarted();
+        return lateResponse;
+      }
+      return tokenExpired();
+    },
+  });
+
+  const body = { id: "stable" };
+  const slow = pickle.request("POST", "/slow", { body, query: { q: "test query" } });
+  await lateStarted;
+  body.id = "changed by caller";
+  await pickle.request("GET", "/fast");
+  returnLate(tokenExpired());
+  await slow;
+  expect(refreshes).toEqual(["ls_start", "ls_1"]);
+  const [slowFirst, fastFirst, fastRetry, slowRetry] = requests;
+  expect(requests).toHaveLength(4);
+  expect(slowFirst).toEqual(["/slow?q=test%20query", fastFirst?.[1], '{"id":"stable"}']);
+  expect(slowRetry).toEqual(["/slow?q=test%20query", fastRetry?.[1], '{"id":"stable"}']);
+  expect(slowRetry?.[1]).not.toBe(slowFirst?.[1]);
+});
+
+test("a caller abort cannot discard a rotation that needs to be saved", async () => {
+  const calls: string[] = [];
+  const controller = new AbortController();
+  const pickle = new PickleClient({
+    loginSession: {
+      token: "ls_start",
+      onRotate: (refresh) => {
+        calls.push(`save ${refresh.login_session_token}`);
+        controller.abort();
+      },
+    },
+    fetch: async (url) => {
+      const { pathname } = new URL(url);
+      calls.push(pathname);
+      return pathname === rotationPath ? rotatedSession("ls_saved") : Response.json({});
+    },
+  });
+
+  const error = await pickle.send("GET", "/aborted", { signal: controller.signal }).catch((e: unknown) => e);
+  expect(error).toBe(controller.signal.reason);
+  expect(calls).toEqual([rotationPath, "save ls_saved"]);
+  await pickle.sync();
+  expect(calls).toEqual([rotationPath, "save ls_saved", "/api/sync"]);
+});
+
+test("retries only once on token_expired and never refreshes for an explicit Authorization header", async () => {
+  const calls: string[] = [];
+  const pickle = new PickleClient({
+    loginSession: { token: "ls_start", onRotate: () => {} },
+    fetch: async (url, init) => {
+      const { pathname } = new URL(url);
+      calls.push(pathname);
+      if (pathname === rotationPath) return rotatedSession(`next_${refreshToken(init)}`);
+      if (pathname === "/not-expired") return Response.json({ detail: "unauthenticated" }, { status: 401 });
+      return tokenExpired();
+    },
+  });
+
+  await expect(pickle.request("GET", "/override", { headers: { authorization: "Bearer explicit" } })).rejects.toMatchObject({ status: 401, detail: "token_expired" });
+  expect(calls).toEqual(["/override"]);
+  await expect(pickle.send("GET", "/not-expired")).rejects.toMatchObject({ status: 401, detail: "unauthenticated" });
+  expect(calls).toEqual(["/override", rotationPath, "/not-expired"]);
+  await expect(pickle.sync()).rejects.toMatchObject({ status: 401, detail: "token_expired" });
+  expect(calls).toEqual(["/override", rotationPath, "/not-expired", "/api/sync", rotationPath, "/api/sync"]);
+});
+
+test("CLI fails on a held session lock and releases its own lock on exit", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "openpickle-lock-"));
+  const file = join(directory, "session.json");
+  const lock = `${file}.lock`;
+  const cli = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
+  async function run() {
+    // An unknown command exercises credential startup without making any API calls.
+    const child = Bun.spawn([process.execPath, cli, "synthetic-unknown-command"], {
+      env: { PICKLE_SESSION_FILE: file },
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    const [code, error] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+    return { code, error };
+  }
+
+  try {
+    await writeFile(file, JSON.stringify({ login_session_token: "ls_synthetic" }));
+    await mkdir(lock);
+    const blocked = await run();
+    expect(blocked.code).not.toBe(0);
+    expect(blocked.error).toContain("Session file is locked:");
+    await rmdir(lock);
+
+    const uncontended = await run();
+    expect(uncontended.code).toBe(2);
+    expect(uncontended.error).toContain("usage:");
+    await mkdir(lock);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("a header override replaces the generated header whatever its case", async () => {

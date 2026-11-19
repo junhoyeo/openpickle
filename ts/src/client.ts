@@ -148,6 +148,16 @@ export class PickleApiError extends Error {
 
 const ALL_SOCIAL_SCOPES = ["activity", "blocked", "friends", "invite", "requests"] as const;
 
+interface SessionAccess {
+  token: string;
+  exp: number;
+}
+
+function needsRefresh(exp: number): boolean {
+  // Refresh a minute early so clock skew and slow requests do not meet an expired token.
+  return !(exp - 60 > Date.now() / 1000);
+}
+
 export class PickleClient {
   readonly baseUrl: string;
   readonly profile: ClientProfile;
@@ -155,8 +165,9 @@ export class PickleClient {
   readonly launchId: string;
   private readonly credentials: Credentials;
   private readonly fetchImpl: (url: string, init: RequestInit) => Promise<Response>;
-  /** The access token from the last login session refresh, or the refresh in flight. */
-  private sessionAccess: Promise<{ token: string; exp: number }> | undefined;
+  private sessionAccess: SessionAccess | undefined;
+  private sessionRotation: Promise<SessionAccess> | undefined;
+  private unsavedRotation: LoginSessionRefresh | undefined;
 
   constructor(options: PickleClientOptions = {}) {
     this.credentials = options.loginSession
@@ -546,34 +557,59 @@ export class PickleClient {
       "Cache-Control": "no-cache",
     };
     const auth = options.auth ?? "bearer";
+    let usesClientBearer = auth === "bearer" || auth === "token";
     if (auth === "bearer" || auth === "app") Object.assign(headers, this.identityHeaders());
-    if (auth === "bearer" || auth === "token") headers.Authorization = `Bearer ${await this.bearerToken()}`;
     if (options.body !== undefined) headers["Content-Type"] = "application/json";
-    // Header names are case-insensitive: `authorization` must replace `Authorization`, or fetch
-    // would send both values joined by a comma.
     for (const [name, value] of Object.entries(options.headers ?? {})) {
-      const existing = Object.keys(headers).find((key) => key.toLowerCase() === name.toLowerCase());
+      const lower = name.toLowerCase();
+      if (lower === "authorization") usesClientBearer = false;
+      const existing = Object.keys(headers).find((key) => key.toLowerCase() === lower);
       if (existing !== undefined) delete headers[existing];
       headers[name] = value;
     }
 
     const query = queryString(options.query);
     const separator = query === "" ? "" : path.includes("?") ? "&" : "?";
-    const response = await this.fetchImpl(this.baseUrl + path + separator + query, {
-      method,
-      headers,
-      body: options.body === undefined ? undefined : JSON.stringify(options.body),
-      signal: options.signal,
-    });
-    if (!response.ok) {
-      const text = await response.text();
-      let body: unknown = text;
-      try {
-        body = JSON.parse(text);
-      } catch {}
-      throw new PickleApiError(method, path, response.status, body);
+    const url = this.baseUrl + path + separator + query;
+    const body = options.body === undefined ? undefined : JSON.stringify(options.body);
+    const { signal } = options;
+    const execute = async (token?: string) => {
+      signal?.throwIfAborted();
+      const response = await this.fetchImpl(url, {
+        method,
+        headers: token === undefined ? headers : { ...headers, Authorization: `Bearer ${token}` },
+        body,
+        signal,
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        let errorBody: unknown = text;
+        try {
+          errorBody = JSON.parse(text);
+        } catch {}
+        throw new PickleApiError(method, path, response.status, errorBody);
+      }
+      return response;
+    };
+
+    signal?.throwIfAborted();
+    if (!usesClientBearer) return execute();
+    const { accessToken, loginSession } = this.credentials;
+    if (!loginSession) {
+      if (accessToken === undefined) throw new Error("this client is signed out; give it credentials first");
+      return execute(typeof accessToken === "function" ? await accessToken() : accessToken);
     }
-    return response;
+
+    const access = await this.getSessionAccess(loginSession);
+    try {
+      return await execute(access.token);
+    } catch (error) {
+      if (!(error instanceof PickleApiError && error.status === 401 && error.detail === "token_expired")) throw error;
+      // A late 401 must not discard a rotation completed by another request.
+      if (this.sessionAccess === access) this.sessionAccess = undefined;
+      signal?.throwIfAborted();
+      return execute((await this.getSessionAccess(loginSession)).token);
+    }
   }
 
   private signInHeaders(): Record<string, string> {
@@ -585,26 +621,31 @@ export class PickleClient {
     };
   }
 
-  private async bearerToken(): Promise<string> {
-    const { accessToken } = this.credentials;
-    if (accessToken !== undefined) return typeof accessToken === "function" ? accessToken() : accessToken;
-    if (!this.credentials.loginSession) throw new Error("this client is signed out; give it credentials first");
-    const pending = this.sessionAccess;
-    const current = await pending?.catch(() => undefined);
-    // Refresh a minute early so clock skew and slow requests do not meet an expired token.
-    if (current && current.exp - 60 > Date.now() / 1000) return current.token;
-    // One refresh at a time: two concurrent refreshes would spend the same token twice. If another
-    // caller started a refresh while this one waited, join it.
-    if (this.sessionAccess === pending) this.sessionAccess = this.refreshSession();
-    return (await this.sessionAccess!).token;
+  private getSessionAccess(session: NonNullable<Credentials["loginSession"]>): Promise<SessionAccess> {
+    if (this.sessionRotation) return this.sessionRotation;
+    if (this.sessionAccess && !needsRefresh(this.sessionAccess.exp)) return Promise.resolve(this.sessionAccess);
+    // Publish the promise before invoking onRotate, and do not pass a single request's abort signal
+    // to an exchange that may spend the token for the whole client.
+    this.sessionRotation = Promise.resolve()
+      .then(() => this.rotateSession(session))
+      .finally(() => { this.sessionRotation = undefined; });
+    return this.sessionRotation;
   }
 
-  private async refreshSession(): Promise<{ token: string; exp: number }> {
-    const session = this.credentials.loginSession!;
-    const refresh = await this.refreshLoginSession(session.token);
-    session.token = refresh.login_session_token;
-    await session.onRotate(refresh);
-    return { token: refresh.login_session_jwt, exp: decodeAccessToken(refresh.login_session_jwt).exp };
+  private async rotateSession(session: NonNullable<Credentials["loginSession"]>): Promise<SessionAccess> {
+    this.sessionAccess = undefined;
+    for (;;) {
+      const retained = this.unsavedRotation;
+      const refresh = retained ?? await this.refreshLoginSession(session.token);
+      session.token = refresh.login_session_token;
+      this.unsavedRotation = refresh;
+      await session.onRotate(refresh);
+      this.unsavedRotation = undefined;
+      const token = refresh.login_session_jwt;
+      const { exp } = decodeAccessToken(token);
+      if (retained && needsRefresh(exp)) continue;
+      return (this.sessionAccess = { token, exp });
+    }
   }
 
   private identityHeaders(): Record<string, string> {
