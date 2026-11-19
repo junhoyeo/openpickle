@@ -231,6 +231,14 @@ impl ChatView {
             .filter(|row| matches!(row.kind, RowKind::Activity(_)))
     }
 
+    #[cfg(test)]
+    pub(crate) fn visible_activity(&self) -> Option<Option<&str>> {
+        match self.activity_row().map(|row| &row.kind) {
+            Some(RowKind::Activity(label)) => Some(label.as_deref()),
+            _ => None,
+        }
+    }
+
     /// Activity is a single nonselectable row after all messages.
     pub(crate) fn set_activity(
         &mut self,

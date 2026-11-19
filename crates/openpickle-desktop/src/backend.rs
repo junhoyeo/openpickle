@@ -1524,14 +1524,12 @@ impl Live {
                     self.queue_history(last_seq);
                 }
             }
-            PickleEvent::Sync(sync) => {
-                if self.roster_rev.is_none_or(|rev| sync.rev > rev) {
-                    ReconcileWork::queue(
-                        &mut self.roster_refresh,
-                        sync.rev,
-                        ReconcileWork::ROSTER_COALESCE,
-                    );
-                }
+            PickleEvent::Sync(sync) if self.roster_rev.is_none_or(|rev| sync.rev > rev) => {
+                ReconcileWork::queue(
+                    &mut self.roster_refresh,
+                    sync.rev,
+                    ReconcileWork::ROSTER_COALESCE,
+                );
             }
             _ => {}
         }
@@ -3458,11 +3456,11 @@ mod tests {
         live.download_attachment(key("primary", "계획서.md"));
         let (room_id, path, file) = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                if let Some(Update::AttachmentDownloaded {
+                if let Update::AttachmentDownloaded {
                     room_id,
                     path,
                     result,
-                }) = received.next().await.expect("the backend is still running")
+                } = received.next().await.expect("the backend is still running")
                 {
                     break (room_id, path, result.unwrap());
                 }
@@ -3542,9 +3540,7 @@ mod tests {
                 device_id: "fixture-new-device".into(),
             };
             store.start_session(&fresh).unwrap();
-            assert!(
-                start_conversation(&store, fresh, Some("fixture-access".into()), &updates).is_ok()
-            );
+            assert!(start_conversation(&store, fresh, None, &updates).is_ok());
             assert!(matches!(
                 received.try_recv().unwrap(),
                 Update::Conversation { room_id, name, avatar: None, messages, can_send: false, .. }

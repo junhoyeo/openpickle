@@ -2338,11 +2338,14 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
-        shell.read_with(cx, |shell, _| {
+        shell.read_with(cx, |shell, cx| {
             assert_eq!(shell.room_id, "peer");
             assert_eq!(shell.messages.len(), 1);
             assert_eq!(shell.messages[0].id, "peer");
-            assert!(shell.activity.is_none());
+            let Screen::Chat(chat) = &shell.screen else {
+                panic!("chat should remain open");
+            };
+            assert_eq!(chat.read(cx).visible_activity(), None);
             assert!(!shell.can_send);
         });
         updates
@@ -2399,16 +2402,16 @@ mod tests {
         updates.unbounded_send(metadata("other", true)).unwrap();
         cx.run_until_parked();
         shell.read_with(cx, |shell, cx| {
-            assert_eq!(&*shell.room_header.name, "Renamed");
+            assert_eq!(shell.room_header.name.as_ref(), "Renamed");
             assert_eq!(shell.opening_room.as_deref(), Some("other"));
             assert!(!shell.can_send);
-            assert_eq!(shell.activity, Some(None));
             assert_eq!(shell.messages.len(), 1);
             assert_eq!(shell.messages[0].id, "existing");
             let Screen::Chat(chat) = &shell.screen else {
                 panic!("chat should remain open");
             };
             assert_eq!(chat.read(cx).draft(cx), "unfinished draft");
+            assert_eq!(chat.read(cx).visible_activity(), Some(None));
         });
     }
 
