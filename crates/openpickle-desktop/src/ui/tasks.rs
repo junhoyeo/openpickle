@@ -1,15 +1,14 @@
-//! The progress of a task Pickle handed off: a sheet over the chat with the task's plan and the
-//! log of what it has done so far. The sheet only reads. The phone app's menu, which cancels
-//! the task, is not here.
+//! The read-only progress sheet for a task Pickle handed off, with its plan and activity log.
 
 use std::{rc::Rc, sync::Arc, time::Duration};
 
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Context, Div, EventEmitter, FocusHandle, Focusable,
-    FontWeight, MouseButton, Pixels, SharedString, Task, Window, div, linear_color_stop,
-    linear_gradient, prelude::*, px, relative,
+    Animation, AnimationExt, AnyElement, App, ClipboardItem, Context, Div, EventEmitter,
+    FocusHandle, Focusable, FontWeight, ListAlignment, ListState, MouseButton, Pixels,
+    SharedString, Task, Window, div, linear_color_stop, linear_gradient, list, prelude::*, px,
+    relative,
 };
-use openpickle_api::{HandoffItem, HandoffLogNode, HandoffScreen};
+use openpickle_api::{HandoffItem, HandoffLogNode, HandoffPlanBlock, HandoffScreen};
 
 use crate::{
     content::{Block, LinkTarget, parse_message},
@@ -47,6 +46,137 @@ const TEXT_LINE: f32 = 19.25;
 /// The status of a running task under its title, in the phone app's blue for it.
 const STATUS: f32 = 13. * TRACKED;
 const RUNNING: u32 = 0x5799f5;
+/// Keep a small buffer of measured entries around the visible log.
+const LOG_OVERDRAW: f32 = 180.;
+
+#[derive(PartialEq)]
+struct TaskDetails {
+    title: String,
+    state: String,
+    requested_at_epoch_ms: f64,
+    latest_log_text: Option<String>,
+}
+
+#[derive(Default)]
+struct TaskPlan {
+    markdown: Vec<String>,
+    rows: Vec<Row>,
+}
+
+impl TaskPlan {
+    fn update(&mut self, blocks: Vec<HandoffPlanBlock>) -> bool {
+        let markdown = blocks.iter().filter_map(|block| block.markdown.as_ref());
+        if self.markdown.iter().eq(markdown) {
+            return false;
+        }
+        self.markdown = blocks
+            .into_iter()
+            .filter_map(|block| block.markdown)
+            .collect();
+        self.rows = self
+            .markdown
+            .iter()
+            .flat_map(|source| parse_message(source))
+            .filter_map(|block| match block {
+                Block::Bubble(text) => Some(Row {
+                    kind: RowKind::Part(Part::Bubble(Arc::new(text))),
+                    side: Side::Theirs,
+                    joined_above: false,
+                    joined_below: false,
+                }),
+                _ => None,
+            })
+            .collect();
+        true
+    }
+}
+
+struct LogRow {
+    text: SharedString,
+    icon: Option<&'static str>,
+    report: bool,
+    wrapped: Option<(Pixels, SharedString)>,
+}
+
+impl LogRow {
+    fn new(node: HandoffLogNode) -> Self {
+        let icon = node_icon(&node.kind);
+        let report = node.kind == "report";
+        Self {
+            text: node.text.unwrap_or(node.kind).into(),
+            icon,
+            report,
+            wrapped: None,
+        }
+    }
+
+    fn matches(&self, node: &HandoffLogNode) -> bool {
+        self.text == node.text.as_deref().unwrap_or(&node.kind)
+            && self.icon == node_icon(&node.kind)
+            && self.report == (node.kind == "report")
+    }
+
+    fn wrap(&mut self, width: Pixels, window: &Window) -> SharedString {
+        if let Some((cached_width, text)) = &self.wrapped
+            && *cached_width == width
+        {
+            return text.clone();
+        }
+        let text = keep_paths(&self.text, px(TEXT), width, window);
+        self.wrapped = Some((width, text.clone()));
+        text
+    }
+}
+
+struct TaskLog {
+    rows: Vec<LogRow>,
+    list: ListState,
+}
+
+impl TaskLog {
+    fn new() -> Self {
+        Self {
+            rows: Vec::new(),
+            // Item 0 is the log's header, including the optional plan and error.
+            list: ListState::new(1, ListAlignment::Top, px(LOG_OVERDRAW)),
+        }
+    }
+
+    fn update(&mut self, nodes: Vec<HandoffLogNode>) -> bool {
+        let unchanged = self
+            .rows
+            .iter()
+            .zip(&nodes)
+            .take_while(|(old, new)| old.matches(new))
+            .count();
+        let old_len = self.rows.len();
+        let new_len = nodes.len();
+        if unchanged == old_len && unchanged == new_len {
+            return false;
+        }
+        // Appending or truncating changes the spacing of the last shared row even when its
+        // contents haven't changed.
+        let remeasure = unchanged.min(old_len.min(new_len).saturating_sub(1));
+        let offset = self.list.logical_scroll_top();
+        self.list
+            .splice(remeasure + 1..old_len + 1, new_len - remeasure);
+        if offset.item_ix <= unchanged {
+            self.list.scroll_to(offset);
+        }
+        self.rows.truncate(unchanged);
+        self.rows
+            .extend(nodes.into_iter().skip(unchanged).map(LogRow::new));
+        true
+    }
+
+    fn text(&self) -> String {
+        self.rows
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
 
 pub enum TaskEvent {
     Close,
@@ -56,10 +186,12 @@ pub struct TaskView {
     path: String,
     /// What the handoff list said about the task, shown until its progress has been read.
     summary: HandoffItem,
-    handoff: Option<HandoffScreen>,
+    details: Option<TaskDetails>,
     error: Option<SharedString>,
+    plan: TaskPlan,
+    log: TaskLog,
     /// Whether the plan is open instead of the log.
-    plan: bool,
+    showing_plan: bool,
     expanded: bool,
     pictures: gpui::Entity<Pictures>,
     selection: SharedSelection,
@@ -77,36 +209,36 @@ impl TaskView {
         pictures: gpui::Entity<Pictures>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let clock = (summary.state == "running").then(|| {
-            cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor().timer(Duration::from_secs(1)).await;
-                    let running = this.update(cx, |this, cx| {
-                        let running = this.running();
-                        if running {
-                            cx.notify();
-                        } else {
-                            this.clock = None;
-                        }
-                        running
-                    });
-                    if !matches!(running, Ok(true)) {
-                        break;
-                    }
-                }
-            })
-        });
-        Self {
+        let mut view = Self {
             path,
             summary,
-            handoff: None,
+            details: None,
             error: None,
-            plan: false,
+            plan: TaskPlan::default(),
+            log: TaskLog::new(),
+            showing_plan: false,
             expanded: false,
             pictures,
             selection: SharedSelection::default(),
             focus: cx.focus_handle(),
-            clock,
+            clock: None,
+        };
+        view.update_clock(cx);
+        view
+    }
+
+    fn update_clock(&mut self, cx: &mut Context<Self>) {
+        if !self.running() || self.showing_plan {
+            self.clock = None;
+        } else if self.clock.is_none() {
+            self.clock = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }));
         }
     }
 
@@ -117,8 +249,7 @@ impl TaskView {
     /// Shows the sheet expanded, or its plan, without a click: for the gallery.
     pub fn show(&mut self, expanded: bool, plan: bool, cx: &mut Context<Self>) {
         self.expanded = expanded;
-        self.plan = plan;
-        cx.notify();
+        self.set_showing_plan(plan, cx);
     }
 
     /// Takes a reading of the task's progress, or the reason there is none.
@@ -131,41 +262,78 @@ impl TaskView {
         if path != self.path {
             return;
         }
-        match result {
+        let plan_was_empty = self.plan.rows.is_empty();
+        let log_was_empty = self.log.rows.is_empty();
+        let (changed, error_changed) = match result {
             Ok(handoff) => {
-                self.handoff = Some(handoff);
-                self.error = None;
+                let details = Some(TaskDetails {
+                    title: handoff.title,
+                    state: handoff.state,
+                    requested_at_epoch_ms: handoff.requested_at_epoch_ms,
+                    latest_log_text: handoff.latest_log_text,
+                });
+                let details_changed = details != self.details;
+                if details_changed {
+                    self.details = details;
+                }
+                let plan_changed = self.plan.update(handoff.plan_blocks);
+                if plan_changed {
+                    self.selection.borrow_mut().rows_changed(0);
+                    if self.plan.rows.is_empty() {
+                        self.showing_plan = false;
+                    }
+                }
+                let log_changed = self.log.update(handoff.log_nodes);
+                (
+                    details_changed || plan_changed || log_changed,
+                    self.error.take().is_some(),
+                )
             }
-            Err(reason) => self.error = Some(reason.into()),
+            Err(reason) => {
+                let error_changed = self.error.as_ref().is_none_or(|error| error != &reason);
+                if error_changed {
+                    self.error = Some(reason.into());
+                }
+                (false, error_changed)
+            }
+        };
+        if error_changed
+            || plan_was_empty != self.plan.rows.is_empty()
+            || log_was_empty != self.log.rows.is_empty()
+        {
+            self.log.list.splice(0..1, 1);
         }
-        cx.notify();
+        if changed || error_changed {
+            self.update_clock(cx);
+            cx.notify();
+        }
     }
 
     fn title(&self) -> &str {
-        self.handoff
+        self.details
             .as_ref()
-            .map_or(&self.summary.title, |handoff| &handoff.title)
+            .map_or(&self.summary.title, |details| &details.title)
     }
 
     fn running(&self) -> bool {
-        self.handoff
+        self.details
             .as_ref()
-            .map_or(&self.summary.state, |handoff| &handoff.state)
+            .map_or(&self.summary.state, |details| &details.state)
             == "running"
     }
 
     fn latest_log(&self) -> Option<&str> {
-        match &self.handoff {
-            Some(handoff) => handoff.latest_log_text.as_deref(),
+        match &self.details {
+            Some(details) => details.latest_log_text.as_deref(),
             None => self.summary.latest_log_text.as_deref(),
         }
     }
 
     fn requested_at(&self) -> f64 {
-        self.handoff
+        self.details
             .as_ref()
-            .map_or(self.summary.requested_at_epoch_ms, |handoff| {
-                handoff.requested_at_epoch_ms
+            .map_or(self.summary.requested_at_epoch_ms, |details| {
+                details.requested_at_epoch_ms
             })
     }
 
@@ -177,12 +345,28 @@ impl TaskView {
         }
     }
 
+    fn set_showing_plan(&mut self, showing_plan: bool, cx: &mut Context<Self>) {
+        self.showing_plan = showing_plan;
+        self.update_clock(cx);
+        cx.notify();
+    }
+
     fn back(&mut self, cx: &mut Context<Self>) {
-        if self.plan {
-            self.plan = false;
-            cx.notify();
+        if self.showing_plan {
+            self.set_showing_plan(false, cx);
         } else {
             cx.emit(TaskEvent::Close);
+        }
+    }
+
+    fn copy(&self, cx: &mut Context<Self>) {
+        let text = if self.showing_plan {
+            self.plan.markdown.join("\n\n")
+        } else {
+            self.log.text()
+        };
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
 
@@ -221,7 +405,11 @@ impl TaskView {
     /// The header lies over the body, which scrolls out under it.
     fn header(&self, width: Pixels, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let room = width - px(2. * (HEADER_ROW_SIDE + 44. + TITLE_GAP));
-        let title = if self.plan { "Plan" } else { self.title() };
+        let (title, can_copy) = if self.showing_plan {
+            ("Plan", !self.plan.rows.is_empty())
+        } else {
+            (self.title(), !self.log.rows.is_empty())
+        };
         let solid = 36. / (HEADER + 16.);
         div()
             .absolute()
@@ -292,35 +480,67 @@ impl TaskView {
                                     .child(fit(title, px(TEXT), FontWeight::MEDIUM, room, window)),
                             )
                             .children(
-                                (!self.plan)
+                                (!self.showing_plan)
                                     .then(|| self.status(room, window))
                                     .flatten()
                                     .map(|status| status.pt(px(0.5))),
                             ),
                     )
-                    // The phone app has the task's menu here.
-                    .child(div().size(px(44.))),
+                    .child(if can_copy {
+                        chrome("task-copy")
+                            .size(px(44.))
+                            .rounded_full()
+                            .text_size(px(12.))
+                            .cursor_pointer()
+                            .child("Copy")
+                            .on_click(cx.listener(|this, _, _, cx| this.copy(cx)))
+                            .into_any_element()
+                    } else {
+                        div().size(px(44.)).into_any_element()
+                    }),
             )
     }
 
-    fn log(&self, width: Pixels, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let handoff = self.handoff.as_ref();
-        let has_plan = handoff.is_some_and(|handoff| {
-            handoff
-                .plan_blocks
-                .iter()
-                .any(|block| block.markdown.is_some())
-        });
-        let nodes = handoff.map_or(&[][..], |handoff| handoff.log_nodes.as_slice());
-        // What a line of the log may fill: the body without the row's icon.
+    fn log(&self, width: Pixels, cx: &mut Context<Self>) -> impl IntoElement {
         let side = self.side();
         let room = width - px(2. * side + 3. + 22. + 4. + 4.5);
-        let running = self.running();
+        list(
+            self.log.list.clone(),
+            cx.processor(move |this, index: usize, window, cx| {
+                if index == 0 {
+                    return this.log_header(width, window, cx).into_any_element();
+                }
+                let last = index == this.log.rows.len();
+                let running = this.running();
+                div()
+                    .w_full()
+                    .px(px(side))
+                    .child(log_node(
+                        &mut this.log.rows[index - 1],
+                        last,
+                        running,
+                        room,
+                        window,
+                    ))
+                    .into_any_element()
+            }),
+        )
+        .size_full()
+        .pb(px(62.))
+    }
+
+    fn log_header(
+        &self,
+        width: Pixels,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let side = self.side();
         div()
             .w_full()
             .px(px(side))
             .pt(px(HEADER + 16.))
-            .pb(px(62.))
+            .pb(px(2.))
             .flex()
             .flex_col()
             .children(self.error.clone().map(|error| {
@@ -331,7 +551,7 @@ impl TaskView {
                     .text_color(theme::color(theme::TEXT_FAINT))
                     .child(error)
             }))
-            .children(has_plan.then(|| {
+            .children((!self.plan.rows.is_empty()).then(|| {
                 div().py(px(4.)).child(
                     div()
                         .id("task-plan")
@@ -343,10 +563,7 @@ impl TaskView {
                         .items_center()
                         .gap(px(4.))
                         .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.plan = true;
-                            cx.notify();
-                        }))
+                        .on_click(cx.listener(|this, _, _, cx| this.set_showing_plan(true, cx)))
                         .child(
                             div()
                                 .size(px(24.))
@@ -382,7 +599,7 @@ impl TaskView {
                         ),
                 )
             }))
-            .children((!nodes.is_empty()).then(|| {
+            .children((!self.log.rows.is_empty()).then(|| {
                 div()
                     .mt(px(2.))
                     .ml(px(12.5))
@@ -391,16 +608,6 @@ impl TaskView {
                     .rounded_full()
                     .bg(theme::color(theme::HAIRLINE))
             }))
-            .child(
-                div()
-                    .mt(px(2.))
-                    .flex()
-                    .flex_col()
-                    .children(nodes.iter().enumerate().map(|(index, node)| {
-                        let last = index + 1 == nodes.len();
-                        log_node(node, last, running, room, window)
-                    })),
-            )
     }
 
     fn plan_body(
@@ -409,17 +616,6 @@ impl TaskView {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let texts: Vec<_> = self
-            .handoff
-            .iter()
-            .flat_map(|handoff| &handoff.plan_blocks)
-            .filter_map(|block| block.markdown.as_deref())
-            .flat_map(parse_message)
-            .filter_map(|block| match block {
-                Block::Bubble(text) => Some(text),
-                _ => None,
-            })
-            .collect();
         let on_link: super::select::LinkHandler = Rc::new(|target, _, cx| {
             if let Some(LinkTarget::Web(url)) = LinkTarget::parse(target) {
                 cx.open_url(&url);
@@ -427,27 +623,21 @@ impl TaskView {
         });
         let side = self.side() + 4.;
         let wrap = width - px(2. * side);
-        let paragraphs: Vec<AnyElement> = texts
-            .iter()
-            .enumerate()
-            .map(|(index, text)| {
-                let row = Row {
-                    kind: RowKind::Part(Part::Bubble(Arc::new(text.clone()))),
-                    side: Side::Theirs,
-                    joined_above: false,
-                    joined_below: false,
-                };
-                let row = RowContext::new(
-                    window,
-                    &row,
-                    index,
-                    &self.selection,
-                    on_link.clone(),
-                    self.pictures.read(cx),
-                );
-                rich_text(text, Some(wrap), &row)
-            })
-            .collect();
+        let pictures = self.pictures.read(cx);
+        let paragraphs = self.plan.rows.iter().enumerate().map(|(index, row)| {
+            let RowKind::Part(Part::Bubble(text)) = &row.kind else {
+                unreachable!("only parsed plan paragraphs are stored");
+            };
+            let cx = RowContext::new(
+                window,
+                row,
+                index,
+                &self.selection,
+                on_link.clone(),
+                pictures,
+            );
+            rich_text(text, Some(wrap), &cx)
+        });
         div()
             .w_full()
             .px(px(side))
@@ -484,14 +674,12 @@ fn node_icon(kind: &str) -> Option<&'static str> {
 /// character reported stands out from what the task did. The last entry of a running task
 /// pulses, where the phone app has a shimmer.
 fn log_node(
-    node: &HandoffLogNode,
+    node: &mut LogRow,
     last: bool,
     running: bool,
     room: Pixels,
     window: &Window,
 ) -> AnyElement {
-    let report = node.kind == "report";
-    let text = node.text.as_deref().unwrap_or(&node.kind);
     let column = div()
         .w(px(22.))
         .flex_none()
@@ -506,7 +694,7 @@ fn log_node(
                 .items_center()
                 .justify_center()
                 .opacity(0.42)
-                .children(node_icon(&node.kind).map(|name| icon(name, 14., theme::TEXT))),
+                .children(node.icon.map(|name| icon(name, 14., theme::TEXT))),
         )
         .when(!last, |column| {
             column.child(
@@ -534,9 +722,9 @@ fn log_node(
                 .text_size(px(TEXT))
                 .line_height(px(TEXT_LINE))
                 // Opacity, not a paler color: an emoji in the text is dimmed with it.
-                .opacity(if report { 0.9 } else { 0.45 })
+                .opacity(if node.report { 0.9 } else { 0.45 })
                 .whitespace_nowrap()
-                .child(keep_paths(text, px(TEXT), room, window)),
+                .child(node.wrap(room, window)),
         );
     if last && running {
         row.with_animation(
@@ -556,10 +744,15 @@ impl Render for TaskView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let inset = if self.expanded { 0. } else { INSET };
         let width = window.viewport_size().width.min(theme::COLUMN_MAX) - px(2. * inset);
-        let body = if self.plan {
-            self.plan_body(width, window, cx).into_any_element()
+        let body = if self.showing_plan {
+            div()
+                .id("task-plan-body")
+                .size_full()
+                .overflow_y_scroll()
+                .child(self.plan_body(width, window, cx))
+                .into_any_element()
         } else {
-            self.log(width, window, cx).into_any_element()
+            self.log(width, cx).into_any_element()
         };
         let sheet = div()
             .id("task-sheet")
@@ -583,13 +776,7 @@ impl Render for TaskView {
                     cx.notify();
                 }
             }))
-            .child(
-                div()
-                    .id("task-body")
-                    .size_full()
-                    .overflow_y_scroll()
-                    .child(body),
-            )
+            .child(body)
             .child(self.header(width, window, cx));
         div()
             .absolute()
@@ -624,12 +811,187 @@ impl Focusable for TaskView {
 
 #[cfg(test)]
 mod tests {
+    use gpui::{
+        Entity, ListOffset, Modifiers, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase,
+        VisualTestContext, point, size,
+    };
+
     use super::*;
+
+    fn node(kind: &str, text: Option<&str>) -> HandoffLogNode {
+        HandoffLogNode {
+            kind: kind.into(),
+            text: text.map(str::to_owned),
+        }
+    }
+
+    fn plan_block(markdown: &str) -> HandoffPlanBlock {
+        HandoffPlanBlock {
+            r#type: "prose".into(),
+            markdown: Some(markdown.into()),
+        }
+    }
+
+    const PATH: &str = "handoffs/example";
+    const WIDTH: Pixels = px(440.);
+    const HEIGHT_PX: Pixels = px(900.);
+    const PLAN: &str = "Check the [museum hours](https://example.com/museum).";
+
+    fn open(
+        cx: &mut TestAppContext,
+        log_nodes: Vec<HandoffLogNode>,
+    ) -> (Entity<TaskView>, &mut VisualTestContext) {
+        let summary = serde_json::from_value(serde_json::json!({
+            "name": "example", "title": "Museum trip", "state": "done",
+            "requested_at_epoch_ms": 1000.0, "time_text": "Today"
+        }))
+        .unwrap();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let pictures = cx.new(|_| Pictures::default());
+            let view = TaskView::new(PATH.into(), summary, pictures, cx);
+            window.focus(&view.focus_handle(cx));
+            window.activate_window();
+            view
+        });
+        cx.simulate_resize(size(WIDTH, HEIGHT_PX));
+        view.update(cx, |view, cx| {
+            view.set_handoff(
+                PATH,
+                Ok(HandoffScreen {
+                    kind: "handoff".into(),
+                    title: "Museum trip".into(),
+                    state: "done".into(),
+                    requested_at_epoch_ms: 1_000.,
+                    latest_log_text: None,
+                    latest_log_kind: None,
+                    handoff_estimate_pct: None,
+                    plan_blocks: vec![plan_block(PLAN)],
+                    log_entries: Vec::new(),
+                    log_nodes,
+                }),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        (view, cx)
+    }
 
     #[test]
     fn the_time_of_a_task_counts_from_its_request() {
         assert_eq!(elapsed_label(1_000., 138_999.), "2:17");
         // A clock that is behind the server's does not count backwards.
         assert_eq!(elapsed_label(2_000., 1_000.), "0:00");
+    }
+
+    #[test]
+    fn unchanged_plan_markdown_reuses_the_parsed_rows() {
+        let mut plan = TaskPlan::default();
+        assert!(plan.update(vec![plan_block(PLAN)]));
+        let RowKind::Part(Part::Bubble(before)) = &plan.rows[0].kind else {
+            panic!("expected a plan paragraph");
+        };
+        let before = before.clone();
+        assert!(!plan.update(vec![plan_block(PLAN)]));
+        let RowKind::Part(Part::Bubble(after)) = &plan.rows[0].kind else {
+            panic!("expected the same plan paragraph");
+        };
+        assert!(Arc::ptr_eq(&before, after));
+        assert_eq!(after.text, "Check the museum hours.");
+        assert!(plan.update(vec![plan_block("**Completed**")]));
+        assert_eq!(plan.rows[0].texts(), ["Completed"]);
+    }
+
+    #[test]
+    fn a_log_update_keeps_the_reader_on_an_unchanged_row() {
+        let mut log = TaskLog::new();
+        let initial = || vec![node("start", None), node("shell", Some("Reading a guide"))];
+        assert!(log.update(initial()));
+        log.list.scroll_to(ListOffset {
+            item_ix: 2,
+            offset_in_item: px(5.),
+        });
+
+        let mut appended = initial();
+        appended.push(node("new_kind", None));
+        assert!(log.update(appended));
+        assert_eq!(log.list.item_count(), 4);
+        assert_eq!(log.list.logical_scroll_top().item_ix, 2);
+        assert_eq!(log.list.logical_scroll_top().offset_in_item, px(5.));
+        assert_eq!(log.text(), "start\nReading a guide\nnew_kind");
+        assert!(log.rows[2].icon.is_none());
+
+        assert!(log.update(initial()));
+        assert_eq!(log.list.item_count(), 3);
+        assert_eq!(log.list.logical_scroll_top().item_ix, 2);
+        assert_eq!(log.list.logical_scroll_top().offset_in_item, px(5.));
+        assert!(!log.update(initial()));
+        assert!(log.update(vec![node("report", Some("Guide missing"))]));
+        assert_eq!(log.list.item_count(), 2);
+        assert_eq!(log.text(), "Guide missing");
+    }
+
+    #[gpui::test]
+    fn a_long_log_wraps_only_a_window_of_entries_and_scrolls(cx: &mut TestAppContext) {
+        let log_nodes = (0..1_000)
+            .map(|index| {
+                node(
+                    "shell",
+                    Some(&format!("Checking notes/museum/{index}/guide.md")),
+                )
+            })
+            .collect();
+        let (view, cx) = open(cx, log_nodes);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.log.list.item_count(), 1_001);
+            let wrapped = view
+                .log
+                .rows
+                .iter()
+                .filter(|row| row.wrapped.is_some())
+                .count();
+            assert!((1..100).contains(&wrapped), "wrapped {wrapped} entries");
+        });
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(WIDTH / 2., HEIGHT_PX - px(100.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-260.))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.expanded);
+            assert!(view.log.list.logical_scroll_top().item_ix > 0);
+        });
+    }
+
+    #[gpui::test]
+    fn copy_uses_the_current_log_or_plan_even_after_a_refresh_error(cx: &mut TestAppContext) {
+        let log = "Read notes/museum/visitor-guide.md";
+        let (view, cx) = open(cx, vec![node("page", Some(log))]);
+        view.update(cx, |view, cx| {
+            view.set_handoff(PATH, Err("Offline".into()), cx)
+        });
+        cx.run_until_parked();
+        let copy = point(
+            WIDTH - px(INSET + HEADER_ROW_SIDE + 22.),
+            HEIGHT_PX * (1. - HEIGHT) - px(INSET) + px(HEADER_ROW_TOP + 22.),
+        );
+        cx.simulate_click(copy, Modifiers::none());
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some(log)
+        );
+
+        view.update(cx, |view, cx| view.set_showing_plan(true, cx));
+        cx.run_until_parked();
+        cx.simulate_click(copy, Modifiers::none());
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some(PLAN)
+        );
     }
 }
