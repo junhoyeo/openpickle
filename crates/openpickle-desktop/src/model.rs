@@ -161,6 +161,43 @@ pub struct Message {
     pub at: f64,
     pub side: Side,
     pub parts: Vec<Part>,
+    pub decorations: MessageDecorations,
+}
+
+impl Message {
+    pub fn part_decorations(&self, index: usize) -> MessageDecorations {
+        MessageDecorations {
+            quote: if index == 0 {
+                self.decorations.quote.clone()
+            } else {
+                None
+            },
+            reactions: if index + 1 == self.parts.len() {
+                self.decorations.reactions.clone()
+            } else {
+                None
+            },
+        }
+    }
+}
+
+/// Read-only context outside the selectable message body.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MessageDecorations {
+    pub quote: Option<Arc<Quote>>,
+    pub reactions: Option<Arc<[ReactionBadge]>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Quote {
+    pub author: Option<&'static str>,
+    pub snippet: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReactionBadge {
+    pub emoji: String,
+    pub count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -218,6 +255,7 @@ pub struct Row {
     /// between them and shrinks the gap.
     pub joined_above: bool,
     pub joined_below: bool,
+    pub decorations: MessageDecorations,
 }
 
 impl Row {
@@ -267,6 +305,11 @@ impl Row {
     /// Whether two rows draw the same thing. Parts are compared by identity, which is enough
     /// because a message's parts are parsed once and shared from then on.
     pub fn same_as(&self, other: &Row) -> bool {
+        self.same_content_as(other) && self.decorations == other.decorations
+    }
+
+    /// Whether the original selectable row still occupies the same place.
+    pub fn same_content_as(&self, other: &Row) -> bool {
         let same_kind = match (&self.kind, &other.kind) {
             (RowKind::Part(a), RowKind::Part(b)) => match (a, b) {
                 (Part::Bubble(a), Part::Bubble(b)) => Arc::ptr_eq(a, b),
@@ -318,6 +361,7 @@ pub fn build_rows(
                 side: Side::Theirs,
                 joined_above: false,
                 joined_below: false,
+                decorations: Default::default(),
             });
         }
         starts.push(rows.len());
@@ -342,6 +386,7 @@ pub fn build_rows(
                 side: message.side,
                 joined_above,
                 joined_below: false,
+                decorations: message.part_decorations(index),
             });
         }
         previous = Some(message);
@@ -352,6 +397,7 @@ pub fn build_rows(
             side: Side::Theirs,
             joined_above: false,
             joined_below: false,
+            decorations: Default::default(),
         });
     }
     (rows, starts)
@@ -389,6 +435,7 @@ mod tests {
             at,
             side,
             parts: vec![part; parts],
+            decorations: Default::default(),
         }
     }
 
@@ -418,6 +465,7 @@ mod tests {
             side: Side::Theirs,
             joined_above: false,
             joined_below: false,
+            decorations: Default::default(),
         };
         assert_eq!(row.texts(), ["photo.png", "PDF · 2 pages"]);
     }

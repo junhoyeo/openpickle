@@ -1,18 +1,23 @@
 //! Turns what the API sends into what the chat screen draws.
 
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 
 use chrono::{DateTime, Utc};
 use openpickle_api::{
     CardState, ExploreSectionsScreen, FileMeta, FriendRequest, HistoryItem, InviteMember,
-    MessageSearchItem, SocialSnapshot, UserSummary,
+    MessageSearchItem, Reaction, ReplyTo, SocialSnapshot, UserSummary,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     content::{Block, Card, CardRow, LinkTarget, RichText, SpanKind, parse_message, plain_text},
     model::{
-        Attachment, AttachmentKind, Explore, Files, Invite, Message, Offer, OfferSection, Part,
-        Person, Request, RequestOption, RequestStatus, RoomInfo, SearchResult, Side, Social,
+        Attachment, AttachmentKind, Explore, Files, Invite, Message, MessageDecorations, Offer,
+        OfferSection, Part, Person, Quote, ReactionBadge, Request, RequestOption, RequestStatus,
+        RoomInfo, SearchResult, Side, Social,
     },
 };
 
@@ -323,6 +328,14 @@ pub fn search_result(item: MessageSearchItem, room_id: &str) -> SearchResult {
 /// The message for a history item. `card_state` is the latest state of the item's request card,
 /// when it is one and has been answered or has expired.
 pub fn message(item: &HistoryItem, card_state: Option<&CardState>) -> Message {
+    message_with_reactions(item, card_state, std::iter::empty())
+}
+
+pub(crate) fn message_with_reactions<'a>(
+    item: &'a HistoryItem,
+    card_state: Option<&CardState>,
+    reactions: impl IntoIterator<Item = &'a Reaction>,
+) -> Message {
     let text = item.text.as_deref().unwrap_or_default();
     let (side, parts) = match item.role.as_str() {
         "user" => (Side::Mine, bubbles(text, false)),
@@ -410,7 +423,80 @@ pub fn message(item: &HistoryItem, card_state: Option<&CardState>) -> Message {
         at: item.at,
         side,
         parts,
+        decorations: MessageDecorations {
+            quote: item
+                .reply_to
+                .as_ref()
+                .map(|reply| Arc::new(quoted_reply(reply))),
+            reactions: reaction_badges(item, reactions),
+        },
     }
+}
+
+fn quoted_reply(reply: &ReplyTo) -> Quote {
+    const SNIPPET_GRAPHEMES: usize = 120;
+    let author = match reply.role.as_str() {
+        "user" => Some("User"),
+        "assistant" | "agent_request" => Some("Pickle"),
+        _ => None,
+    };
+    let mut snippet = reply
+        .text
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if let Some((end, _)) = snippet.grapheme_indices(true).nth(SNIPPET_GRAPHEMES) {
+        snippet.truncate(end);
+        snippet.push('…');
+    }
+    Quote { author, snippet }
+}
+
+fn reaction_badges<'a>(
+    item: &'a HistoryItem,
+    reactions: impl IntoIterator<Item = &'a Reaction>,
+) -> Option<Arc<[ReactionBadge]>> {
+    let inline = item.reactions.iter().flatten().map(|reaction| {
+        (
+            reaction.part,
+            reaction.actor.as_str(),
+            reaction.emoji.as_str(),
+        )
+    });
+    let separate = reactions
+        .into_iter()
+        .filter(|reaction| reaction.target_id == item.id)
+        .map(|reaction| {
+            (
+                reaction.part,
+                reaction.actor.as_str(),
+                reaction.emoji.as_str(),
+            )
+        });
+    // The reaction names a wire part; Markdown parsing may split one wire part into several
+    // desktop rows. Aggregate across the message without guessing a particular row or an
+    // add/remove/replace operation.
+    let mut seen = HashSet::new();
+    let mut counts = BTreeMap::new();
+    for (part, actor, emoji) in inline.chain(separate) {
+        if !actor.trim().is_empty()
+            && !emoji.trim().is_empty()
+            && !emoji.chars().any(char::is_control)
+            && seen.insert((part, actor, emoji))
+        {
+            *counts.entry(emoji).or_default() += 1;
+        }
+    }
+    (!counts.is_empty()).then(|| {
+        counts
+            .into_iter()
+            .map(|(emoji, count)| ReactionBadge {
+                emoji: emoji.to_owned(),
+                count,
+            })
+            .collect()
+    })
 }
 
 fn room_target(target: &str) -> Option<&str> {
@@ -562,6 +648,7 @@ pub fn outgoing(id: String, text: &str, seq: u64, at: f64) -> Message {
         at,
         side: Side::Mine,
         parts: bubbles(text, false),
+        decorations: Default::default(),
     }
 }
 
@@ -884,6 +971,78 @@ mod tests {
             None,
         );
         assert!(matches!(&task.parts[..], [Part::Task(title)] if &**title == "📞 전화"));
+    }
+
+    #[test]
+    fn reply_and_reaction_context_does_not_add_rows_or_selectable_text() {
+        use crate::model::build_rows;
+
+        let target = item(serde_json::json!({
+            "role": "assistant", "id": "m", "at": 1.0, "seq": 7,
+            "text": "<bubble>First **bubble**</bubble><bubble>Second bubble</bubble>",
+            "reply_to": {
+                "target_id": "not-in-local-history", "part": 0, "role": "user",
+                "text": " \nQuoted\twords\u{0000} here "
+            },
+            "reactions": [{"part": 0, "actor": "user", "emoji": "👍", "at": 2.0}]
+        }));
+        let reaction = |seq, target_id: &str, part, actor: &str| Reaction {
+            seq,
+            target_id: target_id.into(),
+            part,
+            actor: actor.into(),
+            emoji: "👍".into(),
+            at: 2.,
+        };
+        let inline_only = message(&target, None);
+        assert_eq!(
+            inline_only.decorations.reactions.as_deref().unwrap()[0].count,
+            1
+        );
+        let updated = message_with_reactions(
+            &target,
+            None,
+            &[
+                reaction(8, "m", 0, "user"), // also present inline
+                reaction(9, "m", 0, "assistant"),
+                reaction(10, "m", 20, "user"), // a different wire part, not a row index
+                reaction(11, "different-message", 0, "assistant"),
+            ],
+        );
+        let (rows, starts) = build_rows(&[updated], None, chrono::Local::now());
+        assert_eq!(starts, [1]);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1].texts(), ["First bubble"]);
+        assert_eq!(rows[2].texts(), ["Second bubble"]);
+        assert!(rows[1].joined_below && rows[2].joined_above);
+        let quote = rows[1].decorations.quote.as_deref().unwrap();
+        assert_eq!(quote.author, Some("User"));
+        assert_eq!(quote.snippet, "Quoted words here");
+        assert!(rows[1].decorations.reactions.is_none());
+        assert!(rows[2].decorations.quote.is_none());
+        assert_eq!(
+            rows[2].decorations.reactions.as_deref().unwrap(),
+            [ReactionBadge {
+                emoji: "👍".into(),
+                count: 3
+            }]
+        );
+        assert_eq!(inline_only.parts.len(), 2);
+    }
+
+    #[test]
+    fn quote_snippets_keep_whole_graphemes_and_do_not_guess_an_unknown_author() {
+        let reply = ReplyTo {
+            target_id: "target".into(),
+            part: 0,
+            text: "👩🏽‍💻".repeat(130),
+            role: "future-role".into(),
+            kind: None,
+            path: None,
+        };
+        let quote = quoted_reply(&reply);
+        assert_eq!(quote.author, None);
+        assert_eq!(quote.snippet, format!("{}…", "👩🏽‍💻".repeat(120)));
     }
 
     #[test]

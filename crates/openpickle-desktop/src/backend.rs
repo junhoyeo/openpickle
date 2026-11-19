@@ -19,7 +19,7 @@ use futures::{Stream, StreamExt, channel::mpsc::UnboundedSender as Updates};
 use openpickle_api::{
     ALL_SOCIAL_SCOPES, CardState, ClientOptions, Credentials, Error, ExploreSectionsScreen,
     HistoryItem, LoginSession, LoginSessionRefresh, MessageContext, PickleClient, PickleEvent,
-    SendMessageOptions, SocialSnapshot,
+    Reaction, SendMessageOptions, SocialSnapshot,
     events::{ChatEvent, RoomEvent},
 };
 use serde::{Deserialize, Serialize};
@@ -302,6 +302,8 @@ enum Record {
     Item(Box<HistoryItem>),
     #[serde(rename = "card")]
     Card(CardState),
+    #[serde(rename = "reaction")]
+    Reaction(Reaction),
     /// How far the log follows the server: the `next_after` of the last page written.
     #[serde(rename = "synced")]
     Synced(i64),
@@ -370,6 +372,8 @@ struct Conversation {
     /// Sparse search neighbors are not logged and cannot advance either history cursor.
     search_context: HashSet<String>,
     card_states: HashMap<String, CardState>,
+    /// Reactions indexed by target message id and reaction sequence number.
+    reactions: HashMap<String, HashMap<i64, Reaction>>,
     /// Sequence number up to which `history/delta` has been read.
     synced: i64,
     /// `None` until the room is known.
@@ -390,6 +394,9 @@ impl Conversation {
             Record::Card(state) => {
                 conversation.card_states.insert(state.id.clone(), state);
             }
+            Record::Reaction(reaction) => {
+                conversation.remember_reaction(reaction);
+            }
             Record::Synced(seq) => conversation.synced = seq,
         });
         conversation.log = Some(log);
@@ -397,7 +404,36 @@ impl Conversation {
     }
 
     fn message(&self, item: &HistoryItem) -> Message {
-        convert::message(item, self.card_states.get(&item.id))
+        let reactions = self
+            .reactions
+            .get(&item.id)
+            .into_iter()
+            .flat_map(HashMap::values);
+        convert::message_with_reactions(item, self.card_states.get(&item.id), reactions)
+    }
+
+    /// Accepts a record once, whether it arrives from history or the live stream first.
+    fn remember_reaction(&mut self, reaction: Reaction) -> bool {
+        let entry = self
+            .reactions
+            .entry(reaction.target_id.clone())
+            .or_default()
+            .entry(reaction.seq);
+        if let std::collections::hash_map::Entry::Vacant(entry) = entry {
+            entry.insert(reaction);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn hear_reaction(&mut self, reaction: Reaction) -> Option<Message> {
+        let target_id = reaction.target_id.clone();
+        if self.remember_reaction(reaction) {
+            self.items.get(&target_id).map(|item| self.message(item))
+        } else {
+            None
+        }
     }
 
     /// The pictures and files of every message, newest first.
@@ -425,9 +461,14 @@ impl Conversation {
         messages
     }
 
-    /// Takes in items and card states and returns the messages they changed.
-    fn apply(&mut self, items: Vec<HistoryItem>, card_states: Vec<CardState>) -> Vec<Message> {
-        let mut changed: Vec<String> = Vec::with_capacity(items.len() + card_states.len());
+    /// Takes in history records and returns the messages they changed.
+    fn apply(
+        &mut self,
+        items: Vec<HistoryItem>,
+        card_states: Vec<CardState>,
+        reactions: Vec<Reaction>,
+    ) -> Vec<Message> {
+        let mut changed = Vec::with_capacity(items.len() + card_states.len() + reactions.len());
         for state in card_states {
             changed.push(state.id.clone());
             self.card_states.insert(state.id.clone(), state);
@@ -436,6 +477,12 @@ impl Conversation {
             changed.push(item.id.clone());
             self.search_context.remove(&item.id);
             self.items.insert(item.id.clone(), item);
+        }
+        for reaction in reactions {
+            let target_id = reaction.target_id.clone();
+            if self.remember_reaction(reaction) {
+                changed.push(target_id);
+            }
         }
         changed.sort();
         changed.dedup();
@@ -1059,13 +1106,14 @@ where
                 .map(|item| Record::Item(Box::new(item)))
                 .collect();
             records.extend(delta.card_states.iter().cloned().map(Record::Card));
+            records.extend(delta.reactions.iter().cloned().map(Record::Reaction));
             records.push(Record::Synced(delta.next_after));
             log.append(&records);
         }
 
         let advanced = delta.next_after > conversation.synced;
         conversation.synced = delta.next_after.max(conversation.synced);
-        let changed = conversation.apply(delta.items, delta.card_states);
+        let changed = conversation.apply(delta.items, delta.card_states, delta.reactions);
         if !changed.is_empty() {
             page_applied(changed);
         }
@@ -1426,6 +1474,32 @@ impl Live {
                     });
                 }
             }
+            PickleEvent::Chat(ChatEvent::Reaction {
+                seq,
+                target_id,
+                part,
+                actor,
+                emoji,
+                at,
+                ..
+            }) => {
+                if !self.character_room.is_empty()
+                    && self.conversation.room_id == self.character_room
+                    && let Some(message) = self.conversation.hear_reaction(Reaction {
+                        seq,
+                        target_id,
+                        part,
+                        actor,
+                        emoji,
+                        at,
+                    })
+                {
+                    self.send(Update::Upsert {
+                        room_id: self.character_room.clone(),
+                        messages: vec![message],
+                    });
+                }
+            }
             PickleEvent::Chat(ChatEvent::Pending { on }) => {
                 if self.conversation.room_id == self.character_room {
                     self.send(Update::Activity {
@@ -1583,11 +1657,14 @@ impl Live {
                 .map(|item| Record::Item(Box::new(item)))
                 .collect();
             records.extend(page.card_states.iter().cloned().map(Record::Card));
+            records.extend(page.reactions.iter().cloned().map(Record::Reaction));
             if !records.is_empty() {
                 log.append(&records);
             }
         }
-        let changed = self.conversation.apply(page.messages, page.card_states);
+        let changed = self
+            .conversation
+            .apply(page.messages, page.card_states, page.reactions);
         if !changed.is_empty() {
             self.send(Update::Upsert {
                 room_id: self.conversation.room_id.clone(),
@@ -3362,7 +3439,7 @@ mod tests {
             "file_meta": {"attachments/2026-11-05/계획서.md": {"name": "계획서.md", "size": 23}},
         }))
         .unwrap();
-        live.conversation.apply(vec![item], vec![]);
+        live.conversation.apply(vec![item], vec![], vec![]);
 
         let key = |room_id: &str, file: &str| DownloadKey {
             room_id: room_id.into(),
@@ -3600,6 +3677,7 @@ mod tests {
                 "attachments": ["attachments/2026-11-16/a.png"],
             }))],
             Vec::new(),
+            Vec::new(),
         );
         let announced = serde_json::json!({ "role": "user", "id": "m", "text": "사진 보낼게", "at": 10.0, "seq": 7 });
         assert!(conversation.hear(item(announced)).is_some());
@@ -3770,6 +3848,92 @@ mod tests {
         log.append(&[Record::Synced(4)]);
         assert_eq!(std::fs::read(&path).unwrap().as_slice(), data.as_slice());
         assert_eq!(Conversation::load(&store, "primary").synced, 1);
+    }
+
+    #[tokio::test]
+    async fn live_reactions_only_update_the_primary_rooms_matching_message() {
+        let server = HistoryServer::start();
+        let (mut live, mut received) = fixture_live("live-reaction", &server);
+        let target: HistoryItem = serde_json::from_value(serde_json::json!({
+            "role": "user", "id": "m", "text": "Synthetic message", "at": 1.0, "seq": 7
+        }))
+        .unwrap();
+        let event = || {
+            PickleEvent::Chat(ChatEvent::Reaction {
+                id: "reaction-8".into(),
+                seq: 8,
+                target_id: "m".into(),
+                part: 0,
+                actor: "assistant".into(),
+                emoji: "👍".into(),
+                at: 2.,
+                prev_seq: 7,
+            })
+        };
+
+        let mut seed = live
+            .conversation
+            .apply(vec![target.clone()], vec![], vec![]);
+        assert!(seed.pop().unwrap().decorations.reactions.is_none());
+        let cursor = live.conversation.synced;
+        live.handle(event());
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Update::Upsert { room_id, messages }
+                if room_id == "primary" && messages[0].id == "m"
+                    && messages[0].decorations.reactions.as_deref().unwrap()[0].emoji == "👍"
+        ));
+        live.handle(event());
+        assert!(received.try_recv().is_err());
+        assert_eq!(live.conversation.synced, cursor);
+
+        live.conversation = Conversation::load(&live.store, "peer");
+        live.conversation.apply(vec![target], vec![], vec![]);
+        live.handle(event());
+        assert!(received.try_recv().is_err());
+        assert!(
+            live.conversation.messages()[0]
+                .decorations
+                .reactions
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_reaction_before_its_target_survives_history_replay_without_double_counting() {
+        let root = std::env::temp_dir().join(format!(
+            "openpickle-test-reactions-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::at(root.clone()).unwrap();
+        let mut log = HistoryLog::new(&store, "primary");
+        let reaction = Reaction {
+            seq: 8,
+            target_id: "m".into(),
+            part: 0,
+            actor: "assistant".into(),
+            emoji: "👍".into(),
+            at: 2.,
+        };
+        log.append(&[Record::Reaction(reaction.clone()), Record::Synced(8)]);
+        let mut conversation = Conversation::load(&store, "primary");
+        assert!(conversation.messages().is_empty());
+        assert_eq!(conversation.synced, 8);
+        let target = serde_json::from_value(serde_json::json!({
+            "role": "user", "id": "m", "text": "Synthetic older message", "at": 1.0, "seq": 7
+        }))
+        .unwrap();
+        let messages = conversation.apply(vec![target], vec![], vec![reaction]);
+        let badges = messages[0].decorations.reactions.as_deref().unwrap();
+        assert_eq!(
+            badges,
+            [crate::model::ReactionBadge {
+                emoji: "👍".into(),
+                count: 1
+            }]
+        );
+        assert_eq!(conversation.synced, 8);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

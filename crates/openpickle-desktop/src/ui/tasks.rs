@@ -83,6 +83,7 @@ impl TaskPlan {
                     side: Side::Theirs,
                     joined_above: false,
                     joined_below: false,
+                    decorations: Default::default(),
                 }),
                 _ => None,
             })
