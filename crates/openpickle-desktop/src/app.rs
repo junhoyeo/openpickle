@@ -1,22 +1,26 @@
 //! The root view: shows sign-in or the signed-in sections, and applies what the backend
 //! reports.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use chrono::Local;
+use chrono::{Local, NaiveDate};
 use futures::{StreamExt, channel::mpsc::UnboundedReceiver};
 use gpui::{
-    AnyView, Context, Entity, Focusable, FontWeight, ImageSource, SharedString, Subscription, Task,
-    Window, div, prelude::*, px,
+    AnyView, Context, Entity, Focusable, FontWeight, ImageSource, PromptButton, PromptLevel,
+    SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
     content::LinkTarget,
     convert,
-    model::{Message, Part, RoomInfo, Social, UNCONFIRMED_SEQ, build_rows},
+    model::{Attachment, Message, Part, RoomInfo, Social, UNCONFIRMED_SEQ},
     phone::CallSummary,
-    protocol::{Command, HandoffCard, Update},
+    protocol::{Command, HandoffCard, RoomMetadata, SearchRequest, Update},
     theme,
     ui::{
         Identity, OpenArchive, OpenChat, OpenExplore, OpenFriends, OpenPhoneCalls, OpenProfile,
@@ -42,6 +46,8 @@ enum Screen {
     Login(Entity<LoginView>),
     /// Signed in. The chat always exists; the other sections are made when first opened.
     Chat(Entity<ChatView>),
+    /// The user confirmed local sign-out; the backend is clearing the account.
+    SigningOut,
     /// The backend stopped; the text says why.
     Failed(SharedString),
 }
@@ -75,10 +81,14 @@ pub struct Shell {
     /// The search screen. It is kept when it closes, so that opening it again shows the same
     /// search: a result is opened to read around it, and then usually the next one.
     search: Option<Entity<SearchView>>,
+    search_generation: u64,
+    pending_search: Option<u64>,
     /// The character's name and picture, for the header of every section.
     identity: Identity,
     /// The pictures on disk, which the sections draw from.
     pictures: Entity<Pictures>,
+    /// GPUI caches decoded images by path, and a different account can reuse the same path.
+    account_images: HashSet<PathBuf>,
     /// The friends and the invite link as last read.
     social: Option<Social>,
     /// The other chat rooms as last listed.
@@ -92,6 +102,8 @@ pub struct Shell {
     pending_phone_task: Option<String>,
     /// The open conversation, oldest first.
     messages: Vec<Message>,
+    /// Lookup by message ID without scanning history. Vec indexes would shift on insertion.
+    message_seqs: HashMap<String, u64>,
     room_id: String,
     is_character: bool,
     can_send: bool,
@@ -105,9 +117,9 @@ pub struct Shell {
     sent: u64,
     /// The offers that messages on their way ask for, by the message's id.
     offers_asked: std::collections::HashMap<String, String>,
-    activity: Option<Option<String>>,
     /// For each message, the index of its first row in the chat's list.
     row_starts: Vec<usize>,
+    row_date: Option<NaiveDate>,
     _screen_events: Option<Subscription>,
     _section_events: Vec<Subscription>,
     _over_events: Option<Subscription>,
@@ -140,8 +152,11 @@ impl Shell {
             profile: None,
             over: None,
             search: None,
+            search_generation: 0,
+            pending_search: None,
             identity: Identity::default(),
             pictures: cx.new(|_| Pictures::default()),
+            account_images: HashSet::new(),
             social: None,
             rooms: Vec::new(),
             calls: Vec::new(),
@@ -149,6 +164,7 @@ impl Shell {
             active_task: None,
             pending_phone_task: None,
             messages: Vec::new(),
+            message_seqs: HashMap::new(),
             room_id: String::new(),
             is_character: true,
             can_send: false,
@@ -160,8 +176,8 @@ impl Shell {
             notice: None,
             sent: 0,
             offers_asked: std::collections::HashMap::new(),
-            activity: None,
             row_starts: Vec::new(),
+            row_date: None,
             _screen_events: None,
             _section_events: Vec::new(),
             _over_events: None,
@@ -171,11 +187,21 @@ impl Shell {
         };
         // The backend started before the window did, so the cached conversation is usually
         // waiting already. Applying it here puts it in the very first frame.
-        while let Ok(update) = updates.try_recv() {
+        let mut next = updates.try_recv().ok();
+        while let Some(mut update) = next {
+            next = coalesce_upserts(&mut update, &mut updates);
             shell.apply(update, window, cx);
+            next = next.or_else(|| updates.try_recv().ok());
         }
         shell._updates = cx.spawn_in(window, async move |this, cx| {
-            while let Some(update) = updates.next().await {
+            let mut next = None;
+            loop {
+                let first = match next.take() {
+                    Some(update) => Some(update),
+                    None => updates.next().await,
+                };
+                let Some(mut update) = first else { break };
+                next = coalesce_upserts(&mut update, &mut updates);
                 let applied = this.update_in(cx, |this, window, cx| this.apply(update, window, cx));
                 if applied.is_err() {
                     break;
@@ -186,14 +212,33 @@ impl Shell {
     }
 
     fn apply(&mut self, update: Update, window: &mut Window, cx: &mut Context<Self>) {
+        // An operation already in flight can finish before the backend sees SignOut.
+        if matches!(self.screen, Screen::SigningOut)
+            && !matches!(update, Update::SignedOut | Update::Failed(_))
+        {
+            return;
+        }
+        match &update {
+            Update::Conversation {
+                avatar: Some(path), ..
+            }
+            | Update::Identity {
+                avatar: Some(path), ..
+            }
+            | Update::AttachmentPreview {
+                result: Ok(path), ..
+            } => {
+                self.account_images.insert(path.clone());
+            }
+            Update::Pictures(pictures) => {
+                self.account_images
+                    .extend(pictures.iter().map(|(_, path)| path.clone()));
+            }
+            _ => {}
+        }
         match update {
             Update::SignedOut => {
-                self.messages.clear();
-                self.forget_account();
-                self.pictures.update(cx, |pictures, cx| {
-                    *pictures = Pictures::default();
-                    cx.notify();
-                });
+                self.forget_account(cx);
                 self.show_login(window, cx)
             }
             Update::CodeSent => {
@@ -215,6 +260,13 @@ impl Shell {
                 messages,
             } => {
                 let changed_room = room_id != self.room_id;
+                let awaiting_other_room = self.opening_room.as_deref().is_some_and(|requested| {
+                    if requested.is_empty() {
+                        !is_character || room_id.is_empty()
+                    } else {
+                        requested != room_id
+                    }
+                });
                 if changed_room {
                     if let Screen::Chat(chat) = &self.screen {
                         self.drafts
@@ -240,10 +292,11 @@ impl Shell {
                 self.room_id = room_id;
                 self.is_character = is_character;
                 self.can_send = can_send;
-                self.opening_room = None;
-                self.notice = None;
-                open_conversation(&mut self.messages, messages);
-                self.activity = None;
+                if !awaiting_other_room {
+                    self.opening_room = None;
+                    self.notice = None;
+                }
+                self.message_seqs = open_conversation(&mut self.messages, messages);
                 self.show_chat(window, cx);
                 self.room_header = Identity {
                     name: name.clone().into(),
@@ -256,31 +309,69 @@ impl Shell {
                     let draft = self.drafts.get(&self.room_id).cloned().unwrap_or_default();
                     chat.update(cx, |chat, cx| {
                         if changed_room {
-                            chat.switch_room(can_send, &draft, cx);
+                            chat.switch_room(can_send && !awaiting_other_room, &draft, cx);
                         }
-                        chat.set_can_send(can_send, cx);
+                        chat.set_can_send(can_send && !awaiting_other_room, cx);
+                        chat.set_activity(None, cx);
                         chat.set_identity(
                             self.room_header.name.clone(),
                             self.room_header.avatar.clone(),
                             cx,
                         );
                     });
-                    if self.tab == Tab::Chat {
+                    if self.tab == Tab::Chat && !self.searching() {
                         window.focus(&chat.focus_handle(cx));
                     }
                 }
                 self.show_active_task(cx);
                 self.refresh_room_avatar(cx);
-                self.refresh_rows(cx);
-                if self.tab == Tab::Archive {
-                    self.commands.send(Command::LoadArchive).ok();
+                self.refresh_rows(0, cx);
+                if self.tab == Tab::Archive && changed_room && !self.room_id.is_empty() {
+                    self.commands
+                        .send(Command::WatchArchive(Some(self.room_id.clone())))
+                        .ok();
                 }
                 self.report_reading(window);
-                if is_character && let Some(action) = self.after_primary.take() {
+                if is_character
+                    && !awaiting_other_room
+                    && let Some(action) = self.after_primary.take()
+                {
                     match action {
                         PrimaryAction::Search => self.open_search(window, cx),
                         PrimaryAction::Ask { text, offer } => self.send(&text, Some(offer), cx),
                     }
+                }
+            }
+            Update::RoomMetadata(RoomMetadata {
+                room_id,
+                is_character,
+                can_send,
+                name,
+                avatar,
+            }) => {
+                if room_id == self.room_id {
+                    self.is_character = is_character;
+                    self.can_send = can_send;
+                    let avatar = avatar.map(ImageSource::from);
+                    self.room_header = Identity {
+                        name: name.clone().into(),
+                        avatar: avatar.clone(),
+                    };
+                    if is_character {
+                        self.set_identity(name, avatar, cx);
+                    }
+                    if let Screen::Chat(chat) = &self.screen {
+                        chat.update(cx, |chat, cx| {
+                            chat.set_can_send(can_send && self.opening_room.is_none(), cx);
+                            chat.set_identity(
+                                self.room_header.name.clone(),
+                                self.room_header.avatar.clone(),
+                                cx,
+                            );
+                        });
+                    }
+                    self.show_active_task(cx);
+                    self.refresh_room_avatar(cx);
                 }
             }
             Update::Identity { name, avatar } => {
@@ -288,10 +379,15 @@ impl Shell {
             }
             Update::Upsert { room_id, messages } => {
                 if room_id == self.room_id {
-                    for message in messages {
-                        upsert(&mut self.messages, message);
+                    let first_changed = messages
+                        .into_iter()
+                        .filter_map(|message| {
+                            upsert(&mut self.messages, &mut self.message_seqs, message)
+                        })
+                        .min();
+                    if let Some(first_changed) = first_changed {
+                        self.refresh_rows(first_changed, cx);
                     }
-                    self.refresh_rows(cx);
                 }
             }
             Update::SendFailed {
@@ -300,10 +396,11 @@ impl Shell {
                 reason,
             } => {
                 if room_id == self.room_id {
-                    mark_not_sent(&mut self.messages, &id, &reason);
-                    self.refresh_rows(cx);
+                    if let Some(index) = mark_not_sent(&mut self.messages, &id, &reason) {
+                        self.refresh_rows(index, cx);
+                    }
                 } else if let Some(pending) = self.pending.get_mut(&room_id) {
-                    mark_not_sent(pending, &id, &reason);
+                    let _ = mark_not_sent(pending, &id, &reason);
                 }
                 if let (Some(offer), Some(explore)) = (self.offers_asked.remove(&id), &self.explore)
                 {
@@ -311,9 +408,10 @@ impl Shell {
                 }
             }
             Update::Activity { room_id, activity } => {
-                if room_id == self.room_id {
-                    self.activity = activity;
-                    self.refresh_rows(cx);
+                if room_id == self.room_id
+                    && let Screen::Chat(chat) = &self.screen
+                {
+                    chat.update(cx, |chat, cx| chat.set_activity(activity, cx));
                 }
             }
             Update::RoomOpenFailed { room_id, reason } => {
@@ -339,7 +437,27 @@ impl Shell {
                     view.update(cx, |view, cx| view.loaded(result, cx));
                 }
             }
-            Update::AttachmentDownloaded { path, result } => {
+            Update::AttachmentDownloadProgress {
+                room_id,
+                path,
+                received,
+                total,
+            } => {
+                if room_id == self.room_id
+                    && let Some(Over::Attachment(view)) = &self.over
+                    && view.read(cx).path() == path
+                {
+                    view.update(cx, |view, cx| view.download_progress(received, total, cx));
+                }
+            }
+            Update::AttachmentDownloaded {
+                room_id,
+                path,
+                result,
+            } => {
+                if room_id != self.room_id {
+                    return;
+                }
                 if let Some(Over::Attachment(view)) = &self.over
                     && view.read(cx).path() == path
                 {
@@ -426,9 +544,40 @@ impl Shell {
                     drawer.update(cx, |drawer, cx| drawer.set_rooms(rooms, cx));
                 }
             }
-            Update::Found { query, results } => {
+            Update::Found { request, results } => {
+                if self.accept_search(&request)
+                    && let Some(search) = &self.search
+                {
+                    search.update(cx, |search, cx| search.found(results, cx));
+                }
+            }
+            Update::SearchResultOpened {
+                request,
+                seq,
+                result,
+            } => {
+                if !self.accept_search(&request) {
+                    return;
+                }
+                let reason = match result {
+                    Ok(messages) => {
+                        self.apply(
+                            Update::Upsert {
+                                room_id: request.room_id,
+                                messages,
+                            },
+                            window,
+                            cx,
+                        );
+                        if self.show_message(seq, window, cx) {
+                            return;
+                        }
+                        "This message can no longer be shown. Choose another result.".into()
+                    }
+                    Err(reason) => reason.into(),
+                };
                 if let Some(search) = &self.search {
-                    search.update(cx, |search, cx| search.found(&query, results, cx));
+                    search.update(cx, |search, cx| search.set_opening(reason, cx));
                 }
             }
             Update::Social(social) => {
@@ -459,7 +608,8 @@ impl Shell {
                 attachments,
                 complete,
             } => {
-                if room_id == self.room_id
+                if self.tab == Tab::Archive
+                    && room_id == self.room_id
                     && let Some(archive) = &self.archive
                 {
                     archive.update(cx, |archive, cx| {
@@ -475,17 +625,15 @@ impl Shell {
                 self.refresh_room_avatar(cx);
             }
             Update::Failed(reason) => {
-                self.forget_account();
-                self._screen_events = None;
+                self.forget_account(cx);
                 self.screen = Screen::Failed(reason.into());
                 cx.notify();
             }
         }
     }
 
-    /// Drops what belongs to the signed-in account besides the conversation: the other
-    /// sections, what is open on top, and the search with what it found.
-    fn forget_account(&mut self) {
+    /// Drops every local projection of the signed-in account before another one can open.
+    fn forget_account(&mut self, cx: &mut Context<Self>) {
         self.tab = Tab::Chat;
         self.explore = None;
         self.friends = None;
@@ -493,12 +641,24 @@ impl Shell {
         self.profile = None;
         self.over = None;
         self.search = None;
+        self.pending_search = None;
         self.social = None;
         self.rooms.clear();
         self.calls.clear();
         self.tasks.clear();
         self.active_task = None;
         self.pending_phone_task = None;
+        self.messages.clear();
+        self.message_seqs.clear();
+        self.identity = Identity::default();
+        self.room_header = Identity::default();
+        self.pictures = cx.new(|_| Pictures::default());
+        for path in self.account_images.drain() {
+            ImageSource::from(path).remove_asset(cx);
+        }
+        self.row_starts.clear();
+        self.sent = 0;
+        self.is_character = true;
         self.drafts.clear();
         self.pending.clear();
         self.offers_asked.clear();
@@ -507,6 +667,7 @@ impl Shell {
         self.after_primary = None;
         self.notice = None;
         self.can_send = false;
+        self._screen_events = None;
         self._section_events.clear();
         self._over_events = None;
         self._search_events = None;
@@ -516,15 +677,16 @@ impl Shell {
         if self.is_character {
             return;
         }
-        if let Some(room) = self.rooms.iter().find(|room| room.room_id == self.room_id)
-            && let Some(avatar) = self.pictures.read(cx).get(&room.picture)
-        {
-            self.room_header.avatar = Some(avatar.clone());
-            if let Screen::Chat(chat) = &self.screen {
-                chat.update(cx, |chat, cx| {
-                    chat.set_identity(self.room_header.name.clone(), Some(avatar), cx)
-                });
-            }
+        let avatar = self
+            .rooms
+            .iter()
+            .find(|room| room.room_id == self.room_id)
+            .and_then(|room| self.pictures.read(cx).get(&room.picture));
+        self.room_header.avatar = avatar.clone();
+        if let Screen::Chat(chat) = &self.screen {
+            chat.update(cx, |chat, cx| {
+                chat.set_identity(self.room_header.name.clone(), avatar, cx)
+            });
         }
     }
 
@@ -557,6 +719,39 @@ impl Shell {
         if let Some(Over::Phone(phone)) = &self.over {
             phone.update(cx, |phone, cx| phone.set_identity(identity.clone(), cx));
         }
+    }
+
+    fn confirm_sign_out(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Screen::Chat(chat) = &self.screen else {
+            return;
+        };
+        let account_view = chat.entity_id();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Sign out on this computer?",
+            Some("This removes the saved sign-in and cached conversations from OpenPickle. Your Pickle account and files saved to Downloads will not change."),
+            &[PromptButton::cancel("Cancel"), PromptButton::new("Sign out")],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if !matches!(answer.await, Ok(1)) {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                if !matches!(&this.screen, Screen::Chat(chat) if chat.entity_id() == account_view) {
+                    return;
+                }
+                this.forget_account(cx);
+                this.screen = if this.commands.send(Command::SignOut).is_ok() {
+                    Screen::SigningOut
+                } else {
+                    Screen::Failed("Could not sign out: the backend already stopped.".into())
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn show_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -610,6 +805,9 @@ impl Shell {
     fn open_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.screen, Screen::Chat(_)) {
             return;
+        }
+        if self.tab == Tab::Archive && tab != Tab::Archive {
+            self.commands.send(Command::WatchArchive(None)).ok();
         }
         match tab {
             Tab::Chat => {}
@@ -685,7 +883,17 @@ impl Shell {
                             ArchiveEvent::Menu => this.open_drawer(window, cx),
                             ArchiveEvent::Invite => this.open_invite(window, cx),
                             ArchiveEvent::Open(tab) => this.open_tab(*tab, window, cx),
-                            ArchiveEvent::ShowInChat(seq) => this.show_message(*seq, window, cx),
+                            ArchiveEvent::ShowInChat(seq) => {
+                                this.show_message(*seq, window, cx);
+                            }
+                            ArchiveEvent::PreviewFile(path) | ArchiveEvent::DownloadFile(path) => {
+                                this.open_archive_file(
+                                    path,
+                                    matches!(event, ArchiveEvent::DownloadFile(_)),
+                                    window,
+                                    cx,
+                                );
+                            }
                             ArchiveEvent::Load(paths) => {
                                 this.commands
                                     .send(Command::LoadAttachments(paths.clone()))
@@ -695,7 +903,11 @@ impl Shell {
                     ));
                     self.archive = Some(archive);
                 }
-                self.commands.send(Command::LoadArchive).ok();
+                if !self.room_id.is_empty() {
+                    self.commands
+                        .send(Command::WatchArchive(Some(self.room_id.clone())))
+                        .ok();
+                }
             }
             Tab::Profile => {
                 if self.profile.is_none() {
@@ -708,6 +920,7 @@ impl Shell {
                             ProfileEvent::Menu => this.open_drawer(window, cx),
                             ProfileEvent::Invite => this.open_invite(window, cx),
                             ProfileEvent::Open(tab) => this.open_tab(*tab, window, cx),
+                            ProfileEvent::SignOut => this.confirm_sign_out(window, cx),
                             ProfileEvent::Reload => {
                                 this.commands.send(Command::LoadProfile).ok();
                             }
@@ -768,6 +981,7 @@ impl Shell {
             Some(Over::Task(_)) => {
                 self.commands.send(Command::WatchHandoff(None)).ok();
             }
+            Some(Over::Search) if !matches!(over, Some(Over::Search)) => self.cancel_search(),
             _ => {}
         }
         self.over = over;
@@ -986,12 +1200,35 @@ impl Shell {
                 self._search_events = Some(cx.subscribe_in(
                     &search,
                     window,
-                    |this, _, event, window, cx| match event {
-                        SearchEvent::Query(query) => {
-                            this.commands.send(Command::Search(query.clone())).ok();
+                    |this, view, event, window, cx| {
+                        if !this.searching() || this.opening_room.is_some() {
+                            return;
                         }
-                        SearchEvent::Open(seq) => this.show_message(*seq, window, cx),
-                        SearchEvent::Close => this.close_over(window, cx),
+                        match event {
+                            SearchEvent::Edited => this.cancel_search(),
+                            SearchEvent::Query(query) => {
+                                if let Err(reason) = this.start_search(|request| Command::Search {
+                                    request,
+                                    query: query.clone(),
+                                }) {
+                                    view.update(cx, |view, cx| view.found(Err(reason), cx));
+                                }
+                            }
+                            SearchEvent::Open(seq) => {
+                                this.cancel_search();
+                                if this.show_message(*seq, window, cx) {
+                                    return;
+                                }
+                                let note = match this.start_search(|request| {
+                                    Command::OpenSearchResult { request, seq: *seq }
+                                }) {
+                                    Ok(()) => "Opening message…".into(),
+                                    Err(reason) => reason.into(),
+                                };
+                                view.update(cx, |view, cx| view.set_opening(note, cx));
+                            }
+                            SearchEvent::Close => this.close_over(window, cx),
+                        }
                     },
                 ));
                 self.search = Some(search.clone());
@@ -1000,15 +1237,57 @@ impl Shell {
         };
         window.focus(&search.focus_handle(cx));
         self._over_events = None;
+        let was_open = self.searching();
         self.set_over(Some(Over::Search));
+        if !was_open {
+            search.update(cx, |search, cx| search.reopen(cx));
+        }
         self.report_reading(window);
         cx.notify();
     }
 
-    /// Whether the search screen is open.
-    #[cfg(test)]
     fn searching(&self) -> bool {
         matches!(self.over, Some(Over::Search))
+    }
+
+    fn start_search(
+        &mut self,
+        command: impl FnOnce(SearchRequest) -> Command,
+    ) -> Result<(), String> {
+        if self.room_id.is_empty() {
+            return Err("Wait for the conversation to connect, then search again.".into());
+        }
+        self.search_generation += 1;
+        let id = self.search_generation;
+        let request = SearchRequest {
+            room_id: self.room_id.clone(),
+            id,
+        };
+        self.pending_search = None;
+        self.commands
+            .send(command(request))
+            .map_err(|_| "OpenPickle has stopped. Reopen the app to search.".to_owned())?;
+        self.pending_search = Some(id);
+        Ok(())
+    }
+
+    fn cancel_search(&mut self) {
+        if self.pending_search.take().is_some() {
+            self.commands.send(Command::CancelSearch).ok();
+        }
+    }
+
+    fn accept_search(&mut self, request: &SearchRequest) -> bool {
+        if self.searching()
+            && self.opening_room.is_none()
+            && self.room_id == request.room_id
+            && self.pending_search == Some(request.id)
+        {
+            self.pending_search = None;
+            true
+        } else {
+            false
+        }
     }
 
     /// Dispatch only supported links. Attachment targets must also belong to a message in
@@ -1045,36 +1324,7 @@ impl Shell {
                     .find(|item| item.path == path)
                     .cloned();
                 if let Some(attachment) = attachment {
-                    let preview = cx.new(|cx| AttachmentView::new(attachment, cx));
-                    self._over_events = Some(cx.subscribe_in(
-                        &preview,
-                        window,
-                        |this, view, event, window, cx| match event {
-                            AttachmentEvent::Close => this.close_over(window, cx),
-                            AttachmentEvent::Retry => {
-                                let path = view.read(cx).path().to_owned();
-                                this.commands.send(Command::PreviewAttachment(path)).ok();
-                            }
-                            AttachmentEvent::Download => {
-                                let path = view.read(cx).path().to_owned();
-                                if this
-                                    .commands
-                                    .send(Command::DownloadAttachment(path))
-                                    .is_err()
-                                {
-                                    let stopped = "OpenPickle has stopped. Reopen the app.";
-                                    view.update(cx, |view, cx| {
-                                        view.downloaded(Err(stopped.into()), cx)
-                                    });
-                                }
-                            }
-                        },
-                    ));
-                    window.focus(&preview.focus_handle(cx));
-                    self.set_over(Some(Over::Attachment(preview)));
-                    self.commands.send(Command::PreviewAttachment(path)).ok();
-                    self.report_reading(window);
-                    cx.notify();
+                    self.open_attachment(attachment, false, window, cx);
                 }
             }
             None => {
@@ -1082,6 +1332,89 @@ impl Shell {
                 cx.notify();
             }
         }
+    }
+
+    fn open_archive_file(
+        &mut self,
+        path: &str,
+        download_now: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tab != Tab::Archive || LinkTarget::attachment(path).is_none() {
+            return;
+        }
+        // Only the Archive projection for this room can supply the file. It may arrive before
+        // the corresponding timeline rows; the backend still checks conversation membership.
+        let attachment = self
+            .archive
+            .as_ref()
+            .and_then(|archive| archive.read(cx).file(path))
+            .cloned();
+        if let Some(attachment) = attachment {
+            self.open_attachment(attachment, download_now, window, cx);
+        }
+    }
+
+    fn open_attachment(
+        &mut self,
+        attachment: Attachment,
+        download_now: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.opening_room.is_some() {
+            return;
+        }
+        let preview = cx.new(|cx| AttachmentView::new(attachment, cx));
+        let room_id = self.room_id.clone();
+        self._over_events = Some(cx.subscribe_in(
+            &preview,
+            window,
+            move |this, view, event, window, cx| {
+                if this.room_id != room_id || this.opening_room.is_some() {
+                    return;
+                }
+                let path = view.read(cx).path().to_owned();
+                let stopped = "OpenPickle has stopped. Reopen the app.";
+                match event {
+                    AttachmentEvent::Close => this.close_over(window, cx),
+                    AttachmentEvent::Preview => {
+                        if this
+                            .commands
+                            .send(Command::PreviewAttachment(path))
+                            .is_err()
+                        {
+                            view.update(cx, |view, cx| view.loaded(Err(stopped.into()), cx));
+                        }
+                    }
+                    AttachmentEvent::Download | AttachmentEvent::CancelDownload => {
+                        let room_id = room_id.clone();
+                        let command = match event {
+                            AttachmentEvent::Download => {
+                                Command::DownloadAttachment { room_id, path }
+                            }
+                            _ => Command::CancelAttachmentDownload { room_id, path },
+                        };
+                        if this.commands.send(command).is_err() {
+                            view.update(cx, |view, cx| view.downloaded(Err(stopped.into()), cx));
+                        }
+                    }
+                }
+            },
+        ));
+        window.focus(&preview.focus_handle(cx));
+        self.set_over(Some(Over::Attachment(preview.clone())));
+        preview.update(cx, |view, cx| {
+            if download_now {
+                // A direct download need not wait on a separate preview request.
+                view.start_download(cx);
+            } else {
+                view.start_preview(cx);
+            }
+        });
+        self.report_reading(window);
+        cx.notify();
     }
 
     /// Keep the old conversation until the backend has opened the target successfully.
@@ -1112,18 +1445,22 @@ impl Shell {
         cx.notify();
     }
 
-    /// Goes to the chat at the message with this sequence number, and marks it for a moment.
-    /// A message that is not on this computer (yet) cannot be shown; nothing changes then.
-    fn show_message(&mut self, seq: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(index) = self.messages.iter().position(|message| message.seq == seq) else {
-            return;
+    /// Reveals a message already in the timeline. False means there is no row to scroll to.
+    fn show_message(&mut self, seq: u64, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(index) = self
+            .messages
+            .iter()
+            .position(|message| message.seq == seq && !message.parts.is_empty())
+        else {
+            return false;
         };
         let (Screen::Chat(chat), Some(&start)) = (&self.screen, self.row_starts.get(index)) else {
-            return;
+            return false;
         };
         let rows = start..start + self.messages[index].parts.len();
         chat.update(cx, |chat, cx| chat.reveal(rows, window, cx));
         self.open_tab(Tab::Chat, window, cx);
+        true
     }
 
     /// Shows the message at once and hands it to the backend, which may be busy for a while:
@@ -1141,7 +1478,7 @@ impl Shell {
             .duration_since(UNIX_EPOCH)
             .map_or(0., |elapsed| elapsed.as_secs_f64());
         let message = convert::outgoing(id.clone(), text, UNCONFIRMED_SEQ + self.sent, now);
-        upsert(&mut self.messages, message);
+        let first_changed = upsert(&mut self.messages, &mut self.message_seqs, message);
         if let Some(offer) = &offer {
             self.offers_asked.insert(id.clone(), offer.clone());
         }
@@ -1152,62 +1489,140 @@ impl Shell {
             offer,
         };
         if self.commands.send(command).is_err() {
-            mark_not_sent(&mut self.messages, &id, "Not sent. OpenPickle has stopped.");
+            let _ = mark_not_sent(&mut self.messages, &id, "Not sent. OpenPickle has stopped.");
         }
-        self.refresh_rows(cx);
+        if let Some(first_changed) = first_changed {
+            self.refresh_rows(first_changed, cx);
+        }
     }
 
-    fn refresh_rows(&mut self, cx: &mut Context<Self>) {
+    fn refresh_rows(&mut self, first_changed: usize, cx: &mut Context<Self>) {
         if let Screen::Chat(chat) = &self.screen {
-            let (rows, starts) = build_rows(
-                &self.messages,
-                self.activity.as_ref().map(|label| label.as_deref()),
-                Local::now(),
-            );
-            self.row_starts = starts;
-            chat.update(cx, |chat, cx| chat.set_rows(rows, cx));
+            let now = Local::now();
+            let date = now.date_naive();
+            // A change of date can affect older timestamp labels too.
+            let first_changed = if self.row_date == Some(date) {
+                first_changed
+            } else {
+                0
+            };
+            self.row_date = Some(date);
+            let previous = first_changed
+                .checked_sub(1)
+                .map(|index| &self.messages[index]);
+            let start = previous.map_or(0, |message| {
+                self.row_starts[first_changed - 1] + message.parts.len()
+            });
+            self.row_starts.truncate(first_changed);
+            chat.update(cx, |chat, cx| {
+                chat.project_rows(
+                    start,
+                    &mut self.row_starts,
+                    previous,
+                    &self.messages[first_changed..],
+                    now,
+                    cx,
+                );
+            });
         }
     }
 }
 
+/// Combines adjacent upserts that are already queued. Returns the first different update
+/// without applying it out of order (e.g. a room switch, send failure, or search completion).
+fn coalesce_upserts(update: &mut Update, queue: &mut UnboundedReceiver<Update>) -> Option<Update> {
+    let Update::Upsert { room_id, messages } = update else {
+        return None;
+    };
+    while let Ok(next) = queue.try_recv() {
+        match next {
+            Update::Upsert {
+                room_id: next_room,
+                messages: more,
+            } if *room_id == next_room => {
+                messages.extend(more);
+            }
+            other => return Some(other),
+        }
+    }
+    None
+}
+
 /// Shows another conversation, or the same one read again. Messages that are still on their
 /// way to the server belong to neither yet, so they stay.
-fn open_conversation(messages: &mut Vec<Message>, conversation: Vec<Message>) {
+fn open_conversation(
+    messages: &mut Vec<Message>,
+    conversation: Vec<Message>,
+) -> HashMap<String, u64> {
     let unconfirmed: Vec<Message> = messages
         .drain(..)
         .filter(|message| message.seq > UNCONFIRMED_SEQ)
         .collect();
     *messages = conversation;
+    let mut seqs: HashMap<_, _> = messages
+        .iter()
+        .map(|message| (message.id.clone(), message.seq))
+        .collect();
     for message in unconfirmed {
-        if !messages.iter().any(|known| known.id == message.id) {
-            upsert(messages, message);
+        if !seqs.contains_key(&message.id) {
+            let _ = upsert(messages, &mut seqs, message);
         }
     }
+    seqs
 }
 
 /// Says under a message that it did not reach the server. A message the server has confirmed
 /// in the meantime did reach it, and stays as it is.
-fn mark_not_sent(messages: &mut [Message], id: &str, reason: &str) {
-    if let Some(message) = messages
+fn mark_not_sent(messages: &mut [Message], id: &str, reason: &str) -> Option<usize> {
+    let (index, message) = messages
         .iter_mut()
-        .rfind(|message| message.id == id && message.seq > UNCONFIRMED_SEQ)
-    {
-        message.parts.push(Part::Task(reason.into()));
-    }
+        .enumerate()
+        .rev()
+        .take_while(|(_, message)| message.seq > UNCONFIRMED_SEQ)
+        .find(|(_, message)| message.id == id)?;
+    message.parts.push(Part::Task(reason.into()));
+    Some(index)
 }
 
 /// Replaces the message with the same id, or inserts a new one, keeping the list ordered by
-/// sequence number. Messages still being sent carry the highest numbers, so they stay last.
-fn upsert(messages: &mut Vec<Message>, message: Message) {
-    if let Some(index) = messages.iter().rposition(|known| known.id == message.id) {
+/// sequence number and returning the first affected index. Pending messages sort last.
+fn upsert(
+    messages: &mut Vec<Message>,
+    seqs: &mut HashMap<String, u64>,
+    message: Message,
+) -> Option<usize> {
+    let old = seqs.get(&message.id).and_then(|&seq| {
+        let start = messages.partition_point(|known| known.seq < seq);
+        messages[start..]
+            .iter()
+            .take_while(|known| known.seq == seq)
+            .position(|known| known.id == message.id)
+            .map(|index| start + index)
+    });
+    if let Some(index) = old {
+        if messages[index] == message {
+            return None;
+        }
         if messages[index].seq == message.seq {
-            messages[index] = message;
-            return;
+            let known = &mut messages[index];
+            let mut message = message;
+            if known.parts == message.parts {
+                // A decoration update can remeasure the row without invalidating its selection.
+                message.parts = std::mem::take(&mut known.parts);
+            }
+            *known = message;
+            return Some(index);
         }
         messages.remove(index);
     }
-    let index = messages.partition_point(|known| known.seq <= message.seq);
+    let index = if messages.last().is_none_or(|known| known.seq <= message.seq) {
+        messages.len()
+    } else {
+        messages.partition_point(|known| known.seq <= message.seq)
+    };
+    seqs.insert(message.id.clone(), message.seq);
     messages.insert(index, message);
+    Some(old.map_or(index, |old| old.min(index)))
 }
 
 impl Render for Shell {
@@ -1238,6 +1653,13 @@ impl Render for Shell {
             }));
         match &self.screen {
             Screen::Starting => screen,
+            Screen::SigningOut => screen
+                .flex()
+                .items_center()
+                .justify_center()
+                .font_family(theme::FONT)
+                .text_color(theme::color(theme::TEXT_MUTED))
+                .child("Signing out…"),
             Screen::Login(login) => screen.child(login.clone()),
             Screen::Chat(_) => {
                 let over: Option<AnyView> = match &self.over {
@@ -1319,6 +1741,7 @@ mod tests {
             at: seq as f64,
             side: Side::Mine,
             parts: vec![],
+            decorations: Default::default(),
         }
     }
 
@@ -1365,6 +1788,60 @@ mod tests {
         shell.read_with(cx, |shell, _| {
             let parts = &shell.messages.last().unwrap().parts;
             assert_eq!(parts.last(), Some(&Part::Task("Not sent.".into())));
+        });
+    }
+
+    #[gpui::test]
+    fn local_sign_out_waits_for_confirmation_and_does_not_reopen_the_old_chat(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::ui::bind_keys);
+        let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, received) = futures::channel::mpsc::unbounded();
+        let old_conversation = || Update::Conversation {
+            room_id: "previous".into(),
+            is_character: true,
+            can_send: true,
+            name: "Previous Pickle".into(),
+            avatar: None,
+            messages: vec![message("old", 1)],
+        };
+        updates.unbounded_send(old_conversation()).unwrap();
+        let (shell, cx) =
+            cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
+        shell.update_in(cx, |shell, window, cx| {
+            shell.open_tab(Tab::Profile, window, cx)
+        });
+        let profile = shell.read_with(cx, |shell, _| shell.profile.clone().unwrap());
+        profile.update(cx, |_, cx| cx.emit(ProfileEvent::SignOut));
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(
+            std::iter::from_fn(|| sent.try_recv().ok())
+                .all(|command| !matches!(command, Command::SignOut))
+        );
+
+        profile.update(cx, |_, cx| cx.emit(ProfileEvent::SignOut));
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Sign out");
+        cx.run_until_parked();
+        assert!(
+            std::iter::from_fn(|| sent.try_recv().ok())
+                .any(|command| matches!(command, Command::SignOut))
+        );
+        updates.unbounded_send(old_conversation()).unwrap();
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(matches!(shell.screen, Screen::SigningOut));
+            assert!(shell.profile.is_none());
+            assert!(shell.messages.is_empty());
+            assert_eq!(shell.identity.name.as_ref(), "Pickle");
+        });
+        updates.unbounded_send(Update::SignedOut).unwrap();
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(matches!(shell.screen, Screen::Login(_)))
         });
     }
 
@@ -1526,92 +2003,210 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_search_result_opens_its_message_and_closes_the_search(cx: &mut gpui::TestAppContext) {
+    fn an_uncached_search_result_retries_then_reveals_its_hydrated_message(
+        cx: &mut gpui::TestAppContext,
+    ) {
         cx.update(crate::ui::bind_keys);
         let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
         let (updates, received) = futures::channel::mpsc::unbounded();
-        let part = Part::Task("내일 비 온대요".into());
-        let conversation = Update::Conversation {
-            room_id: "primary".into(),
-            is_character: true,
+        let row = |seq| Message {
+            parts: vec![Part::Task(format!("Message {seq}").into())],
+            ..message(&format!("message-{seq}"), seq)
+        };
+        let conversation = |room: &str| Update::Conversation {
+            room_id: room.into(),
+            is_character: room == "primary",
             can_send: true,
             name: "Pickle".into(),
             avatar: None,
-            messages: vec![Message {
-                parts: vec![part],
-                ..message("a", 1)
-            }],
+            messages: (100..200).map(row).collect(),
         };
-        updates.unbounded_send(conversation).unwrap();
+        updates.unbounded_send(conversation("primary")).unwrap();
         let (shell, cx) =
             cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
-
         cx.simulate_resize(gpui::size(gpui::px(440.), gpui::px(900.)));
 
         cx.simulate_keystrokes("secondary-f");
-        cx.simulate_input("비");
-        cx.simulate_keystrokes("enter");
-        let asked = std::iter::from_fn(|| sent.try_recv().ok()).find_map(|command| match command {
-            Command::Search(query) => Some(query),
-            _ => None,
-        });
-        assert_eq!(asked.as_deref(), Some("비"));
+        cx.simulate_input("old");
+        cx.simulate_keystrokes("enter enter");
+        let (first_query, query) = std::iter::from_fn(|| sent.try_recv().ok())
+            .find_map(|command| match command {
+                Command::Search { request, query } => Some((request, query)),
+                _ => None,
+            })
+            .unwrap();
+        let (current_query, second_query) = std::iter::from_fn(|| sent.try_recv().ok())
+            .find_map(|command| match command {
+                Command::Search { request, query } => Some((request, query)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!((query.as_str(), second_query.as_str()), ("old", "old"));
 
         let found = |seq| SearchResult {
             seq: Some(seq),
             label: "Chat".into(),
             date: "Nov 16".into(),
-            snippet: "내일 비 온대요".into(),
-            matches: vec![0..6, 7..10],
+            snippet: "An old message".into(),
+            matches: std::iter::once(3..6).collect(),
         };
-        // The first result is a message this computer does not have; the second one it has.
-        let results = Update::Found {
-            query: "비".into(),
-            results: Ok(vec![found(99), found(1)]),
-        };
-        updates.unbounded_send(results).unwrap();
+        // The same query text does not identify a request. Its earlier answer cannot open a row.
+        updates
+            .unbounded_send(Update::Found {
+                request: first_query,
+                results: Ok(vec![found(121)]),
+            })
+            .unwrap();
         cx.run_until_parked();
         let first = gpui::point(gpui::px(120.), gpui::px(75.));
         cx.simulate_click(first, gpui::Modifiers::none());
         shell.read_with(cx, |shell, _| assert!(shell.searching()));
-        cx.simulate_click(
-            first + gpui::point(gpui::px(0.), gpui::px(70.)),
-            gpui::Modifiers::none(),
-        );
-        shell.read_with(cx, |shell, _| assert!(!shell.searching()));
 
-        // Escape closes the search too.
-        cx.simulate_keystrokes("secondary-f");
+        updates
+            .unbounded_send(Update::Found {
+                request: current_query,
+                results: Ok(vec![found(50), found(121), found(25)]),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let lookup = |sent: &mut tokio::sync::mpsc::UnboundedReceiver<Command>, expected| {
+            std::iter::from_fn(|| sent.try_recv().ok())
+                .find_map(|command| match command {
+                    Command::OpenSearchResult { request, seq } => {
+                        assert_eq!((request.room_id.as_str(), seq), ("primary", expected));
+                        Some(request)
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        cx.simulate_click(first, gpui::Modifiers::none());
+        let failed = lookup(&mut sent, 50);
+        let failed_id = failed.id;
+        updates
+            .unbounded_send(Update::SearchResultOpened {
+                request: failed,
+                seq: 50,
+                result: Err("This message is no longer available. Choose another result.".into()),
+            })
+            .unwrap();
+        cx.run_until_parked();
         shell.read_with(cx, |shell, _| assert!(shell.searching()));
-        cx.simulate_keystrokes("escape");
+
+        cx.simulate_click(first, gpui::Modifiers::none());
+        let retried = lookup(&mut sent, 50);
+        updates
+            .unbounded_send(Update::SearchResultOpened {
+                request: SearchRequest {
+                    room_id: "primary".into(),
+                    id: failed_id,
+                },
+                seq: 50,
+                result: Ok(vec![row(50), row(51)]),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.searching());
+            assert!(shell.messages.iter().all(|message| message.seq >= 100));
+        });
+
+        updates
+            .unbounded_send(Update::SearchResultOpened {
+                request: retried,
+                seq: 50,
+                result: Ok(vec![row(52), row(50), row(48)]),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| {
+            assert!(!shell.searching());
+            assert_eq!(
+                shell.messages[..3]
+                    .iter()
+                    .map(|item| item.seq)
+                    .collect::<Vec<_>>(),
+                [48, 50, 52]
+            );
+            let Screen::Chat(chat) = &shell.screen else {
+                panic!("expected chat")
+            };
+            let (marked, top) = chat.read(cx).search_position();
+            let target = shell.row_starts[1];
+            assert_eq!(marked, Some(target));
+            assert!(
+                top <= target && target - top <= 2,
+                "top row {top}, target {target}"
+            );
+        });
+
+        // Reopening the same result needs no further network work.
+        cx.simulate_keystrokes("secondary-f");
+        cx.simulate_click(first, gpui::Modifiers::none());
         shell.read_with(cx, |shell, _| assert!(!shell.searching()));
+        assert!(
+            !std::iter::from_fn(|| sent.try_recv().ok())
+                .any(|command| matches!(command, Command::OpenSearchResult { .. }))
+        );
+
+        cx.simulate_keystrokes("secondary-f down down down enter");
+        let leaving = lookup(&mut sent, 25);
+        updates.unbounded_send(conversation("peer")).unwrap();
+        updates
+            .unbounded_send(Update::SearchResultOpened {
+                request: leaving,
+                seq: 25,
+                result: Ok(vec![row(25)]),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            std::iter::from_fn(|| sent.try_recv().ok())
+                .any(|command| matches!(command, Command::CancelSearch))
+        );
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.room_id, "peer");
+            assert!(!shell.searching());
+            assert!(shell.messages.iter().all(|message| message.seq >= 100));
+            let Screen::Chat(chat) = &shell.screen else {
+                panic!("expected chat")
+            };
+            assert_eq!(chat.read(cx).search_position().0, None);
+        });
     }
 
     #[test]
     fn a_message_on_its_way_survives_the_conversation_arriving_and_is_then_confirmed() {
         // Typed while the backend was still connecting.
         let mut messages = vec![message("typed", UNCONFIRMED_SEQ + 1)];
-        open_conversation(&mut messages, vec![message("a", 1), message("b", 2)]);
+        let mut seqs = open_conversation(&mut messages, vec![message("a", 1), message("b", 2)]);
         assert_eq!(
             messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
             ["a", "b", "typed"]
         );
 
         // The server's copy takes its place. A failure reported after that is stale.
-        upsert(&mut messages, message("typed", 3));
-        mark_not_sent(&mut messages, "typed", "Not sent.");
+        assert_eq!(
+            upsert(&mut messages, &mut seqs, message("typed", 3)),
+            Some(2)
+        );
+        assert_eq!(mark_not_sent(&mut messages, "typed", "Not sent."), None);
         assert_eq!(messages.last(), Some(&message("typed", 3)));
 
         // Reading the conversation again does not bring a confirmed message back as pending.
         let mut messages = vec![message("typed", UNCONFIRMED_SEQ + 1)];
-        open_conversation(&mut messages, vec![message("a", 1), message("typed", 2)]);
+        let seqs = open_conversation(&mut messages, vec![message("a", 1), message("typed", 2)]);
+        assert_eq!(seqs["typed"], 2);
         assert_eq!(messages, [message("a", 1), message("typed", 2)]);
     }
 
     #[test]
     fn a_message_that_was_not_sent_says_so() {
         let mut messages = vec![message("a", 1), message("typed", UNCONFIRMED_SEQ + 1)];
-        mark_not_sent(&mut messages, "typed", "Not sent. Check your connection.");
+        assert_eq!(
+            mark_not_sent(&mut messages, "typed", "Not sent. Check your connection."),
+            Some(1),
+        );
         assert_eq!(
             messages[1].parts,
             [Part::Task("Not sent. Check your connection.".into())]
@@ -1621,16 +2216,25 @@ mod tests {
 
     #[test]
     fn upsert_orders_by_seq_and_confirms_pending_messages() {
-        let mut messages = vec![message("a", 1), message("c", 5)];
-        upsert(&mut messages, message("b", 3));
-        upsert(&mut messages, message("sent", u64::MAX));
-        upsert(&mut messages, message("d", 7));
+        let mut messages = Vec::new();
+        let mut seqs = open_conversation(&mut messages, vec![message("a", 1), message("c", 5)]);
+        assert_eq!(upsert(&mut messages, &mut seqs, message("b", 3)), Some(1));
+        assert_eq!(
+            upsert(&mut messages, &mut seqs, message("sent", u64::MAX)),
+            Some(3)
+        );
+        assert_eq!(upsert(&mut messages, &mut seqs, message("d", 7)), Some(3));
+        assert_eq!(upsert(&mut messages, &mut seqs, message("d", 7)), None);
         assert_eq!(
             messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
             ["a", "b", "c", "d", "sent"]
         );
         // The server confirms the pending message with its real sequence number.
-        upsert(&mut messages, message("sent", 6));
+        assert_eq!(
+            upsert(&mut messages, &mut seqs, message("sent", 6)),
+            Some(3)
+        );
+        assert_eq!(seqs["sent"], 6);
         assert_eq!(
             messages
                 .iter()
@@ -1638,6 +2242,78 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("a", 1), ("b", 3), ("c", 5), ("sent", 6), ("d", 7)]
         );
+    }
+
+    #[test]
+    fn a_decoration_only_upsert_keeps_selectable_content_identity() {
+        use crate::model::build_rows;
+
+        let mut messages = vec![convert::outgoing("m".into(), "body", 1, 1.)];
+        let now = Local::now();
+        let (before, starts) = build_rows(&messages, None, now);
+        let mut decorated = convert::outgoing("m".into(), "body", 1, 1.);
+        decorated.decorations.quote = Some(std::sync::Arc::new(crate::model::Quote {
+            author: Some("Pickle"),
+            snippet: "Earlier words".into(),
+        }));
+        let mut seqs = HashMap::from([("m".to_owned(), 1)]);
+        assert_eq!(upsert(&mut messages, &mut seqs, decorated), Some(0));
+        let (after, new_starts) = build_rows(&messages, None, now);
+        assert_eq!(starts, new_starts);
+        let start = starts[0];
+        assert!(before[start].same_content_as(&after[start]));
+        assert!(!before[start].same_as(&after[start]));
+        assert_eq!(after[start].texts(), ["body"]);
+    }
+
+    #[gpui::test]
+    fn an_upsert_batch_keeps_search_row_starts_when_confirming_a_pending_message(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, received) = futures::channel::mpsc::unbounded();
+        let shown = |id: &str, seq| convert::outgoing(id.into(), id, seq, seq as f64);
+        updates
+            .unbounded_send(Update::Conversation {
+                room_id: "primary".into(),
+                is_character: true,
+                can_send: true,
+                name: "Pickle".into(),
+                avatar: None,
+                messages: vec![shown("first", 1), shown("third", 7200)],
+            })
+            .unwrap();
+        let (shell, cx) =
+            cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
+        shell.update(cx, |shell, cx| shell.send("pending", None, cx));
+        let id = std::iter::from_fn(|| sent.try_recv().ok())
+            .find_map(|command| match command {
+                Command::Send { id, .. } => Some(id),
+                _ => None,
+            })
+            .unwrap();
+        updates
+            .unbounded_send(Update::Upsert {
+                room_id: "primary".into(),
+                messages: vec![
+                    shown("latest", 7202),
+                    convert::outgoing(id.clone(), "pending", 7201, 7201.),
+                ],
+            })
+            .unwrap();
+        updates
+            .unbounded_send(Update::Upsert {
+                room_id: "primary".into(),
+                messages: vec![shown("second", 2)],
+            })
+            .unwrap();
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            let seqs: Vec<_> = shell.messages.iter().map(|message| message.seq).collect();
+            assert_eq!(seqs, [1, 2, 7200, 7201, 7202]);
+            assert_eq!(shell.messages[3].id, id);
+            assert_eq!(shell.row_starts, [1, 2, 4, 5, 6]);
+        });
     }
 
     #[gpui::test]
@@ -1674,11 +2350,14 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
-        shell.read_with(cx, |shell, _| {
+        shell.read_with(cx, |shell, cx| {
             assert_eq!(shell.room_id, "peer");
             assert_eq!(shell.messages.len(), 1);
             assert_eq!(shell.messages[0].id, "peer");
-            assert!(shell.activity.is_none());
+            let Screen::Chat(chat) = &shell.screen else {
+                panic!("chat should remain open");
+            };
+            assert_eq!(chat.read(cx).visible_activity(), None);
             assert!(!shell.can_send);
         });
         updates
@@ -1691,6 +2370,61 @@ mod tests {
             _ => None,
         });
         assert_eq!(send, Some(("primary".into(), "unsent draft".into())));
+    }
+
+    #[gpui::test]
+    fn room_metadata_preserves_chat_state_and_pending_room_open(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::ui::bind_keys);
+        let (commands, _sent) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, received) = futures::channel::mpsc::unbounded();
+        updates
+            .unbounded_send(Update::Conversation {
+                room_id: "peer".into(),
+                is_character: false,
+                can_send: true,
+                name: "Peer".into(),
+                avatar: None,
+                messages: vec![message("existing", 1)],
+            })
+            .unwrap();
+        let (shell, cx) =
+            cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
+        cx.simulate_input("unfinished draft");
+        shell.update_in(cx, |shell, window, cx| {
+            shell.apply(
+                Update::Activity {
+                    room_id: "peer".into(),
+                    activity: Some(None),
+                },
+                window,
+                cx,
+            );
+            shell.open_room("other", window, cx);
+        });
+        let metadata = |room_id: &str, can_send| {
+            Update::RoomMetadata(RoomMetadata {
+                room_id: room_id.into(),
+                is_character: false,
+                can_send,
+                name: "Renamed".into(),
+                avatar: None,
+            })
+        };
+        updates.unbounded_send(metadata("peer", false)).unwrap();
+        updates.unbounded_send(metadata("other", true)).unwrap();
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.room_header.name.as_ref(), "Renamed");
+            assert_eq!(shell.opening_room.as_deref(), Some("other"));
+            assert!(!shell.can_send);
+            assert_eq!(shell.messages.len(), 1);
+            assert_eq!(shell.messages[0].id, "existing");
+            let Screen::Chat(chat) = &shell.screen else {
+                panic!("chat should remain open");
+            };
+            assert_eq!(chat.read(cx).draft(cx), "unfinished draft");
+            assert_eq!(chat.read(cx).visible_activity(), Some(None));
+        });
     }
 
     #[gpui::test]
@@ -1751,13 +2485,15 @@ mod tests {
         cx.run_until_parked();
         assert!(std::iter::from_fn(|| sent.try_recv().ok()).any(|command| {
             matches!(command,
-            Command::DownloadAttachment(path) if path == "attachments/2026-01-01/report.pdf")
+            Command::DownloadAttachment { room_id, path }
+                if room_id == "primary" && path == "attachments/2026-01-01/report.pdf")
         }));
         cx.simulate_keystrokes("escape");
         shell.read_with(cx, |shell, _| assert!(shell.over.is_none()));
         // A download that ends after its preview was closed is reported in the window.
         updates
             .unbounded_send(Update::AttachmentDownloaded {
+                room_id: "primary".into(),
                 path: "attachments/2026-01-01/report.pdf".into(),
                 result: Ok("/made-up/Downloads/Report.pdf".into()),
             })
@@ -1776,12 +2512,120 @@ mod tests {
     }
 
     #[gpui::test]
+    fn archive_files_preview_or_download_in_place_and_can_still_jump_to_chat(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::ui::bind_keys);
+        let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, received) = futures::channel::mpsc::unbounded();
+        const PATH: &str = "attachments/2026-01-01/archive-only.pdf";
+        let attachment = Attachment {
+            path: PATH.into(),
+            seq: 13,
+            at: 1.,
+            name: "Archive file.pdf".into(),
+            detail: String::new(),
+            kind: crate::model::AttachmentKind::File,
+        };
+        updates
+            .unbounded_send(Update::Conversation {
+                room_id: "primary".into(),
+                is_character: true,
+                can_send: true,
+                name: "Pickle".into(),
+                avatar: None,
+                messages: vec![],
+            })
+            .unwrap();
+        let (shell, cx) =
+            cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
+        cx.simulate_resize(gpui::size(px(440.), px(900.)));
+        shell.update_in(cx, |shell, window, cx| {
+            shell.open_tab(Tab::Archive, window, cx)
+        });
+        updates
+            .unbounded_send(Update::Archive {
+                room_id: "primary".into(),
+                complete: true,
+                attachments: vec![attachment.clone()],
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let click = |cx: &mut gpui::VisualTestContext, selector| {
+            cx.update(|window, cx| window.draw(cx).clear());
+            let bounds = cx.debug_bounds(selector).expect(selector);
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        };
+        let mut commands = || std::iter::from_fn(|| sent.try_recv().ok()).collect::<Vec<_>>();
+
+        click(cx, "archive-Files");
+        click(cx, "archive-preview-file");
+        let preview = shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.tab, Tab::Archive);
+            let Some(Over::Attachment(view)) = &shell.over else {
+                panic!("Archive-only file should open the shared preview");
+            };
+            assert_eq!(view.read(cx).path(), PATH);
+            view.clone()
+        });
+        assert!(commands().into_iter().any(|command| {
+            matches!(command, Command::PreviewAttachment(path) if path == PATH)
+        }));
+        preview.update(cx, |_, cx| cx.emit(AttachmentEvent::Close));
+        cx.run_until_parked();
+
+        click(cx, "archive-download-file");
+        let requested = commands();
+        assert!(requested.iter().any(|command| {
+            matches!(command, Command::DownloadAttachment { room_id, path }
+                if room_id == "primary" && path == PATH)
+        }));
+        assert!(
+            !requested
+                .iter()
+                .any(|command| matches!(command, Command::PreviewAttachment(_)))
+        );
+        let result = |room: &str| Update::AttachmentDownloaded {
+            room_id: room.into(),
+            path: PATH.into(),
+            result: Ok(std::env::temp_dir().join("openpickle-synthetic.pdf")),
+        };
+        updates.unbounded_send(result("other-room")).unwrap();
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("open-original").is_none());
+        updates.unbounded_send(result("primary")).unwrap();
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("open-original").is_some());
+        cx.simulate_keystrokes("escape");
+
+        updates
+            .unbounded_send(Update::Upsert {
+                room_id: "primary".into(),
+                messages: vec![Message {
+                    parts: vec![Part::Files(std::sync::Arc::new(crate::model::Files {
+                        items: vec![attachment],
+                    }))],
+                    ..message("archive-message", 13)
+                }],
+            })
+            .unwrap();
+        cx.run_until_parked();
+        click(cx, "archive-show-file-in-chat");
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.tab, Tab::Chat);
+            assert!(shell.over.is_none());
+        });
+    }
+
+    #[gpui::test]
     fn a_room_switch_hides_the_previous_rooms_archive_before_loading(
         cx: &mut gpui::TestAppContext,
     ) {
         use crate::model::{Attachment, AttachmentKind};
         cx.update(crate::ui::bind_keys);
-        let (commands, _sent) = tokio::sync::mpsc::unbounded_channel();
+        let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
         let (updates, received) = futures::channel::mpsc::unbounded();
         let conversation = |room: &str| Update::Conversation {
             room_id: room.into(),
@@ -1796,6 +2640,15 @@ mod tests {
             cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
         cx.simulate_resize(gpui::size(px(440.), px(900.)));
         cx.simulate_keystrokes("secondary-4");
+        let mut archive_watches = || {
+            std::iter::from_fn(|| sent.try_recv().ok())
+                .filter_map(|command| match command {
+                    Command::WatchArchive(room_id) => Some(room_id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(archive_watches(), vec![Some("primary".into())]);
         let old_archive = || Update::Archive {
             room_id: "primary".into(),
             complete: true,
@@ -1812,6 +2665,7 @@ mod tests {
         cx.run_until_parked();
         updates.unbounded_send(conversation("peer")).unwrap();
         cx.run_until_parked();
+        assert_eq!(archive_watches(), vec![Some("peer".into())]);
         cx.simulate_click(gpui::point(px(60.), px(280.)), gpui::Modifiers::none());
         shell.read_with(cx, |shell, _| assert_eq!(shell.tab, Tab::Archive));
         // An old response cannot refill the view after it was cleared.
@@ -1819,6 +2673,50 @@ mod tests {
         cx.run_until_parked();
         cx.simulate_click(gpui::point(px(60.), px(280.)), gpui::Modifiers::none());
         shell.read_with(cx, |shell, _| assert_eq!(shell.tab, Tab::Archive));
+        cx.simulate_keystrokes("secondary-1");
+        assert_eq!(archive_watches(), vec![None]);
+    }
+
+    #[gpui::test]
+    fn a_fallback_snapshot_does_not_acknowledge_an_open_for_a_different_room(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (commands, _sent) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, received) = futures::channel::mpsc::unbounded();
+        let conversation = |room: &str| Update::Conversation {
+            room_id: room.into(),
+            is_character: room == "primary",
+            can_send: true,
+            name: room.into(),
+            avatar: None,
+            messages: vec![],
+        };
+        updates.unbounded_send(conversation("old-peer")).unwrap();
+        let (shell, cx) =
+            cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
+        shell.update_in(cx, |shell, window, cx| {
+            shell.open_room("new-peer", window, cx)
+        });
+        updates.unbounded_send(conversation("primary")).unwrap();
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.room_id, "primary");
+            assert_eq!(shell.opening_room.as_deref(), Some("new-peer"));
+        });
+        updates
+            .unbounded_send(Update::RoomOpenFailed {
+                room_id: "new-peer".into(),
+                reason: "No longer available".into(),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.opening_room.is_none());
+            assert_eq!(
+                shell.notice.as_deref().map(|notice| notice.as_ref()),
+                Some("No longer available")
+            );
+        });
     }
 
     #[gpui::test]

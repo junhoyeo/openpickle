@@ -23,6 +23,7 @@ pub enum ProfileEvent {
     Open(Tab),
     Invite,
     Reload,
+    SignOut,
     Link(String),
 }
 
@@ -148,7 +149,15 @@ impl ProfileView {
                     );
             }
         }
-        content
+        content.child(
+            card()
+                .id("sign-out")
+                .cursor_pointer()
+                .hover(|card| card.bg(theme::alpha(0xffffff, 0.065)))
+                .text_color(theme::color(theme::DANGER))
+                .child("Sign out on this computer")
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(ProfileEvent::SignOut))),
+        )
     }
 
     fn usage_summary(
@@ -662,6 +671,7 @@ fn active_row(
 ) -> Stateful<Div> {
     div()
         .id(id)
+        .debug_selector(|| id.to_owned())
         .py(px(7.))
         .flex()
         .items_center()
@@ -955,7 +965,8 @@ mod tests {
             touch_phase: TouchPhase::Moved,
         });
         cx.run_until_parked();
-        cx.simulate_click(contact_position, Modifiers::none());
+        let contact = cx.debug_bounds("contact").expect("contact row is drawn");
+        cx.simulate_click(contact.center(), Modifiers::none());
         assert_eq!(&*links.borrow(), &[CONTACT_URL.to_owned()]);
     }
 }

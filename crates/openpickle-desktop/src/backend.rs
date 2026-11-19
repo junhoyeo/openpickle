@@ -6,7 +6,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::PathBuf,
     pin::Pin,
     sync::{
         Arc,
@@ -19,7 +19,7 @@ use futures::{Stream, StreamExt, channel::mpsc::UnboundedSender as Updates};
 use openpickle_api::{
     ALL_SOCIAL_SCOPES, CardState, ClientOptions, Credentials, Error, ExploreSectionsScreen,
     HistoryItem, LoginSession, LoginSessionRefresh, MessageContext, PickleClient, PickleEvent,
-    SendMessageOptions, SocialSnapshot,
+    Reaction, SendMessageOptions, SocialSnapshot,
     events::{ChatEvent, RoomEvent},
 };
 use serde::{Deserialize, Serialize};
@@ -33,9 +33,15 @@ use crate::{
     model::{Attachment, Message},
     phone::CallSummary,
     profile::ProfileData,
-    protocol::{Command, Update},
-    store::{Session, Store},
+    protocol::{Command, RoomMetadata, Update},
+    store::{LogStatus, Session, Store},
 };
+
+mod attachment_downloads;
+mod search;
+
+use attachment_downloads::{DownloadKey, OriginalDownloads};
+use search::{SearchJob, SearchReads};
 
 type EventStream = Pin<Box<dyn Stream<Item = openpickle_api::Result<PickleEvent>> + Send>>;
 
@@ -111,7 +117,7 @@ pub fn start() -> Result<Backend, StartError> {
 
 /// Why the backend stopped doing what it was doing.
 enum Ended {
-    /// The server no longer knows the login session.
+    /// The user asked to sign out locally, or the server no longer knows the login session.
     SignedOut,
     /// The UI is gone.
     Closed,
@@ -136,10 +142,23 @@ impl OpenRoomError {
 }
 
 async fn run(store: Store, mut commands: Commands<Command>, updates: Updates<Update>) {
-    let mut signed_in = store.session().map(|session| (session, None));
+    let mut saved_session = match store.session() {
+        Ok(session) => session,
+        // Sign-in can recover a damaged credential. No cache is displayed, and a new login
+        // must clear it before saving the new credential.
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => None,
+        Err(error) => {
+            updates
+                .unbounded_send(Update::Failed(format!(
+                    "Could not read the local login session: {error}"
+                )))
+                .ok();
+            return;
+        }
+    };
     let ended = loop {
-        let (session, access_token) = match signed_in.take() {
-            Some(signed_in) => signed_in,
+        let (session, access_token) = match saved_session.take() {
+            Some(session) => (session, None),
             None => {
                 updates.unbounded_send(Update::SignedOut).ok();
                 match sign_in(&store, &mut commands, &updates).await {
@@ -149,12 +168,11 @@ async fn run(store: Store, mut commands: Commands<Command>, updates: Updates<Upd
             }
         };
         match converse(&store, session, access_token, &mut commands, &updates).await {
-            // Without this, the next person to sign in would see the old conversations.
             Ended::SignedOut => {
+                // `converse` has dropped Live, disabling detached writes for this account.
                 if let Err(error) = store.sign_out() {
                     break Ended::Failed(format!(
-                        "Pickle ended this login session, but its data on this computer could \
-                         not be cleared: {error}"
+                        "Could not clear the login and cache on this computer: {error}"
                     ));
                 }
             }
@@ -179,8 +197,11 @@ async fn sign_in(
     commands: &mut Commands<Command>,
     updates: &Updates<Update>,
 ) -> Result<(Session, String), Ended> {
-    let client =
-        PickleClient::new(ClientOptions::default()).map_err(|error| cannot_start(&error))?;
+    let client = PickleClient::new(ClientOptions::default()).map_err(|error| {
+        Ended::Failed(format!(
+            "Could not set up the connection to Pickle: {error}"
+        ))
+    })?;
     let mut pending_id = None;
     while let Some(command) = commands.recv().await {
         let failure = match command {
@@ -202,10 +223,10 @@ async fn sign_in(
                             // iOS reports an upper-case UUID as its device id.
                             device_id: uuid::Uuid::new_v4().to_string().to_uppercase(),
                         };
-                        match store.save_session(&session) {
+                        match store.start_session(&session) {
                             Ok(()) => return Ok((session, issued.login_session_jwt)),
                             Err(error) => {
-                                format!("Signed in, but the session could not be saved: {error}")
+                                format!("Could not finish signing in on this computer: {error}")
                             }
                         }
                     }
@@ -214,8 +235,11 @@ async fn sign_in(
                 None => "Ask for a code first.".to_owned(),
             },
             Command::Quit => break,
-            Command::Send { .. }
-            | Command::Search(_)
+            Command::SignOut
+            | Command::Send { .. }
+            | Command::Search { .. }
+            | Command::OpenSearchResult { .. }
+            | Command::CancelSearch
             | Command::OpenRoom(_)
             | Command::LoadSocial
             | Command::LoadExplore
@@ -224,11 +248,12 @@ async fn sign_in(
             | Command::ResolvePhoneTask(_)
             | Command::LoadHandoffCard(_)
             | Command::WatchHandoff(_)
-            | Command::DownloadAttachment(_)
+            | Command::DownloadAttachment { .. }
+            | Command::CancelAttachmentDownload { .. }
             | Command::WatchPhoneCall(_)
             | Command::EndPhoneCall { .. }
             | Command::OffersShown(_)
-            | Command::LoadArchive
+            | Command::WatchArchive(_)
             | Command::LoadAttachments(_)
             | Command::PreviewAttachment(_)
             | Command::Active(_) => continue,
@@ -277,6 +302,8 @@ enum Record {
     Item(Box<HistoryItem>),
     #[serde(rename = "card")]
     Card(CardState),
+    #[serde(rename = "reaction")]
+    Reaction(Reaction),
     /// How far the log follows the server: the `next_after` of the last page written.
     #[serde(rename = "synced")]
     Synced(i64),
@@ -298,16 +325,65 @@ struct Identity {
 struct HistoryLog {
     store: Store,
     name: String,
+    archive_rescan: bool,
     broken: bool,
 }
 
 impl HistoryLog {
     fn new(store: &Store, room_id: &str) -> Self {
+        let name = format!("room-{room_id}.jsonl");
+        let archive_rescan = store
+            .cached(&Self::archive_rescan_name(&name))
+            .unwrap_or(false);
         Self {
             store: store.clone(),
-            name: format!("room-{room_id}.jsonl"),
+            name,
+            archive_rescan,
             broken: false,
         }
+    }
+
+    fn archive_rescan_name(name: &str) -> String {
+        format!("{name}.archive-rescan")
+    }
+
+    fn finish_archive_rescan(&mut self) {
+        if self.archive_rescan
+            && !self.broken
+            && self
+                .store
+                .cache(&Self::archive_rescan_name(&self.name), &false)
+                .is_ok()
+        {
+            self.archive_rescan = false;
+        }
+    }
+
+    fn replay(&mut self, mut visit: impl FnMut(Record)) {
+        self.broken |= match self.store.read_log(&self.name, |record, after_gap| {
+            if Self::replayable(&record, after_gap) {
+                visit(record);
+            }
+        }) {
+            Ok(LogStatus::Clean) => false,
+            // Keep the last safe cursor on disk so catch-up can checkpoint repaired pages
+            // normally, even if another restart interrupts the backfill.
+            Ok(LogStatus::TornTail) => self.store.repair_log(&self.name, Self::replayable).is_err(),
+            Ok(LogStatus::Corrupt) => {
+                // An invalid row could be from backward paging, before even the last safe
+                // forward cursor. Record the need to rescan before removing the evidence.
+                self.archive_rescan = true;
+                self.store
+                    .cache(&Self::archive_rescan_name(&self.name), &true)
+                    .is_err()
+                    || self.store.repair_log(&self.name, Self::replayable).is_err()
+            }
+            Err(_) => true,
+        };
+    }
+
+    fn replayable(record: &Record, after_gap: bool) -> bool {
+        !after_gap || !matches!(record, Record::Synced(_))
     }
 
     fn append(&mut self, records: &[Record]) {
@@ -322,7 +398,11 @@ impl HistoryLog {
 struct Conversation {
     room_id: String,
     items: HashMap<String, HistoryItem>,
+    /// Sparse search neighbors are not logged and cannot advance either history cursor.
+    search_context: HashSet<String>,
     card_states: HashMap<String, CardState>,
+    /// Reactions indexed by target message id and reaction sequence number.
+    reactions: HashMap<String, HashMap<i64, Reaction>>,
     /// Sequence number up to which `history/delta` has been read.
     synced: i64,
     /// `None` until the room is known.
@@ -331,28 +411,58 @@ struct Conversation {
 
 impl Conversation {
     fn load(store: &Store, room_id: &str) -> Self {
-        let log = HistoryLog::new(store, room_id);
+        let mut log = HistoryLog::new(store, room_id);
         let mut conversation = Self {
             room_id: room_id.to_owned(),
             ..Default::default()
         };
-        for record in store.log::<Record>(&log.name) {
-            match record {
-                Record::Item(item) => {
-                    conversation.items.insert(item.id.clone(), *item);
-                }
-                Record::Card(state) => {
-                    conversation.card_states.insert(state.id.clone(), state);
-                }
-                Record::Synced(seq) => conversation.synced = seq,
+        log.replay(|record| match record {
+            Record::Item(item) => {
+                conversation.items.insert(item.id.clone(), *item);
             }
-        }
+            Record::Card(state) => {
+                conversation.card_states.insert(state.id.clone(), state);
+            }
+            Record::Reaction(reaction) => {
+                conversation.remember_reaction(reaction);
+            }
+            Record::Synced(seq) => conversation.synced = seq,
+        });
         conversation.log = Some(log);
         conversation
     }
 
     fn message(&self, item: &HistoryItem) -> Message {
-        convert::message(item, self.card_states.get(&item.id))
+        let reactions = self
+            .reactions
+            .get(&item.id)
+            .into_iter()
+            .flat_map(HashMap::values);
+        convert::message_with_reactions(item, self.card_states.get(&item.id), reactions)
+    }
+
+    /// Accepts a record once, whether it arrives from history or the live stream first.
+    fn remember_reaction(&mut self, reaction: Reaction) -> bool {
+        let entry = self
+            .reactions
+            .entry(reaction.target_id.clone())
+            .or_default()
+            .entry(reaction.seq);
+        if let std::collections::hash_map::Entry::Vacant(entry) = entry {
+            entry.insert(reaction);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn hear_reaction(&mut self, reaction: Reaction) -> Option<Message> {
+        let target_id = reaction.target_id.clone();
+        if self.remember_reaction(reaction) {
+            self.items.get(&target_id).map(|item| self.message(item))
+        } else {
+            None
+        }
     }
 
     /// The pictures and files of every message, newest first.
@@ -362,9 +472,14 @@ impl Conversation {
         items.into_iter().flat_map(convert::attachments).collect()
     }
 
-    /// The oldest message on this computer, which is where reading back starts.
+    /// The oldest regular history item, where reading back starts. A search can have
+    /// loaded an isolated older window without covering the messages that lead up to it.
     fn first_seq(&self) -> Option<i64> {
-        self.items.values().map(|item| item.seq).min()
+        self.items
+            .values()
+            .filter(|item| !self.search_context.contains(&item.id))
+            .map(|item| item.seq)
+            .min()
     }
 
     /// Every message, oldest first.
@@ -375,16 +490,28 @@ impl Conversation {
         messages
     }
 
-    /// Takes in items and card states and returns the messages they changed.
-    fn apply(&mut self, items: Vec<HistoryItem>, card_states: Vec<CardState>) -> Vec<Message> {
-        let mut changed: Vec<String> = Vec::with_capacity(items.len() + card_states.len());
+    /// Takes in history records and returns the messages they changed.
+    fn apply(
+        &mut self,
+        items: Vec<HistoryItem>,
+        card_states: Vec<CardState>,
+        reactions: Vec<Reaction>,
+    ) -> Vec<Message> {
+        let mut changed = Vec::with_capacity(items.len() + card_states.len() + reactions.len());
         for state in card_states {
             changed.push(state.id.clone());
             self.card_states.insert(state.id.clone(), state);
         }
         for item in items {
             changed.push(item.id.clone());
+            self.search_context.remove(&item.id);
             self.items.insert(item.id.clone(), item);
+        }
+        for reaction in reactions {
+            let target_id = reaction.target_id.clone();
+            if self.remember_reaction(reaction) {
+                changed.push(target_id);
+            }
         }
         changed.sort();
         changed.dedup();
@@ -425,6 +552,7 @@ impl Conversation {
     fn head_seq(&self) -> i64 {
         self.items
             .values()
+            .filter(|item| !self.search_context.contains(&item.id))
             .map(|item| item.seq)
             .max()
             .unwrap_or(0)
@@ -549,6 +677,64 @@ const CARD_HANDOFFS_FRESH: Duration = Duration::from_secs(10);
 /// started is listed within seconds, one from long ago never is.
 const CARD_UNLISTED_WAIT: Duration = Duration::from_secs(30);
 
+type ArchiveRequest = Pin<Box<dyn std::future::Future<Output = ArchivePage> + Send>>;
+
+struct ArchivePage {
+    room_id: String,
+    before: i64,
+    result: openpickle_api::Result<openpickle_api::HistoryPage>,
+}
+
+#[derive(Default)]
+struct ArchiveLoad {
+    watching: bool,
+    /// The cursor of the next page, including when the view closes or the request fails.
+    before: Option<i64>,
+    complete: bool,
+    request: Option<ArchiveRequest>,
+    /// A projection for this opening. Backward pages normally add to its tail.
+    attachments: Vec<Attachment>,
+}
+
+impl ArchiveLoad {
+    fn pause(&mut self) {
+        self.watching = false;
+        self.request = None;
+        self.attachments = Vec::new();
+    }
+
+    fn add_attachments(&mut self, mut additions: Vec<Attachment>) {
+        additions.sort_by_key(|attachment| std::cmp::Reverse(attachment.seq));
+        for attachment in additions {
+            let start = self
+                .attachments
+                .partition_point(|known| known.seq > attachment.seq);
+            let end = self
+                .attachments
+                .partition_point(|known| known.seq >= attachment.seq);
+            if let Some(index) = self.attachments[start..end]
+                .iter()
+                .position(|known| known.path == attachment.path)
+            {
+                self.attachments[start + index] = attachment;
+            } else {
+                self.attachments.insert(end, attachment);
+            }
+        }
+    }
+}
+
+async fn next_archive_page(request: &mut Option<ArchiveRequest>) -> ArchivePage {
+    match request {
+        Some(request) => request.await,
+        None => std::future::pending().await,
+    }
+}
+
+fn backward_cursor(before: i64, page: &openpickle_api::HistoryPage) -> Option<i64> {
+    (page.has_more && page.next_before < before).then_some(page.next_before)
+}
+
 struct Live {
     client: PickleClient,
     store: Store,
@@ -559,12 +745,10 @@ struct Live {
     handoff_watch: Option<HandoffWatch>,
     phone_watch: Option<PhoneWatch>,
     handoff_cards: HandoffCards,
-    /// Where downloaded attachments go: the user's Downloads folder.
-    download_dir: PathBuf,
+    original_downloads: OriginalDownloads,
     /// Whether the window is in front; only then does reading count as "seen".
     active: bool,
-    /// Whether the history on this computer reaches back to the first message.
-    history_complete: bool,
+    archive: ArchiveLoad,
     /// The room with the character, which the app starts in.
     character_room: String,
     /// Another room the window switched to. While it is set, the stream's chat events for
@@ -572,6 +756,9 @@ struct Live {
     room_override: Option<String>,
     /// The rooms as last listed by `sync`; this is the authority for room links and send access.
     last_rooms: Vec<openpickle_api::Room>,
+    roster_rev: Option<i64>,
+    roster_refresh: Option<ReconcileWork>,
+    history_refresh: Option<ReconcileWork>,
     /// Becomes false before this account ends, so detached picture tasks cannot recreate a
     /// signed-out account's cache.
     account_active: Arc<AtomicBool>,
@@ -596,13 +783,12 @@ fn save_refresh_if_active(
     })
 }
 
-async fn converse(
+fn start_conversation(
     store: &Store,
     session: Session,
     access_token: Option<String>,
-    commands: &mut Commands<Command>,
     updates: &Updates<Update>,
-) -> Ended {
+) -> Result<Live, Ended> {
     let device_id = session.device_id.clone();
     let account_active = Arc::new(AtomicBool::new(true));
     let rotate_store = store.clone();
@@ -623,10 +809,7 @@ async fn converse(
         ..Default::default()
     };
     // A failure here is local: only the server can say that the login session is gone.
-    let client = match PickleClient::new(options) {
-        Ok(client) => client,
-        Err(error) => return cannot_start(&error),
-    };
+    let client = PickleClient::new(options).map_err(|error| cannot_start(&error))?;
 
     // First paint comes from the disk; the network is asked afterwards.
     let room_id: Option<String> = store.cached("room.json");
@@ -635,7 +818,7 @@ async fn converse(
         .map(|room_id| Conversation::load(store, room_id))
         .unwrap_or_default();
     let identity: Identity = store.cached("identity.json").unwrap_or_default();
-    let mut live = Live {
+    let live = Live {
         client,
         store: store.clone(),
         updates: updates.clone(),
@@ -645,25 +828,57 @@ async fn converse(
         handoff_watch: None,
         phone_watch: None,
         handoff_cards: HandoffCards::default(),
-        download_dir: download_dir(),
+        original_downloads: OriginalDownloads::new(download_dir(), account_active.clone()),
         // The window says when it comes to the front.
         active: false,
-        history_complete: false,
+        archive: ArchiveLoad::default(),
         character_room: String::new(),
         room_override: None,
         last_rooms: Vec::new(),
+        roster_rev: None,
+        roster_refresh: None,
+        history_refresh: None,
         account_active: account_active.clone(),
         shown_from_disk: HashSet::new(),
         pictures: PictureFetches::new(account_active),
         marked_read: 0,
     };
     live.send_startup_conversation();
+    Ok(live)
+}
 
-    let mut events: Option<EventStream> = None;
+async fn converse(
+    store: &Store,
+    session: Session,
+    access_token: Option<String>,
+    commands: &mut Commands<Command>,
+    updates: &Updates<Update>,
+) -> Ended {
+    let mut live = match start_conversation(store, session, access_token, updates) {
+        Ok(live) => live,
+        Err(ended) => return ended,
+    };
+    let ended = conversation_loop(&mut live, commands, None).await;
+    live.account_active.store(false, Ordering::Release);
+    live.original_downloads.shutdown().await;
+    ended
+}
+
+async fn conversation_loop(
+    live: &mut Live,
+    commands: &mut Commands<Command>,
+    mut events: Option<EventStream>,
+) -> Ended {
     let mut connect_at = Instant::now();
     let mut opened_at = Instant::now();
     let mut backoff = Backoff::default();
+    let mut search = SearchReads::default();
     loop {
+        search.start_next(
+            &live.client,
+            live.search_room(),
+            live.roster_refresh.is_none(),
+        );
         let watch_deadline = live
             .phone_watch
             .as_ref()
@@ -678,11 +893,20 @@ async fn converse(
             .chain(cards_deadline)
             .chain(handoff_deadline)
             .min();
+        let reconcile_at = live.reconcile_at();
         tokio::select! {
             command = commands.recv() => match command {
-                None | Some(Command::Quit) => return Ended::Closed,
+                None | Some(Command::Quit) => {
+                    // Background reads can have started a rotation. Keep the store alive until
+                    // it finishes, and stop their queued clones from starting another one.
+                    let _ = live.client.close_login_session().await;
+                    return Ended::Closed;
+                }
+                Some(Command::SignOut) => return Ended::SignedOut,
                 Some(Command::Send { room_id, id, text, offer }) => {
-                    let sync_failure = if live.last_rooms.is_empty() {
+                    let sync_failure = if room_id == live.conversation.room_id
+                        && (live.roster_rev.is_none() || live.roster_refresh.is_some())
+                    {
                         match live.find_room().await {
                             Ok(()) => None,
                             Err(error) if session_is_gone(&error) => return Ended::SignedOut,
@@ -706,18 +930,9 @@ async fn converse(
                         live.send(Update::SendFailed { room_id, id, reason });
                     }
                 }
-                Some(Command::Search(query)) => {
-                    let results = match live.client.search_messages(&query).await {
-                        Ok(found) => Ok(found
-                            .items
-                            .into_iter()
-                            .map(|item| convert::search_result(item, &live.conversation.room_id))
-                            .collect()),
-                        Err(error) if session_is_gone(&error) => return Ended::SignedOut,
-                        Err(error) => Err(explain(&error)),
-                    };
-                    live.send(Update::Found { query, results });
-                }
+                Some(Command::Search { request, query }) => live.queue_search(&mut search, request, SearchJob::Query(query)),
+                Some(Command::OpenSearchResult { request, seq }) => live.queue_search(&mut search, request, SearchJob::Open(seq)),
+                Some(Command::CancelSearch) => search.cancel(),
                 Some(Command::LoadSocial) => {
                     if let Some(cached) = live.cached_once::<SocialSnapshot>("social.json") {
                         live.show_social(&cached);
@@ -805,21 +1020,15 @@ async fn converse(
                     }
                 }
                 Some(Command::OpenRoom(room_id)) => {
+                    live.archive.pause();
+                    search.cancel();
                     if let Err(error) = live.open_room_and_report(room_id).await
                         && session_is_gone(&error)
                     {
                         return Ended::SignedOut;
                     }
                 }
-                Some(Command::LoadArchive) => {
-                    if let Err(error) = live.read_archive().await {
-                        if session_is_gone(&error) {
-                            return Ended::SignedOut;
-                        }
-                        // What was read is shown; the rest is read on the next opening.
-                        live.show_archive(false);
-                    }
-                }
+                Some(Command::WatchArchive(room_id)) => live.watch_archive(room_id.as_deref()),
                 Some(Command::LoadAttachments(paths)) => live.fetch_attachments(paths),
                 Some(Command::PreviewAttachment(path)) => {
                     if let Err(error) = live.preview_attachment(path).await
@@ -828,7 +1037,12 @@ async fn converse(
                         return Ended::SignedOut;
                     }
                 }
-                Some(Command::DownloadAttachment(path)) => live.download_attachment(path),
+                Some(Command::DownloadAttachment { room_id, path }) => {
+                    live.download_attachment(DownloadKey { room_id, path });
+                }
+                Some(Command::CancelAttachmentDownload { room_id, path }) => {
+                    live.original_downloads.cancel(&DownloadKey { room_id, path });
+                }
                 Some(Command::OffersShown(offers)) => {
                     // Nothing on screen depends on this report, so a failure is not shown.
                     if let Err(error) = live.client.report_offer_impressions(&offers).await
@@ -843,6 +1057,18 @@ async fn converse(
                 }
                 Some(Command::RequestCode(_) | Command::VerifyCode(_)) => {}
             },
+            page = next_archive_page(&mut live.archive.request), if live.archive.request.is_some() => {
+                if let Err(error) = live.finish_archive_page(page)
+                    && session_is_gone(&error)
+                {
+                    return Ended::SignedOut;
+                }
+            },
+            (request, reply, wanted) = search.next(), if search.is_active() => {
+                if live.finish_search(request, reply, wanted).is_err() {
+                    return Ended::SignedOut;
+                }
+            }
             _ = tokio::time::sleep_until(phone_deadline.unwrap_or_else(Instant::now)), if phone_deadline.is_some() => {
                 let now = Instant::now();
                 if watch_deadline.is_some_and(|at| at <= now)
@@ -863,18 +1089,19 @@ async fn converse(
             },
             event = next_event(&mut events), if events.is_some() => match event {
                 Some(Ok(PickleEvent::Retry(delay))) => backoff.server_asks(delay),
-                Some(Ok(event)) => {
-                    if let Err(error) = live.handle(event).await
-                        && session_is_gone(&error)
-                    {
-                        return Ended::SignedOut;
-                    }
-                }
+                Some(Ok(event)) => live.handle(event),
                 // The stream ended or broke: catch up and open it again after a wait.
                 Some(Err(_)) | None => {
                     events = None;
                     backoff.stream_ended(opened_at.elapsed());
                     connect_at = Instant::now() + backoff.next();
+                }
+            },
+            _ = tokio::time::sleep_until(reconcile_at.unwrap_or_else(Instant::now)), if events.is_some() && reconcile_at.is_some() => {
+                if let Err(error) = live.reconcile().await
+                    && session_is_gone(&error)
+                {
+                    return Ended::SignedOut;
                 }
             },
             _ = tokio::time::sleep_until(connect_at), if events.is_none() => match live.connect().await {
@@ -916,13 +1143,14 @@ where
                 .map(|item| Record::Item(Box::new(item)))
                 .collect();
             records.extend(delta.card_states.iter().cloned().map(Record::Card));
+            records.extend(delta.reactions.iter().cloned().map(Record::Reaction));
             records.push(Record::Synced(delta.next_after));
             log.append(&records);
         }
 
         let advanced = delta.next_after > conversation.synced;
         conversation.synced = delta.next_after.max(conversation.synced);
-        let changed = conversation.apply(delta.items, delta.card_states);
+        let changed = conversation.apply(delta.items, delta.card_states, delta.reactions);
         if !changed.is_empty() {
             page_applied(changed);
         }
@@ -972,6 +1200,34 @@ impl Backoff {
     fn server_asks(&mut self, wait: Duration) {
         self.first = wait;
         self.wait = self.wait.max(wait);
+    }
+}
+
+/// A coalesced server watermark and the next attempt to reach it. New events raise the
+/// watermark without postponing an already scheduled attempt or bypassing its backoff.
+struct ReconcileWork {
+    through: i64,
+    at: Instant,
+    backoff: Backoff,
+}
+
+impl ReconcileWork {
+    const ROSTER_COALESCE: Duration = Duration::from_millis(100);
+
+    fn queue(pending: &mut Option<Self>, through: i64, delay: Duration) {
+        if let Some(work) = pending {
+            work.through = work.through.max(through);
+        } else {
+            *pending = Some(Self {
+                through,
+                at: Instant::now() + delay,
+                backoff: Backoff::default(),
+            });
+        }
+    }
+
+    fn defer(&mut self) {
+        self.at = Instant::now() + self.backoff.next();
     }
 }
 
@@ -1025,44 +1281,125 @@ impl Live {
         Ok(events)
     }
 
-    /// Refreshes the authoritative room roster without changing or republishing the visible
-    /// conversation. Room-opening uses this while its target is still staged.
-    async fn refresh_rooms(&mut self) -> openpickle_api::Result<Option<String>> {
+    /// Refreshes the authoritative roster and reconciles the visible room. An explicit room
+    /// open still stages its target separately while the current room remains authorized.
+    async fn find_room(&mut self) -> openpickle_api::Result<()> {
         let rooms = self.client.sync().await?;
+        if self.roster_rev.is_some_and(|rev| rooms.rev < rev) {
+            return Ok(());
+        }
+        let first_roster = self.roster_rev.is_none();
+        let archive_waiting_for_roster = self.archive.watching
+            && self.archive.request.is_none()
+            && (first_roster || self.roster_refresh.is_some());
+        let before = self.room_metadata(&self.conversation.room_id);
         let character_room = rooms
             .rooms
             .iter()
             .find(|room| room.kind == "character")
             .map(|room| room.room_id.clone());
-        self.show_rooms(&rooms);
-        if let Some(character_room) = &character_room {
-            self.character_room = character_room.clone();
-            // This cache is intentionally always the primary room. A launch must never reopen a
-            // peer room before `sync` can validate that the current account may see it.
-            self.store.cache("room.json", character_room).ok();
+        if first_roster
+            || character_room.as_deref().unwrap_or_default() != self.character_room.as_str()
+        {
+            // Offline startup may only reopen the primary room. `None` clears the pointer when
+            // the authoritative roster no longer names one (existing string caches still work).
+            self.store.cache("room.json", &character_room).ok();
         }
-        Ok(character_room)
+        self.character_room = character_room.unwrap_or_default();
+        self.roster_rev = Some(rooms.rev);
+        if self
+            .roster_refresh
+            .as_ref()
+            .is_some_and(|work| work.through <= rooms.rev)
+        {
+            self.roster_refresh = None;
+        }
+        self.show_rooms(&rooms);
+
+        let wanted = self
+            .room_override
+            .as_ref()
+            .filter(|wanted| self.known_room(wanted).is_some())
+            .cloned()
+            .unwrap_or_else(|| self.character_room.clone());
+        self.room_override = (wanted != self.character_room).then(|| wanted.clone());
+        if wanted != self.conversation.room_id {
+            // Never continue displaying a room absent from the authoritative roster, even if
+            // no primary room is available. Publish the fallback before requesting its history.
+            self.conversation = if wanted.is_empty() {
+                Conversation::default()
+            } else {
+                Conversation::load(&self.store, &wanted)
+            };
+            self.reset_room_state();
+            self.send_update_for(&wanted);
+        } else {
+            let after = self.room_metadata(&wanted);
+            if first_roster || before != after {
+                self.send(Update::RoomMetadata(after));
+            }
+            if archive_waiting_for_roster && self.roster_refresh.is_none() {
+                self.watch_archive(Some(&wanted));
+            }
+        }
+        if let Some(room) = self.known_room(&wanted) {
+            self.queue_history(room.last_seq);
+        }
+        Ok(())
     }
 
-    /// Asks the server which room is the one with the character. When it is not the open one
-    /// (the first launch, or another account), opens it with what the disk has for it.
-    async fn find_room(&mut self) -> openpickle_api::Result<()> {
-        if let Some(character_room) = self.refresh_rooms().await? {
-            let wanted = self
-                .room_override
-                .as_ref()
-                .filter(|wanted| self.known_room(wanted).is_some())
-                .cloned()
-                .unwrap_or_else(|| character_room.clone());
-            self.room_override = (wanted != character_room).then(|| wanted.clone());
-            if wanted != self.conversation.room_id {
-                self.conversation = Conversation::load(&self.store, &wanted);
-                self.reset_room_state();
+    fn queue_history(&mut self, last_seq: i64) {
+        if last_seq > self.conversation.synced {
+            ReconcileWork::queue(&mut self.history_refresh, last_seq, Duration::ZERO);
+        }
+    }
+
+    fn reconcile_at(&self) -> Option<Instant> {
+        self.roster_refresh
+            .iter()
+            .chain(&self.history_refresh)
+            .map(|work| work.at)
+            .min()
+    }
+
+    async fn reconcile(&mut self) -> openpickle_api::Result<()> {
+        if self
+            .roster_refresh
+            .as_ref()
+            .is_some_and(|work| work.at <= Instant::now())
+        {
+            if let Err(error) = self.find_room().await
+                && session_is_gone(&error)
+            {
+                return Err(error);
             }
-            // `sync` is the authority for membership and permissions. Publish it even when the
-            // cached room was already open, so startup cannot leave the composer disabled or
-            // accidentally preserve stale write access.
-            self.send_update_for(&wanted);
+            if let Some(work) = &mut self.roster_refresh {
+                // This also covers a successful sync response that is behind the SSE revision.
+                work.defer();
+            }
+        }
+        if let Some(work) = &self.history_refresh
+            && work.at <= Instant::now()
+        {
+            let through = work.through;
+            let retry = if self.conversation.synced >= through {
+                false
+            } else {
+                match self.catch_up().await {
+                    Ok(()) => self.conversation.synced < through,
+                    Err(error) if session_is_gone(&error) => return Err(error),
+                    Err(error) => !error.api().is_some_and(|api| {
+                        (400..500).contains(&api.status) && !matches!(api.status, 408 | 429)
+                    }),
+                }
+            };
+            if retry {
+                if let Some(work) = &mut self.history_refresh {
+                    work.defer();
+                }
+            } else {
+                self.history_refresh = None;
+            }
         }
         Ok(())
     }
@@ -1108,7 +1445,7 @@ impl Live {
         }
         if renamed || repainted {
             self.store.cache("identity.json", &self.identity).ok();
-            if self.conversation.room_id == self.character_room {
+            if self.is_open_character() {
                 self.send(Update::Identity {
                     name: self.display_name(),
                     avatar: self.avatar_path(),
@@ -1117,7 +1454,7 @@ impl Live {
         }
     }
 
-    async fn handle(&mut self, event: PickleEvent) -> openpickle_api::Result<()> {
+    fn handle(&mut self, event: PickleEvent) {
         match event {
             PickleEvent::Usage(usage) => {
                 if let Some(data) = &mut self.profile {
@@ -1147,7 +1484,7 @@ impl Live {
             }) => {
                 // Chat events carry no room id and belong only to the primary character room.
                 // While a peer room is open, its messages arrive through scoped `room` events.
-                if self.conversation.room_id == self.character_room
+                if self.is_open_character()
                     && let Ok(item) = serde_json::from_value::<HistoryItem>(
                         serde_json::json!({ "role": role, "id": id, "text": text, "at": at, "seq": seq }),
                     )
@@ -1168,7 +1505,7 @@ impl Live {
                 seq,
                 ..
             }) => {
-                if self.conversation.room_id == self.character_room
+                if self.is_open_character()
                     && let Ok(item) = serde_json::from_value::<HistoryItem>(serde_json::json!({
                         "role":role,"id":id,"title":title,"path":path,"at":at,"seq":seq
                     }))
@@ -1180,8 +1517,33 @@ impl Live {
                     });
                 }
             }
+            PickleEvent::Chat(ChatEvent::Reaction {
+                seq,
+                target_id,
+                part,
+                actor,
+                emoji,
+                at,
+                ..
+            }) => {
+                if self.is_open_character()
+                    && let Some(message) = self.conversation.hear_reaction(Reaction {
+                        seq,
+                        target_id,
+                        part,
+                        actor,
+                        emoji,
+                        at,
+                    })
+                {
+                    self.send(Update::Upsert {
+                        room_id: self.character_room.clone(),
+                        messages: vec![message],
+                    });
+                }
+            }
             PickleEvent::Chat(ChatEvent::Pending { on }) => {
-                if self.conversation.room_id == self.character_room {
+                if self.is_open_character() {
                     self.send(Update::Activity {
                         room_id: self.character_room.clone(),
                         activity: on.then_some(None),
@@ -1189,7 +1551,7 @@ impl Live {
                 }
             }
             PickleEvent::Chat(ChatEvent::Activity { state, label, .. }) => {
-                if self.conversation.room_id == self.character_room {
+                if self.is_open_character() {
                     self.send(Update::Activity {
                         room_id: self.character_room.clone(),
                         activity: Some(label.filter(|_| state == "tool")),
@@ -1200,13 +1562,27 @@ impl Live {
                 let RoomEvent::Advanced {
                     room_id, last_seq, ..
                 } = *room;
-                if room_id == self.conversation.room_id && last_seq > self.conversation.synced {
-                    self.catch_up().await?;
+                if let Some(room) = self
+                    .last_rooms
+                    .iter_mut()
+                    .find(|room| room.room_id == room_id)
+                {
+                    room.last_seq = room.last_seq.max(last_seq);
+                    let through = room.last_seq;
+                    if room_id == self.conversation.room_id {
+                        self.queue_history(through);
+                    }
                 }
+            }
+            PickleEvent::Sync(sync) if self.roster_rev.is_none_or(|rev| sync.rev > rev) => {
+                ReconcileWork::queue(
+                    &mut self.roster_refresh,
+                    sync.rev,
+                    ReconcileWork::ROSTER_COALESCE,
+                );
             }
             _ => {}
         }
-        Ok(())
     }
 
     /// Sends a message the UI already shows. The server's copy, which carries the same id,
@@ -1229,50 +1605,149 @@ impl Live {
             .map(drop)
     }
 
-    /// Lists the conversation's pictures and files. The history on this computer usually
-    /// starts where the app was first opened; the messages before it are read page by page,
-    /// logged like any other, and the list is shown again after each page.
-    async fn read_archive(&mut self) -> openpickle_api::Result<()> {
-        if self.conversation.room_id.is_empty() {
-            self.find_room().await?;
+    fn watch_archive(&mut self, room_id: Option<&str>) {
+        let Some(room_id) = room_id else {
+            self.archive.pause();
+            return;
+        };
+        if room_id.is_empty()
+            || room_id != self.conversation.room_id
+            || self.archive.request.is_some()
+        {
+            return;
         }
-        self.show_archive(self.history_complete);
-        while !self.history_complete {
-            let before = self.conversation.first_seq().unwrap_or(i64::MAX);
-            let page = self
-                .client
-                .get_history_page(&self.conversation.room_id, before, ARCHIVE_PAGE)
-                .await?;
-            // A page that reaches back no further than what is known ends the reading.
-            let older = page.messages.iter().any(|item| item.seq < before);
-            self.history_complete = !page.has_more || !older;
+        self.archive.watching = true;
+        self.archive.attachments = self.conversation.attachments();
+        self.show_archive();
+        if !self.archive.complete
+            && self.roster_refresh.is_none()
+            && self.known_room(room_id).is_some()
+        {
+            let before = self
+                .archive
+                .before
+                .or_else(|| {
+                    let rescan = self
+                        .conversation
+                        .log
+                        .as_ref()
+                        .is_some_and(|log| log.archive_rescan);
+                    if rescan {
+                        None
+                    } else {
+                        self.conversation.first_seq()
+                    }
+                })
+                .unwrap_or(i64::MAX);
+            self.request_archive_page(before);
+        }
+    }
+
+    /// The select loop owns this future. Other ready branches can run while the GET is pending;
+    /// dropping the future cancels that read without applying anything to a different room.
+    fn request_archive_page(&mut self, before: i64) {
+        self.archive.before = Some(before);
+        let room_id = self.conversation.room_id.clone();
+        let client = self.client.clone();
+        self.archive.request = Some(Box::pin(async move {
+            let result = client
+                .get_history_page(&room_id, before, BACKWARD_PAGE_SIZE)
+                .await;
+            ArchivePage {
+                room_id,
+                before,
+                result,
+            }
+        }));
+    }
+
+    fn finish_archive_page(&mut self, page: ArchivePage) -> openpickle_api::Result<()> {
+        if page.room_id != self.conversation.room_id
+            || self.archive.before != Some(page.before)
+            || self.archive.request.is_none()
+        {
+            return Ok(());
+        }
+        self.archive.request = None;
+        // A failure leaves the requested cursor intact for the next opening.
+        let before = page.before;
+        let page = page.result?;
+        let next = backward_cursor(before, &page);
+        self.archive.complete = !page.has_more;
+        let attachments = self.apply_archive_page(before, page);
+        if self.archive.complete {
             if let Some(log) = &mut self.conversation.log {
-                let mut records: Vec<Record> = page
-                    .messages
-                    .iter()
-                    .cloned()
-                    .map(|item| Record::Item(Box::new(item)))
-                    .collect();
-                records.extend(page.card_states.iter().cloned().map(Record::Card));
-                log.append(&records);
+                log.finish_archive_rescan();
             }
-            let changed = self.conversation.apply(page.messages, page.card_states);
-            if !changed.is_empty() {
-                self.send(Update::Upsert {
-                    room_id: self.conversation.room_id.clone(),
-                    messages: changed,
-                });
+            // Include any live or delta messages received since the Archive opened.
+            self.archive.attachments = self.conversation.attachments();
+            self.show_archive();
+        } else if !attachments.is_empty() {
+            self.archive.add_attachments(attachments);
+            self.show_archive();
+        }
+        if let Some(next) = next {
+            self.archive.before = Some(next);
+            if self.roster_refresh.is_none() {
+                self.request_archive_page(next);
             }
-            self.show_archive(self.history_complete);
         }
         Ok(())
     }
 
-    fn show_archive(&mut self, complete: bool) {
+    fn apply_archive_page(
+        &mut self,
+        before: i64,
+        mut page: openpickle_api::HistoryPage,
+    ) -> Vec<Attachment> {
+        // The timeline may have received a fresh copy while this GET was in progress. A backward
+        // page must neither admit out-of-range items nor replace a copy already fetched normally.
+        page.messages.retain(|item| {
+            item.seq < before
+                && (!self.conversation.items.contains_key(&item.id)
+                    || self.conversation.search_context.contains(&item.id))
+        });
+        page.card_states.retain(|state| {
+            self.conversation
+                .card_states
+                .get(&state.id)
+                .is_none_or(|known| known.seq < state.seq)
+        });
+        let attachments = page
+            .messages
+            .iter()
+            .flat_map(convert::attachments)
+            .collect();
+        if let Some(log) = &mut self.conversation.log {
+            let mut records: Vec<Record> = page
+                .messages
+                .iter()
+                .cloned()
+                .map(|item| Record::Item(Box::new(item)))
+                .collect();
+            records.extend(page.card_states.iter().cloned().map(Record::Card));
+            records.extend(page.reactions.iter().cloned().map(Record::Reaction));
+            if !records.is_empty() {
+                log.append(&records);
+            }
+        }
+        let changed = self
+            .conversation
+            .apply(page.messages, page.card_states, page.reactions);
+        if !changed.is_empty() {
+            self.send(Update::Upsert {
+                room_id: self.conversation.room_id.clone(),
+                messages: changed,
+            });
+        }
+        attachments
+    }
+
+    fn show_archive(&self) {
         self.send(Update::Archive {
             room_id: self.conversation.room_id.clone(),
-            attachments: self.conversation.attachments(),
-            complete,
+            attachments: self.archive.attachments.clone(),
+            complete: self.archive.complete,
         });
     }
 
@@ -1343,42 +1818,33 @@ impl Live {
         }
     }
 
-    /// Downloads an attachment of the open conversation, the file itself, into the Downloads
-    /// folder. A file may take minutes, so it is fetched beside the conversation, which goes
-    /// on meanwhile.
-    fn download_attachment(&mut self, path: String) {
-        let attachments = self.conversation.attachments();
-        let Some(attachment) = attachments.iter().find(|item| item.path == path) else {
-            self.send(Update::AttachmentDownloaded {
-                path,
-                result: Err("This attachment does not belong to the open conversation.".to_owned()),
-            });
+    /// Authorize once against the room that was open when the download was requested.
+    fn download_attachment(&mut self, key: DownloadKey) {
+        let name = (key.room_id == self.conversation.room_id)
+            .then(|| {
+                // Use the newest matching metadata without building and sorting the whole Archive.
+                self.conversation
+                    .items
+                    .values()
+                    .filter_map(|item| {
+                        let attachment = convert::attachments(item)
+                            .into_iter()
+                            .find(|attachment| attachment.path == key.path)?;
+                        Some((item.seq, attachment.name))
+                    })
+                    .max_by_key(|(seq, _)| *seq)
+                    .map(|(_, name)| name)
+            })
+            .flatten();
+        let Some(name) = name else {
+            key.finished(
+                &self.updates,
+                Err("This attachment does not belong to the open conversation.".to_owned()),
+            );
             return;
         };
-        let name = attachment.name.clone();
-        let client = self.client.clone();
-        let updates = self.updates.clone();
-        let account_active = self.account_active.clone();
-        let folder = self.download_dir.clone();
-        tokio::spawn(async move {
-            let result = match client.get_attachment(&path).await {
-                Ok(_) if !account_active.load(Ordering::Acquire) => {
-                    Err("The account was signed out before the download finished.".to_owned())
-                }
-                // Writing a large file takes its time too, and the backend has one thread: the
-                // write goes to a thread of its own.
-                Ok(bytes) => {
-                    tokio::task::spawn_blocking(move || save_download(&folder, &name, &bytes))
-                        .await
-                        .unwrap_or_else(|stopped| Err(std::io::Error::other(stopped)))
-                        .map_err(|error| format!("Could not save the file: {error}"))
-                }
-                Err(error) => Err(explain(&error)),
-            };
-            updates
-                .unbounded_send(Update::AttachmentDownloaded { path, result })
-                .ok();
-        });
+        self.original_downloads
+            .start(key, self.client.clone(), name, self.updates.clone());
     }
 
     /// What the disk has under `name`, the first time it is asked for in this run. The window
@@ -1764,7 +2230,24 @@ impl Live {
     /// Tells the window which other chat rooms exist, and shows their characters' pictures.
     fn show_rooms(&mut self, rooms: &openpickle_api::SyncResponse) {
         let (infos, pictures) = convert::rooms(&rooms.rooms);
-        self.last_rooms = rooms.rooms.clone();
+        let previous: HashMap<_, _> = self
+            .last_rooms
+            .iter()
+            .map(|room| (room.room_id.as_str(), room))
+            .collect();
+        self.last_rooms = rooms
+            .rooms
+            .iter()
+            .cloned()
+            .map(|mut room| {
+                if let Some(old) = previous.get(room.room_id.as_str())
+                    && old.log_epoch == room.log_epoch
+                {
+                    room.last_seq = room.last_seq.max(old.last_seq);
+                }
+                room
+            })
+            .collect();
         self.send(Update::Rooms(infos));
         self.fetch_pictures(pictures);
     }
@@ -1773,9 +2256,15 @@ impl Live {
         self.last_rooms.iter().find(|room| room.room_id == room_id)
     }
 
+    fn is_open_character(&self) -> bool {
+        !self.character_room.is_empty() && self.conversation.room_id == self.character_room
+    }
+
     fn send_block_reason(&self, room_id: &str) -> Option<&'static str> {
         if room_id != self.conversation.room_id {
             Some("Not sent. This conversation is no longer open.")
+        } else if self.roster_refresh.is_some() {
+            Some("Not sent. Room permissions are updating. Try again.")
         } else if !self.known_room(room_id).is_some_and(|room| !room.observer) {
             Some("Not sent. This room is read-only.")
         } else {
@@ -1784,7 +2273,8 @@ impl Live {
     }
 
     fn reset_room_state(&mut self) {
-        self.history_complete = false;
+        self.archive = ArchiveLoad::default();
+        self.history_refresh = None;
         self.marked_read = 0;
     }
 
@@ -1811,8 +2301,11 @@ impl Live {
     /// old conversation intact.
     async fn open_room(&mut self, requested: &str) -> Result<(), OpenRoomError> {
         let mut refreshed = false;
-        if self.last_rooms.is_empty() || self.character_room.is_empty() {
-            self.refresh_rooms().await.map_err(OpenRoomError::Session)?;
+        if self.last_rooms.is_empty()
+            || self.character_room.is_empty()
+            || self.roster_refresh.is_some()
+        {
+            self.find_room().await.map_err(OpenRoomError::Session)?;
             refreshed = true;
         }
         let mut wanted = if requested.is_empty() {
@@ -1823,18 +2316,27 @@ impl Live {
         if (wanted.is_empty() || self.known_room(&wanted).is_none()) && !refreshed {
             // A link can name a room created after the last event or reconnect. Refresh the
             // authoritative roster once before deciding that the account cannot open it.
-            self.refresh_rooms().await.map_err(OpenRoomError::Session)?;
+            self.find_room().await.map_err(OpenRoomError::Session)?;
             wanted = if requested.is_empty() {
                 self.character_room.clone()
             } else {
                 requested.to_owned()
             };
         }
-        if wanted.is_empty() || self.known_room(&wanted).is_none() {
+        if self.roster_refresh.is_some() {
+            return Err(OpenRoomError::Visible(
+                "Room permissions are updating. Try opening this room again.".to_owned(),
+            ));
+        }
+        let Some(through) = self
+            .known_room(&wanted)
+            .filter(|_| !wanted.is_empty())
+            .map(|room| room.last_seq)
+        else {
             return Err(OpenRoomError::Visible(
                 "This chat room is not available for this account.".to_owned(),
             ));
-        }
+        };
         if wanted == self.conversation.room_id {
             // Opening a room is also a UI handshake: a no-op still acknowledges the request so
             // the window can clear its pending switch state and restore the composer.
@@ -1850,19 +2352,21 @@ impl Live {
         self.room_override = (wanted != self.character_room).then(|| wanted.clone());
         self.conversation = target;
         self.reset_room_state();
+        // The staged delta can succeed before it reaches the last advertised room sequence.
+        self.queue_history(through);
         self.send_update_for(&wanted);
         self.mark_read().await;
         Ok(())
     }
 
-    /// The conversation update for a validated room: the character room carries the primary
-    /// identity; a peer room carries the title and permissions from `sync`.
-    fn send_update_for(&self, room_id: &str) {
+    fn room_metadata(&self, room_id: &str) -> RoomMetadata {
         let room = self.known_room(room_id);
         let is_character = room.is_some_and(|room| room.kind == "character");
         let can_send = room.is_some_and(|room| !room.observer);
         let (name, avatar) = if is_character {
             (self.display_name(), self.avatar_path())
+        } else if room_id.is_empty() {
+            ("No conversation".to_owned(), None)
         } else {
             (
                 room.map(|room| {
@@ -1880,8 +2384,26 @@ impl Live {
                 None,
             )
         };
-        self.send(Update::Conversation {
+        RoomMetadata {
             room_id: room_id.to_owned(),
+            is_character,
+            can_send,
+            name,
+            avatar,
+        }
+    }
+
+    /// Full snapshot for a room switch or an explicit room-open acknowledgment.
+    fn send_update_for(&self, room_id: &str) {
+        let RoomMetadata {
+            room_id,
+            is_character,
+            can_send,
+            name,
+            avatar,
+        } = self.room_metadata(room_id);
+        self.send(Update::Conversation {
+            room_id,
             is_character,
             can_send,
             name,
@@ -1907,7 +2429,7 @@ impl Live {
         let head = self.conversation.head_seq();
         if self.active
             && head > self.marked_read
-            && !self.conversation.room_id.is_empty()
+            && self.known_room(&self.conversation.room_id).is_some()
             && self
                 .client
                 .mark_read(&self.conversation.room_id, head)
@@ -2031,8 +2553,8 @@ impl PictureFetches {
     }
 }
 
-/// How many messages the Archive reads back at a time, as the app does.
-const ARCHIVE_PAGE: u32 = 250;
+/// How many messages the Archive asks for in one request, as the app does.
+const BACKWARD_PAGE_SIZE: u32 = 250;
 
 /// Downloads pictures, a few at a time.
 struct Downloads {
@@ -2066,7 +2588,6 @@ impl Downloads {
     }
 }
 
-/// The cache file of the picture with this key. The extension tells GPUI how to decode it.
 /// The user's Downloads folder. A system that names none gets one in the home folder.
 fn download_dir() -> PathBuf {
     dirs::download_dir()
@@ -2074,55 +2595,7 @@ fn download_dir() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
-/// Writes a downloaded file into `folder` under its own name, or under the next free one
-/// ("report (1).pdf") when a file of that name is there. Only the last part of the name is
-/// used and what a file name may not hold is replaced, so that a name from the server cannot
-/// lead out of the folder.
-fn save_download(folder: &Path, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
-    use std::io::Write;
-
-    let name: String = Path::new(name)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("attachment")
-        .chars()
-        .map(|c| match c {
-            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
-            c if c.is_control() => '_',
-            c => c,
-        })
-        .collect();
-    let (stem, extension) = match name.rfind('.') {
-        Some(dot) if dot > 0 => name.split_at(dot),
-        _ => (name.as_str(), ""),
-    };
-    std::fs::create_dir_all(folder)?;
-    for count in 0.. {
-        let file = if count == 0 {
-            folder.join(&name)
-        } else {
-            folder.join(format!("{stem} ({count}){extension}"))
-        };
-        // Creating the file fails when it exists: two downloads cannot take one name.
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&file)
-        {
-            Ok(mut created) => {
-                if let Err(error) = created.write_all(bytes) {
-                    std::fs::remove_file(&file).ok();
-                    return Err(error);
-                }
-                return Ok(file);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-    }
-    unreachable!("the count has no end")
-}
-
+/// The cache file of the picture with this key. The extension tells GPUI how to decode it.
 fn picture_file(key: &str) -> String {
     // FNV-1a: the name has to be the same in every run, which the standard hasher does not
     // promise.
@@ -2168,7 +2641,7 @@ mod tests {
     use std::{
         io::{Read, Write},
         net::{TcpListener, TcpStream},
-        sync::Mutex,
+        sync::{Mutex, atomic::AtomicI64},
         thread,
     };
 
@@ -2177,6 +2650,7 @@ mod tests {
         address: std::net::SocketAddr,
         requests: Arc<Mutex<Vec<String>>>,
         rooms: Arc<Mutex<Vec<openpickle_api::Room>>>,
+        roster_rev: Arc<AtomicI64>,
         fail_sync_once: Arc<AtomicBool>,
         fail_handoffs_once: Arc<AtomicBool>,
         tasks_ended: Arc<AtomicBool>,
@@ -2204,6 +2678,8 @@ mod tests {
             let active = Arc::new(AtomicBool::new(true));
             let server_requests = requests.clone();
             let server_rooms = rooms.clone();
+            let roster_rev = Arc::new(AtomicI64::new(1));
+            let server_roster_rev = roster_rev.clone();
             let server_fail_sync_once = fail_sync_once.clone();
             let server_fail_handoffs_once = fail_handoffs_once.clone();
             let server_tasks_ended = tasks_ended.clone();
@@ -2233,7 +2709,7 @@ mod tests {
                                 "200 OK",
                                 serde_json::json!({
                                     "rooms": server_rooms.lock().unwrap().clone(),
-                                    "rev": 1,
+                                    "rev": server_roster_rev.load(Ordering::Acquire),
                                 })
                                 .to_string(),
                             )
@@ -2360,6 +2836,7 @@ mod tests {
                 address,
                 requests,
                 rooms,
+                roster_rev,
                 fail_sync_once,
                 fail_handoffs_once,
                 tasks_ended,
@@ -2459,9 +2936,12 @@ mod tests {
             handoff_watch: None,
             phone_watch: None,
             handoff_cards: HandoffCards::default(),
-            download_dir: store.cache_path("downloads"),
+            original_downloads: OriginalDownloads::new(
+                store.cache_path("downloads"),
+                account_active.clone(),
+            ),
             active: false,
-            history_complete: false,
+            archive: ArchiveLoad::default(),
             character_room: "primary".to_owned(),
             room_override: None,
             last_rooms: vec![
@@ -2469,6 +2949,9 @@ mod tests {
                 fixture_room("peer", "character_pair", false),
                 fixture_room("observer", "character_pair", true),
             ],
+            roster_rev: None,
+            roster_refresh: None,
+            history_refresh: None,
             account_active: account_active.clone(),
             shown_from_disk: HashSet::new(),
             pictures: PictureFetches::new(account_active),
@@ -2479,6 +2962,162 @@ mod tests {
 
     fn drain(received: &mut futures::channel::mpsc::UnboundedReceiver<Update>) {
         while received.try_recv().is_ok() {}
+    }
+
+    #[test]
+    fn archive_resumes_its_server_cursor_and_stops_if_it_does_not_advance() {
+        let server = HistoryServer::start();
+        let (mut live, mut received) = fixture_live("archive-cursor", &server);
+        let item = |id: &str, seq: i64| {
+            serde_json::from_value::<HistoryItem>(serde_json::json!({
+                "role": "user", "id": id, "text": id, "at": 10.0, "seq": seq,
+            }))
+            .unwrap()
+        };
+        live.conversation
+            .items
+            .insert("latest".into(), item("latest", 100));
+        live.conversation.synced = 100;
+        live.watch_archive(Some("primary"));
+        assert_eq!(live.archive.before, Some(100));
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Update::Archive {
+                complete: false,
+                ..
+            }
+        ));
+
+        let page = |room_id: &str, before, messages, next_before, has_more| ArchivePage {
+            room_id: room_id.into(),
+            before,
+            result: Ok(openpickle_api::HistoryPage {
+                v: 1,
+                messages,
+                reactions: vec![],
+                card_states: vec![],
+                has_more,
+                next_before,
+            }),
+        };
+        let stale = page("peer", 100, vec![item("peer-only", 90)], 90, true);
+        live.finish_archive_page(stale).unwrap();
+        assert!(!live.conversation.items.contains_key("peer-only"));
+        assert!(live.archive.request.is_some());
+
+        // The page cursor is authoritative, not the minimum message sequence in the page.
+        let first = page(
+            "primary",
+            100,
+            vec![item("out-of-range", 100), item("older", 96)],
+            90,
+            true,
+        );
+        live.finish_archive_page(first).unwrap();
+        assert_eq!(live.archive.before, Some(90));
+        assert_eq!(live.conversation.synced, 100);
+        assert!(
+            matches!(received.try_recv().unwrap(), Update::Upsert { messages, .. }
+            if messages.iter().map(|message| message.seq).eq([96]))
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "a text-only continuation needs no Archive snapshot"
+        );
+
+        live.watch_archive(None);
+        assert!(live.archive.request.is_none());
+        live.watch_archive(Some("primary"));
+        assert_eq!(live.archive.before, Some(90));
+        assert!(live.archive.request.is_some());
+        let stuck = page(
+            "primary",
+            90,
+            vec![item("still-older", 89), item("older", 88)],
+            90,
+            true,
+        );
+        live.finish_archive_page(stuck).unwrap();
+        assert!(live.archive.request.is_none());
+        assert!(!live.archive.complete);
+        assert!(live.conversation.items.contains_key("still-older"));
+        assert_eq!(live.conversation.items["older"].seq, 96);
+    }
+
+    #[tokio::test]
+    async fn cached_room_waits_for_roster_before_remote_archive_and_search_reads() {
+        let server = HistoryServer::start();
+        let (mut live, mut received) = fixture_live("archive-search-roster", &server);
+        live.character_room.clear();
+        live.last_rooms.clear();
+        live.watch_archive(Some("primary"));
+        assert!(live.archive.request.is_none());
+        drain(&mut received);
+
+        let mut search = SearchReads::default();
+        live.queue_search(
+            &mut search,
+            crate::protocol::SearchRequest {
+                room_id: "primary".into(),
+                id: 1,
+            },
+            SearchJob::Query("fixture".into()),
+        );
+        search.start_next(&live.client, live.search_room(), true);
+        assert!(!search.is_active());
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Update::Found {
+                results: Err(_),
+                ..
+            })
+        ));
+
+        live.find_room().await.unwrap();
+        assert!(live.archive.request.is_some());
+        assert_eq!(live.search_room(), Some("primary"));
+    }
+
+    #[tokio::test]
+    async fn a_pending_archive_read_does_not_delay_events_timers_or_opening_another_room() {
+        let server = HistoryServer::start();
+        let (mut live, mut updates) = fixture_live("archive-interrupt", &server);
+        let (commands, mut receiver) = unbounded_channel();
+        let (events, incoming) = futures::channel::mpsc::unbounded();
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped, dropped_rx) = tokio::sync::oneshot::channel::<()>();
+        live.archive.before = Some(100);
+        live.archive.request = Some(Box::pin(async move {
+            let _dropped_on_cancel = dropped;
+            started.send(()).unwrap();
+            std::future::pending().await
+        }));
+        live.handoff_watch = Some(HandoffWatch {
+            path: "handoffs/done-task".into(),
+            next_refresh: Some(Instant::now()),
+        });
+        let (ended, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                conversation_loop(&mut live, &mut receiver, Some(Box::pin(incoming))),
+                async {
+                    started_rx.await.unwrap();
+                    events.unbounded_send(Ok(PickleEvent::Chat(ChatEvent::Pending { on: true }))).unwrap();
+                    let (mut activity, mut timer) = (false, false);
+                    while !activity || !timer {
+                        match updates.next().await.unwrap() {
+                            Update::Activity { room_id, activity: Some(None) } if room_id == "primary" => activity = true,
+                            Update::Handoff { result: Ok(_), .. } => timer = true,
+                            _ => {}
+                        }
+                    }
+                    commands.send(Command::OpenRoom("peer".into())).ok().unwrap();
+                    assert!(dropped_rx.await.is_err(), "the old room's pending read was dropped");
+                    assert!(matches!(updates.next().await, Some(Update::Conversation { room_id, .. }) if room_id == "peer"));
+                    commands.send(Command::Quit).ok().unwrap();
+                }
+            )
+        }).await.expect("the pending Archive GET must not block the conversation loop");
+        assert!(matches!(ended, Ended::Closed));
     }
 
     #[tokio::test]
@@ -2509,6 +3148,219 @@ mod tests {
                 .filter(|target| target.contains("after_seq=1"))
                 .count(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn room_advance_retries_from_the_applied_cursor_without_another_event() {
+        let server = HistoryServer::start();
+        server.fail_second_history_page_once();
+        let (mut live, mut received) = fixture_live("quiet-retry", &server);
+        live.handle(PickleEvent::Room(Box::new(RoomEvent::Advanced {
+            room_id: "primary".into(),
+            last_seq: 2,
+            room: fixture_room("primary", "character", false),
+        })));
+        live.reconcile().await.unwrap();
+        assert_eq!(live.conversation.synced, 1);
+        assert!(live.reconcile_at().is_some_and(|at| at > Instant::now()));
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Update::Upsert { room_id, messages })
+                if room_id == "primary" && messages[0].seq == 1
+        ));
+
+        // Make the retry deadline due without introducing another SSE event or a real delay.
+        live.history_refresh.as_mut().unwrap().at = Instant::now();
+        live.reconcile().await.unwrap();
+        assert_eq!(live.conversation.synced, 2);
+        assert!(live.reconcile_at().is_none());
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Update::Upsert { room_id, messages })
+                if room_id == "primary" && messages[0].seq == 2
+        ));
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|target| target.contains("after_seq=1"))
+                .count(),
+            2
+        );
+    }
+
+    fn sync_event(rev: i64) -> PickleEvent {
+        PickleEvent::Sync(openpickle_api::events::SyncEvent { rev })
+    }
+
+    #[tokio::test]
+    async fn newer_roster_updates_permissions_after_coalescing_and_sync_lag() {
+        let server = HistoryServer::start();
+        let (mut live, mut received) = fixture_live("roster-permissions", &server);
+        live.find_room().await.unwrap();
+        live.open_room("peer").await.unwrap();
+        live.archive.complete = true;
+        live.marked_read = 1;
+        let cursor_before = live.conversation.synced;
+        drain(&mut received);
+
+        live.handle(sync_event(1));
+        assert!(live.reconcile_at().is_none());
+        live.handle(sync_event(2));
+        let first_deadline = live.reconcile_at().unwrap();
+        live.handle(sync_event(4));
+        live.handle(sync_event(3));
+        assert_eq!(live.reconcile_at(), Some(first_deadline));
+        assert_eq!(live.roster_refresh.as_ref().unwrap().through, 4);
+
+        // An old snapshot and then a request failure must leave the newest revision pending.
+        live.roster_refresh.as_mut().unwrap().at = Instant::now();
+        live.reconcile().await.unwrap();
+        assert_eq!(live.roster_refresh.as_ref().unwrap().through, 4);
+        server.fail_next_sync();
+        live.roster_refresh.as_mut().unwrap().at = Instant::now();
+        live.reconcile().await.unwrap();
+        assert_eq!(live.roster_rev, Some(1));
+        assert_eq!(live.roster_refresh.as_ref().unwrap().through, 4);
+
+        let mut peer = fixture_room("peer", "character_pair", true);
+        peer.title = "Renamed peer".into();
+        server.set_rooms(vec![fixture_room("primary", "character", false), peer]);
+        server.roster_rev.store(4, Ordering::Release);
+        live.roster_refresh.as_mut().unwrap().at = Instant::now();
+        live.reconcile().await.unwrap();
+        assert_eq!(live.roster_rev, Some(4));
+        assert!(live.reconcile_at().is_none());
+        assert_eq!(live.conversation.room_id, "peer");
+        assert_eq!(live.conversation.synced, cursor_before);
+        assert_eq!(live.marked_read, 1);
+        assert!(live.archive.complete);
+        assert_eq!(
+            live.send_block_reason("peer"),
+            Some("Not sent. This room is read-only.")
+        );
+        let updates: Vec<_> = std::iter::from_fn(|| received.try_recv().ok()).collect();
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            Update::RoomMetadata(RoomMetadata { room_id, name, can_send: false, .. })
+                if room_id == "peer" && name == "Renamed peer"
+        )));
+        assert!(
+            !updates
+                .iter()
+                .any(|update| matches!(update, Update::Conversation { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn revoked_room_falls_back_and_drops_its_scheduled_history() {
+        let server = HistoryServer::start();
+        let (mut live, mut received) = fixture_live("roster-revocation", &server);
+        live.find_room().await.unwrap();
+        live.open_room("peer").await.unwrap();
+        drain(&mut received);
+        server.requests.lock().unwrap().clear();
+
+        live.handle(PickleEvent::Room(Box::new(RoomEvent::Advanced {
+            room_id: "peer".into(),
+            last_seq: 10,
+            room: fixture_room("peer", "character_pair", false),
+        })));
+        server.set_rooms(vec![fixture_room("primary", "character", false)]);
+        server.roster_rev.store(2, Ordering::Release);
+        live.handle(sync_event(2));
+        live.roster_refresh.as_mut().unwrap().at = Instant::now();
+        live.reconcile().await.unwrap();
+        assert_eq!(live.conversation.room_id, "primary");
+        assert!(live.room_override.is_none());
+        assert!(live.history_refresh.is_none());
+        assert!(live.send_block_reason("peer").is_some());
+        assert!(matches!(received.try_recv(), Ok(Update::Rooms(_))));
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Update::Conversation { room_id, can_send: true, .. }) if room_id == "primary"
+        ));
+        assert!(
+            !server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|req| req.contains("/rooms/peer/"))
+        );
+
+        // If the primary is removed too, there is no authorized fallback to load from disk.
+        live.catch_up().await.unwrap();
+        drain(&mut received);
+        server.set_rooms(Vec::new());
+        server.roster_rev.store(3, Ordering::Release);
+        live.handle(sync_event(3));
+        live.roster_refresh.as_mut().unwrap().at = Instant::now();
+        live.reconcile().await.unwrap();
+        assert!(live.conversation.room_id.is_empty());
+        assert!(live.store.cached::<String>("room.json").is_none());
+        assert!(matches!(received.try_recv(), Ok(Update::Rooms(_))));
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Update::Conversation { room_id, messages, can_send: false, .. })
+                if room_id.is_empty() && messages.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_retries_from_a_staged_delta_behind_the_last_announced_sequence() {
+        let server = HistoryServer::start();
+        let (mut live, mut received) = fixture_live("staged-lag", &server);
+        live.find_room().await.unwrap();
+        drain(&mut received);
+        live.handle(PickleEvent::Room(Box::new(RoomEvent::Advanced {
+            room_id: "peer".into(),
+            last_seq: 2,
+            room: fixture_room("peer", "character_pair", false),
+        })));
+        assert!(live.history_refresh.is_none());
+
+        // A same-epoch roster response can still be behind the room event.
+        live.find_room().await.unwrap();
+        drain(&mut received);
+        live.open_room("peer").await.unwrap();
+        assert_eq!(live.conversation.synced, 1);
+        assert_eq!(live.history_refresh.as_ref().unwrap().through, 2);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Update::Conversation { room_id, .. }) if room_id == "peer"
+        ));
+
+        live.reconcile().await.unwrap();
+        assert_eq!(live.conversation.synced, 2);
+        assert!(live.history_refresh.is_none());
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Update::Upsert { room_id, messages })
+                if room_id == "peer" && messages[0].seq == 2
+        ));
+    }
+
+    #[tokio::test]
+    async fn known_stale_roster_cannot_authorize_a_send_or_open() {
+        let server = HistoryServer::start();
+        let (mut live, _) = fixture_live("stale-roster", &server);
+        live.find_room().await.unwrap();
+        live.handle(sync_event(2));
+        assert!(live.send_block_reason("primary").is_some());
+        assert!(matches!(
+            live.open_room("peer").await,
+            Err(OpenRoomError::Visible(_))
+        ));
+        assert_eq!(live.conversation.room_id, "primary");
+        assert!(
+            !server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.contains("/history/"))
         );
     }
 
@@ -2578,7 +3430,8 @@ mod tests {
         ));
         assert!(matches!(
             cached_updates.next().await,
-            Some(Update::Conversation { room_id, can_send: true, .. }) if room_id == "primary"
+            Some(Update::RoomMetadata(RoomMetadata { room_id, can_send: true, .. }))
+                if room_id == "primary"
         ));
     }
 
@@ -2654,12 +3507,12 @@ mod tests {
         let server = HistoryServer::start();
         let (mut live, mut received) = fixture_live("isolation", &server);
 
-        live.history_complete = true;
+        live.archive.complete = true;
         live.marked_read = 41;
         live.open_room("peer").await.unwrap();
         assert_eq!(live.conversation.room_id, "peer");
         assert_eq!(live.room_override.as_deref(), Some("peer"));
-        assert!(!live.history_complete);
+        assert!(!live.archive.complete);
         assert_eq!(live.marked_read, 0);
         assert_eq!(
             live.store.cached::<String>("room.json").as_deref(),
@@ -2684,12 +3537,8 @@ mod tests {
             seq: 99,
             channel: "fixture".to_owned(),
             prev_seq: None,
-        }))
-        .await
-        .unwrap();
-        live.handle(PickleEvent::Chat(ChatEvent::Pending { on: true }))
-            .await
-            .unwrap();
+        }));
+        live.handle(PickleEvent::Chat(ChatEvent::Pending { on: true }));
         assert!(!live.conversation.items.contains_key("unscoped"));
         assert!(received.try_recv().is_err());
 
@@ -2700,9 +3549,8 @@ mod tests {
             room_id: "peer".to_owned(),
             last_seq: 2,
             room: peer,
-        })))
-        .await
-        .unwrap();
+        })));
+        live.reconcile().await.unwrap();
         assert_eq!(live.conversation.synced, 2);
         assert!(matches!(
             received.next().await,
@@ -2711,12 +3559,12 @@ mod tests {
         ));
 
         // Empty OpenRoom returns to the character conversation and resets per-room state.
-        live.history_complete = true;
+        live.archive.complete = true;
         live.marked_read = 87;
         live.open_room("").await.unwrap();
         assert_eq!(live.conversation.room_id, "primary");
         assert!(live.room_override.is_none());
-        assert!(!live.history_complete);
+        assert!(!live.archive.complete);
         assert_eq!(live.marked_read, 0);
         assert_eq!(
             live.store.cached::<String>("room.json").as_deref(),
@@ -2777,32 +3625,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_download_keeps_its_name_or_takes_the_next_free_one_and_stays_in_its_folder() {
-        let folder =
-            std::env::temp_dir().join(format!("openpickle-test-downloads-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&folder);
-        let first = save_download(&folder, "보고서 최종.pdf", b"one").unwrap();
-        let second = save_download(&folder, "보고서 최종.pdf", b"two").unwrap();
-        assert_eq!(first, folder.join("보고서 최종.pdf"));
-        assert_eq!(second, folder.join("보고서 최종 (1).pdf"));
-        assert_eq!(std::fs::read(&first).unwrap(), b"one");
-        assert_eq!(std::fs::read(&second).unwrap(), b"two");
-        // A name from the server cannot lead out of the folder. A name without an extension
-        // is counted without one.
-        let notes = save_download(&folder, "../../notes", b"x").unwrap();
-        assert_eq!(notes, folder.join("notes"));
-        assert_eq!(
-            save_download(&folder, "notes", b"y").unwrap(),
-            folder.join("notes (1)")
-        );
-        assert_eq!(
-            save_download(&folder, "..", b"z").unwrap(),
-            folder.join("attachment")
-        );
-        std::fs::remove_dir_all(&folder).ok();
-    }
-
     #[tokio::test]
     async fn an_attachment_of_the_open_conversation_is_downloaded_under_its_own_name() {
         let server = HistoryServer::start();
@@ -2813,23 +3635,40 @@ mod tests {
             "file_meta": {"attachments/2026-11-05/계획서.md": {"name": "계획서.md", "size": 23}},
         }))
         .unwrap();
-        live.conversation.apply(vec![item], vec![]);
+        live.conversation.apply(vec![item], vec![], vec![]);
 
-        // A path that no message of the conversation carries is not asked for.
-        live.download_attachment("attachments/2026-11-05/other.pdf".into());
-        assert!(matches!(
-            received.try_recv().unwrap(),
-            Update::AttachmentDownloaded { result: Err(_), .. }
-        ));
+        let key = |room_id: &str, file: &str| DownloadKey {
+            room_id: room_id.into(),
+            path: format!("attachments/2026-11-05/{file}"),
+        };
+        // Unknown paths and requests from a room that is no longer open never reach HTTP.
+        for unauthorized in [key("primary", "other.pdf"), key("peer", "계획서.md")] {
+            live.download_attachment(unauthorized);
+            assert!(matches!(
+                received.try_recv().unwrap(),
+                Update::AttachmentDownloaded { result: Err(_), .. }
+            ));
+        }
         assert!(server.requests.lock().unwrap().is_empty());
 
-        live.download_attachment("attachments/2026-11-05/계획서.md".into());
-        let Some(Update::AttachmentDownloaded { path, result }) = received.next().await else {
-            panic!("the download reports how it ended");
-        };
+        live.download_attachment(key("primary", "계획서.md"));
+        let (room_id, path, file) = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Update::AttachmentDownloaded {
+                    room_id,
+                    path,
+                    result,
+                } = received.next().await.expect("the backend is still running")
+                {
+                    break (room_id, path, result.unwrap());
+                }
+            }
+        })
+        .await
+        .expect("the download reports how it ended");
+        assert_eq!(room_id, "primary");
         assert_eq!(path, "attachments/2026-11-05/계획서.md");
-        let file = result.unwrap();
-        assert_eq!(file, live.download_dir.join("계획서.md"));
+        assert_eq!(file, live.store.cache_path("downloads").join("계획서.md"));
         assert_eq!(std::fs::read(&file).unwrap(), b"the file as it was made");
         assert_eq!(
             *server.requests.lock().unwrap(),
@@ -2841,6 +3680,76 @@ mod tests {
     fn attachment_thumbnails_are_always_cached_as_jpeg() {
         assert!(picture_file("thumbnail:attachments/fixture/document.pdf").ends_with(".jpg"));
         assert!(picture_file("thumbnail:attachments/fixture/picture.png").ends_with(".jpg"));
+    }
+
+    #[test]
+    fn startup_keeps_the_saved_accounts_cache_but_never_reuses_it_for_a_new_login() {
+        for malformed in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "openpickle-test-account-cache-{}-{malformed}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let store = Store::at(root.clone()).unwrap();
+            let previous = Session {
+                login_session_token: "fixture-old-user".into(),
+                device_id: "fixture-old-device".into(),
+            };
+            store.save_session(&previous).unwrap();
+            store.cache("room.json", &"previous-room").unwrap();
+            store
+                .cache(
+                    "identity.json",
+                    &Identity {
+                        name: "Previous Pickle".into(),
+                        avatar_file: Some("avatar.png".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            store.cache_bytes("avatar.png", b"fixture avatar").unwrap();
+            let old_row: HistoryItem = serde_json::from_value(serde_json::json!({
+                "role": "user", "id": "previous-row", "text": "Old message", "at": 1.0, "seq": 1
+            }))
+            .unwrap();
+            store
+                .append_log(
+                    "room-previous-room.jsonl",
+                    &[Record::Item(Box::new(old_row))],
+                )
+                .unwrap();
+            let (updates, mut received) = futures::channel::mpsc::unbounded();
+            let restored = store.session().unwrap().unwrap();
+            assert!(start_conversation(&store, restored, None, &updates).is_ok());
+            assert!(matches!(
+                received.try_recv().unwrap(),
+                Update::Conversation { room_id, name, avatar: Some(_), messages, can_send: false, .. }
+                if room_id == "previous-room" && name == "Previous Pickle" && messages.len() == 1
+            ));
+
+            let credential = root.join("session.json");
+            if malformed {
+                std::fs::write(&credential, b"synthetic malformed login").unwrap();
+            } else {
+                std::fs::remove_file(&credential).unwrap();
+            }
+            let fresh = Session {
+                login_session_token: "fixture-new-user".into(),
+                device_id: "fixture-new-device".into(),
+            };
+            store.start_session(&fresh).unwrap();
+            assert!(start_conversation(&store, fresh, None, &updates).is_ok());
+            assert!(matches!(
+                received.try_recv().unwrap(),
+                Update::Conversation { room_id, name, avatar: None, messages, can_send: false, .. }
+                if room_id.is_empty() && name == "Pickle" && messages.is_empty()
+            ));
+            assert!(
+                Conversation::load(&store, "previous-room")
+                    .messages()
+                    .is_empty()
+            );
+        }
     }
 
     #[test]
@@ -2866,7 +3775,7 @@ mod tests {
         };
 
         save_refresh_if_active(&store, &active, "fixture-device", &refresh).unwrap();
-        assert!(store.session().is_none());
+        assert!(store.session().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2962,6 +3871,7 @@ mod tests {
                 "attachments": ["attachments/2026-11-16/a.png"],
             }))],
             Vec::new(),
+            Vec::new(),
         );
         let announced = serde_json::json!({ "role": "user", "id": "m", "text": "사진 보낼게", "at": 10.0, "seq": 7 });
         assert!(conversation.hear(item(announced)).is_some());
@@ -3035,6 +3945,225 @@ mod tests {
         ))));
         assert!(!session_is_gone(&Error::RefreshAborted));
         assert!(!session_is_gone(&Error::InvalidHeader));
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_middle_record_replays_from_the_last_safe_cursor() {
+        let server = HistoryServer::start();
+        let (live, _) = fixture_live("repair-middle", &server);
+        let store = &live.store;
+        let log = HistoryLog::new(store, "primary");
+        let path = store.cache_path(&log.name);
+        let prefix = br#"{"t":"item","v":{"id":"fixture-1","role":"assistant","seq":1,"at":1.0}}
+{"t":"synced","v":1}
+"#;
+        let invalid = br#"{"t":"item","v":{"id":"missing-required-fields"}}
+"#;
+        let kept = br#"{"t":"item","v":{"id":"fixture-3","role":"assistant","seq":3,"at":1.0,"extra_field":"keep"}}
+{"t":"card","v":{"id":"fixture-3","seq":3,"state":"answered"}}
+"#;
+        let unsafe_cursor = b"{\"t\":\"synced\",\"v\":3}\n";
+        std::fs::write(
+            &path,
+            [prefix.as_slice(), invalid, kept, unsafe_cursor].concat(),
+        )
+        .unwrap();
+
+        let mut other = HistoryLog::new(store, "peer");
+        other.append(&[Record::Synced(42)]);
+        let other_path = store.cache_path(&other.name);
+        let other_data = std::fs::read(&other_path).unwrap();
+
+        let repaired = Conversation::load(store, "primary");
+        assert_eq!(repaired.synced, 1);
+        assert_eq!(repaired.items.len(), 2);
+        assert_eq!(repaired.card_states["fixture-3"].state, "answered");
+        let clean = [prefix.as_slice(), kept].concat();
+        assert_eq!(std::fs::read(&path).unwrap(), clean);
+        assert_eq!(std::fs::read(&other_path).unwrap(), other_data);
+        assert_eq!(Conversation::load(store, "peer").synced, 42);
+
+        // Restart before replay completes: the suspect cursor must stay invalidated.
+        let mut resumed = Conversation::load(store, "primary");
+        assert_eq!(resumed.synced, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), clean);
+        catch_up_conversation(&live.client, &mut resumed, |_| {})
+            .await
+            .unwrap();
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("after_seq=1"));
+        let reloaded = Conversation::load(store, "primary");
+        assert_eq!(reloaded.synced, 2);
+        assert_eq!(reloaded.items.len(), 3);
+        assert!(reloaded.items.contains_key("fixture-2"));
+        assert!(reloaded.items.contains_key("fixture-3"));
+        assert_eq!(reloaded.card_states["fixture-3"].state, "answered");
+    }
+
+    #[tokio::test]
+    async fn archive_rescans_older_history_after_middle_damage_and_restart() {
+        let server = HistoryServer::start();
+        let (mut live, _) = fixture_live("repair-archive", &server);
+        let path = live.store.cache_path("room-primary.jsonl");
+        std::fs::write(
+            path,
+            b"{\"t\":\"synced\",\"v\":30}\ninvalid archived row\n{\"t\":\"item\",\"v\":{\"id\":\"older\",\"role\":\"assistant\",\"seq\":5,\"at\":1.0}}\n",
+        )
+        .unwrap();
+        let repaired = Conversation::load(&live.store, "primary");
+        assert_eq!(repaired.synced, 30);
+        drop(repaired);
+
+        live.conversation = Conversation::load(&live.store, "primary");
+        assert_eq!(live.conversation.first_seq(), Some(5));
+        live.watch_archive(Some("primary"));
+        assert_eq!(live.archive.before, Some(i64::MAX));
+        let page = serde_json::from_value(serde_json::json!({
+            "v": 1,
+            "messages": [{"id":"missed", "role":"assistant", "seq":8, "at":2.0}],
+            "card_states": [], "reactions": [], "has_more": false, "next_before": 1,
+        }))
+        .unwrap();
+        live.finish_archive_page(ArchivePage {
+            room_id: "primary".into(),
+            before: i64::MAX,
+            result: Ok(page),
+        })
+        .unwrap();
+        let reloaded = Conversation::load(&live.store, "primary");
+        assert_eq!(reloaded.synced, 30);
+        assert!(reloaded.items.contains_key("missed"));
+        assert!(!reloaded.log.unwrap().archive_rescan);
+    }
+
+    #[test]
+    fn an_unterminated_tail_does_not_invalidate_the_previous_cursor() {
+        let root = std::env::temp_dir().join(format!(
+            "openpickle-test-history-torn-tail-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root).unwrap();
+        let path = store.cache_path("room-primary.jsonl");
+        let prefix = b"{\"t\":\"synced\",\"v\":7}\n";
+        std::fs::write(&path, [prefix.as_slice(), b"{\"t\":\"item\""].concat()).unwrap();
+
+        let loaded = Conversation::load(&store, "primary");
+        assert_eq!(loaded.synced, 7);
+        assert_eq!(std::fs::read(&path).unwrap().as_slice(), prefix.as_slice());
+        loaded.log.unwrap().append(&[Record::Synced(8)]);
+        assert_eq!(Conversation::load(&store, "primary").synced, 8);
+    }
+
+    #[test]
+    fn a_failed_repair_neither_alters_the_log_nor_allows_new_checkpoints() {
+        let root = std::env::temp_dir().join(format!(
+            "openpickle-test-history-repair-failure-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root).unwrap();
+        let path = store.cache_path("room-primary.jsonl");
+        let data = b"{\"t\":\"synced\",\"v\":1}\ninvalid\n{\"t\":\"synced\",\"v\":3}\n";
+        std::fs::write(&path, data).unwrap();
+        let temporary = path.with_extension("repair");
+        std::fs::create_dir(&temporary).unwrap();
+
+        let loaded = Conversation::load(&store, "primary");
+        assert_eq!(loaded.synced, 1);
+        let mut log = loaded.log.unwrap();
+        assert!(log.broken);
+        std::fs::remove_dir(&temporary).unwrap();
+        log.append(&[Record::Synced(4)]);
+        assert_eq!(std::fs::read(&path).unwrap().as_slice(), data.as_slice());
+        assert_eq!(Conversation::load(&store, "primary").synced, 1);
+    }
+
+    #[tokio::test]
+    async fn live_reactions_only_update_the_primary_rooms_matching_message() {
+        let server = HistoryServer::start();
+        let (mut live, mut received) = fixture_live("live-reaction", &server);
+        let target: HistoryItem = serde_json::from_value(serde_json::json!({
+            "role": "user", "id": "m", "text": "Synthetic message", "at": 1.0, "seq": 7
+        }))
+        .unwrap();
+        let event = || {
+            PickleEvent::Chat(ChatEvent::Reaction {
+                id: "reaction-8".into(),
+                seq: 8,
+                target_id: "m".into(),
+                part: 0,
+                actor: "assistant".into(),
+                emoji: "👍".into(),
+                at: 2.,
+                prev_seq: 7,
+            })
+        };
+
+        let mut seed = live
+            .conversation
+            .apply(vec![target.clone()], vec![], vec![]);
+        assert!(seed.pop().unwrap().decorations.reactions.is_none());
+        let cursor = live.conversation.synced;
+        live.handle(event());
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Update::Upsert { room_id, messages }
+                if room_id == "primary" && messages[0].id == "m"
+                    && messages[0].decorations.reactions.as_deref().unwrap()[0].emoji == "👍"
+        ));
+        live.handle(event());
+        assert!(received.try_recv().is_err());
+        assert_eq!(live.conversation.synced, cursor);
+
+        live.conversation = Conversation::load(&live.store, "peer");
+        live.conversation.apply(vec![target], vec![], vec![]);
+        live.handle(event());
+        assert!(received.try_recv().is_err());
+        assert!(
+            live.conversation.messages()[0]
+                .decorations
+                .reactions
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_reaction_before_its_target_survives_history_replay_without_double_counting() {
+        let root = std::env::temp_dir().join(format!(
+            "openpickle-test-reactions-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::at(root.clone()).unwrap();
+        let mut log = HistoryLog::new(&store, "primary");
+        let reaction = Reaction {
+            seq: 8,
+            target_id: "m".into(),
+            part: 0,
+            actor: "assistant".into(),
+            emoji: "👍".into(),
+            at: 2.,
+        };
+        log.append(&[Record::Reaction(reaction.clone()), Record::Synced(8)]);
+        let mut conversation = Conversation::load(&store, "primary");
+        assert!(conversation.messages().is_empty());
+        assert_eq!(conversation.synced, 8);
+        let target = serde_json::from_value(serde_json::json!({
+            "role": "user", "id": "m", "text": "Synthetic older message", "at": 1.0, "seq": 7
+        }))
+        .unwrap();
+        let messages = conversation.apply(vec![target], vec![], vec![reaction]);
+        let badges = messages[0].decorations.reactions.as_deref().unwrap();
+        assert_eq!(
+            badges,
+            [crate::model::ReactionBadge {
+                emoji: "👍".into(),
+                count: 1
+            }]
+        );
+        assert_eq!(conversation.synced, 8);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

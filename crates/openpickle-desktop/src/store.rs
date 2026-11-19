@@ -7,7 +7,7 @@
 use std::{
     fmt,
     fs::{self, File, OpenOptions, TryLockError},
-    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -33,6 +33,13 @@ impl fmt::Debug for Session {
 #[derive(Clone, Debug)]
 pub struct Store {
     root: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LogStatus {
+    Clean,
+    TornTail,
+    Corrupt,
 }
 
 impl Store {
@@ -72,10 +79,30 @@ impl Store {
         }
     }
 
-    pub fn session(&self) -> Option<Session> {
-        self.read_json(&self.root.join("session.json"))
+    /// Missing is normal. A malformed credential is not usable, and other read errors must
+    /// not quietly turn into a new login attempt. Never include the credential bytes in errors.
+    pub fn session(&self) -> io::Result<Option<Session>> {
+        let bytes = match fs::read(self.root.join("session.json")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid local login session");
+        let session: Session = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        if session.login_session_token.trim().is_empty() || session.device_id.trim().is_empty() {
+            return Err(invalid());
+        }
+        Ok(Some(session))
     }
 
+    /// A newly issued session may be for a different account. Establish an empty cache before
+    /// persisting it, so even a restart cannot open the old account's conversations under it.
+    pub fn start_session(&self, session: &Session) -> io::Result<()> {
+        self.sign_out()?;
+        self.save_session(session)
+    }
+
+    /// Persists a replacement credential for the same account, preserving its cache.
     pub fn save_session(&self, session: &Session) -> io::Result<()> {
         write_atomically(
             &self.root.join("session.json"),
@@ -86,12 +113,14 @@ impl Store {
     /// Forgets the login session and everything cached for it. The next person to sign in on
     /// this computer account must not be shown the previous conversations.
     pub fn sign_out(&self) -> io::Result<()> {
-        match fs::remove_file(self.root.join("session.json")) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
-            _ => {}
-        }
-        fs::remove_dir_all(self.root.join("cache"))?;
-        Self::at(self.root.clone()).map(drop)
+        let credential = self.root.join("session.json");
+        let removed = remove_if_present(fs::remove_file(&credential));
+        // A failed atomic write can have left a second copy of the credential. Keep clearing
+        // the cache even if either removal fails, but do not accept a new login on error.
+        let scratch = remove_if_present(fs::remove_file(credential.with_extension("tmp")));
+        let cache = remove_if_present(fs::remove_dir_all(self.root.join("cache")))
+            .and_then(|()| Self::at(self.root.clone()).map(drop));
+        removed.and(scratch).and(cache)
     }
 
     /// A cached value, or `None` when it is missing or unreadable.
@@ -103,19 +132,62 @@ impl Store {
         write_atomically(&self.cache_path(name), &serde_json::to_vec(value)?)
     }
 
-    /// Every record of an append-only log, oldest first. A line that is not a record is
-    /// skipped: one cut short by a crash, or one whose bytes are not text.
-    pub fn log<T: DeserializeOwned>(&self, name: &str) -> Vec<T> {
-        let Ok(file) = File::open(self.cache_path(name)) else {
-            return Vec::new();
+    /// Visits valid records in order. The visitor's second argument is true after a
+    /// malformed, newline-terminated record. A malformed unterminated tail has no later
+    /// records to invalidate, but must be removed before appending.
+    pub(crate) fn read_log<T: DeserializeOwned>(
+        &self,
+        name: &str,
+        mut visit: impl FnMut(T, bool),
+    ) -> io::Result<LogStatus> {
+        let file = match File::open(self.cache_path(name)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(LogStatus::Clean),
+            Err(error) => return Err(error),
         };
-        // Lines are split as bytes. Reading them as text would stop at the first line that
-        // is not UTF-8 and lose every record after it.
-        BufReader::new(file)
-            .split(b'\n')
-            .map_while(Result::ok)
-            .filter_map(|line| serde_json::from_slice(&line).ok())
-            .collect()
+        scan_log(file, |record, _, after_gap| {
+            visit(record, after_gap);
+            Ok(())
+        })
+    }
+
+    /// Removes unreadable lines and records rejected by `keep`. Retained lines are copied
+    /// as-is so repair does not strip fields unknown to this version of the app.
+    pub(crate) fn repair_log<T: DeserializeOwned>(
+        &self,
+        name: &str,
+        mut keep: impl FnMut(&T, bool) -> bool,
+    ) -> io::Result<()> {
+        let path = self.cache_path(name);
+        let source = File::open(&path)?;
+        let temporary = path.with_extension("repair");
+        let mut repaired = BufWriter::new(
+            private(OpenOptions::new().write(true).create(true).truncate(true)).open(&temporary)?,
+        );
+        let result = (|| {
+            scan_log(source, |record, line, after_gap| {
+                if keep(&record, after_gap) {
+                    repaired.write_all(line)?;
+                }
+                Ok(())
+            })?;
+            repaired.flush()?;
+            repaired.get_ref().sync_all()
+        })();
+        drop(repaired);
+        let result = result.and_then(|()| fs::rename(&temporary, &path));
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    #[cfg(test)]
+    pub fn log<T: DeserializeOwned>(&self, name: &str) -> Vec<T> {
+        let mut records = Vec::new();
+        self.read_log(name, |record, _| records.push(record))
+            .unwrap();
+        records
     }
 
     pub fn append_log<T: Serialize>(&self, name: &str, records: &[T]) -> io::Result<()> {
@@ -154,6 +226,33 @@ impl Store {
 
     fn read_json<T: DeserializeOwned>(&self, path: &Path) -> Option<T> {
         serde_json::from_slice(&fs::read(path).ok()?).ok()
+    }
+}
+
+fn scan_log<T: DeserializeOwned>(
+    file: File,
+    mut visit: impl FnMut(T, &[u8], bool) -> io::Result<()>,
+) -> io::Result<LogStatus> {
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut status = LogStatus::Clean;
+    // Read bytes, not text: invalid UTF-8 in one row must not hide later rows.
+    while reader.read_until(b'\n', &mut line)? != 0 {
+        match serde_json::from_slice(&line) {
+            Ok(record) => visit(record, &line, status == LogStatus::Corrupt)?,
+            Err(_) if line.ends_with(b"\n") => status = LogStatus::Corrupt,
+            Err(_) if status == LogStatus::Clean => status = LogStatus::TornTail,
+            Err(_) => {}
+        }
+        line.clear();
+    }
+    Ok(status)
+}
+
+fn remove_if_present(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
     }
 }
 
@@ -198,20 +297,55 @@ mod tests {
     #[test]
     fn session_round_trips() {
         let store = store("session");
-        assert_eq!(store.session(), None);
+        assert_eq!(store.session().unwrap(), None);
         let session = Session {
             login_session_token: "ls_test".into(),
             device_id: "device".into(),
         };
         store.save_session(&session).unwrap();
-        assert_eq!(store.session(), Some(session.clone()));
+        assert_eq!(store.session().unwrap(), Some(session.clone()));
         let replacement = Session {
             login_session_token: "ls_next".into(),
             device_id: "device".into(),
         };
         store.save_session(&replacement).unwrap();
-        assert_eq!(store.session(), Some(replacement));
+        assert_eq!(store.session().unwrap(), Some(replacement));
         assert!(!format!("{session:?}").contains("ls_test"));
+    }
+
+    #[test]
+    fn local_login_distinguishes_missing_malformed_and_read_errors() {
+        let store = store("session-errors");
+        let path = store.root.join("session.json");
+        assert_eq!(store.session().unwrap(), None);
+        for bytes in [
+            b"synthetic-malformed-credential".as_slice(),
+            br#"{"login_session_token":" ","device_id":"fixture"}"#,
+        ] {
+            fs::write(&path, bytes).unwrap();
+            let error = store.session().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), "invalid local login session");
+        }
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let error = store.session().unwrap_err();
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+        assert_ne!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn fresh_login_is_not_saved_when_the_old_cache_cannot_be_cleared() {
+        let store = store("blocked-cache-clear");
+        let path = store.root.join("cache");
+        fs::remove_dir(&path).unwrap();
+        fs::write(&path, b"not a directory").unwrap();
+        let session = Session {
+            login_session_token: "fixture-new-user".into(),
+            device_id: "fixture-device".into(),
+        };
+        assert!(store.start_session(&session).is_err());
+        assert_eq!(store.session().unwrap(), None);
     }
 
     #[cfg(unix)]
@@ -248,7 +382,14 @@ mod tests {
         bytes.extend_from_slice(b"\xff\xfe{\"cut\n");
         fs::write(&path, bytes).unwrap();
         store.append_log("room.jsonl", &[3]).unwrap();
-        assert_eq!(store.log::<i32>("room.jsonl"), [1, 2, 3]);
+        let mut records = Vec::new();
+        let status = store
+            .read_log::<i32>("room.jsonl", |record, after_gap| {
+                records.push((record, after_gap));
+            })
+            .unwrap();
+        assert_eq!(status, LogStatus::Corrupt);
+        assert_eq!(records, [(1, false), (2, false), (3, true)]);
     }
 
     #[test]
@@ -262,12 +403,34 @@ mod tests {
             .unwrap();
         store.cache("room.json", &"room").unwrap();
         store.append_log("room.jsonl", &[1]).unwrap();
+        let scratch = store.root.join("session.tmp");
+        fs::write(&scratch, b"fixture refresh scratch").unwrap();
         store.sign_out().unwrap();
-        assert_eq!(store.session(), None);
+        assert_eq!(store.session().unwrap(), None);
+        assert!(!scratch.exists());
         assert_eq!(store.cached::<String>("room.json"), None);
         assert!(store.log::<u32>("room.jsonl").is_empty());
+        // A repeated cleanup also works after a partial removal.
+        fs::remove_dir(store.root.join("cache")).unwrap();
+        store.sign_out().unwrap();
         // The store is still usable for the next sign-in.
         store.cache("room.json", &"next").unwrap();
+    }
+
+    #[test]
+    fn a_failed_scratch_removal_does_not_leave_the_old_cache() {
+        let store = store("blocked-scratch-removal");
+        let session = Session {
+            login_session_token: "fixture-old-user".into(),
+            device_id: "fixture-device".into(),
+        };
+        store.save_session(&session).unwrap();
+        store.cache("room.json", &"old room").unwrap();
+        fs::create_dir(store.root.join("session.tmp")).unwrap();
+
+        assert!(store.sign_out().is_err());
+        assert!(store.session().unwrap().is_none());
+        assert!(store.cached::<String>("room.json").is_none());
     }
 
     #[test]

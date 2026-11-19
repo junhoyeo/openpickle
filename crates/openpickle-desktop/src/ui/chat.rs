@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use chrono::{DateTime, Local};
 use gpui::{
     App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, ImageSource,
     ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point,
@@ -14,7 +15,7 @@ use gpui::{
 use openpickle_api::PhoneCallTranscript;
 
 use crate::{
-    model::{AttachmentKind, Part, Row, RowKind},
+    model::{AttachmentKind, Message, Part, Row, RowKind, append_message_rows},
     protocol::HandoffCard,
     theme,
     ui::{
@@ -84,6 +85,7 @@ pub struct ChatView {
     scrolled_at: Option<Instant>,
     /// The rows of the message a search result opened, marked for a moment.
     found: Option<Range<usize>>,
+    reveal_generation: u64,
     _found: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -149,6 +151,7 @@ impl ChatView {
             menu: None,
             scrolled_at: None,
             found: None,
+            reveal_generation: 0,
             _found: None,
             _subscriptions: subscriptions,
         }
@@ -181,8 +184,7 @@ impl ChatView {
         self.selection.borrow_mut().clear();
         self.selection.borrow_mut().release();
         self.menu = None;
-        self.found = None;
-        self._found = None;
+        self.cancel_reveal();
         self.requested_pictures.clear();
         // The cards are asked for again when they are next drawn.
         self.requested_handoff_cards.clear();
@@ -194,19 +196,110 @@ impl ChatView {
 
     /// Replaces the rows. Rows before the first changed one keep their measured heights.
     pub fn set_rows(&mut self, rows: Vec<Row>, cx: &mut Context<Self>) {
-        let unchanged = self
-            .rows
+        self.replace_rows_from(0, rows, cx);
+    }
+
+    /// Reprojects only the messages starting at `start`, the end of the retained prefix.
+    pub(crate) fn project_rows(
+        &mut self,
+        start: usize,
+        starts: &mut Vec<usize>,
+        previous: Option<&Message>,
+        messages: &[Message],
+        now: DateTime<Local>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut rows = Vec::with_capacity(messages.len());
+        let joins_retained_row =
+            append_message_rows(&mut rows, starts, start, previous, messages, now);
+        if let Some(index) = start.checked_sub(1) {
+            let boundary = &mut self.rows[index];
+            if boundary.joined_below != joins_retained_row {
+                boundary.joined_below = joins_retained_row;
+                cx.notify();
+            }
+        }
+        rows.extend(self.activity_row().cloned());
+        self.replace_rows_from(start, rows, cx);
+    }
+
+    fn activity_row(&self) -> Option<&Row> {
+        self.rows
+            .last()
+            .filter(|row| matches!(row.kind, RowKind::Activity(_)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visible_activity(&self) -> Option<Option<&str>> {
+        match self.activity_row().map(|row| &row.kind) {
+            Some(RowKind::Activity(label)) => Some(label.as_deref()),
+            _ => None,
+        }
+    }
+
+    /// Activity is a single nonselectable row after all messages.
+    pub(crate) fn set_activity(
+        &mut self,
+        activity: Option<Option<String>>,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self.activity_row();
+        let replacement = activity.map(Row::activity);
+        if current == replacement.as_ref() {
+            return;
+        }
+        let old_end = self.rows.len();
+        let start = old_end - usize::from(current.is_some());
+        self.rows.truncate(start);
+        self.rows.extend(replacement);
+        self.list.splice(start..old_end, self.rows.len() - start);
+        cx.notify();
+    }
+
+    fn replace_rows_from(&mut self, start: usize, rows: Vec<Row>, cx: &mut Context<Self>) {
+        let matched = self.rows[start..]
             .iter()
             .zip(&rows)
             .take_while(|(old, new)| old.same_as(new))
             .count();
-        if unchanged < self.rows.len() || unchanged < rows.len() {
-            self.list
-                .splice(unchanged..self.rows.len(), rows.len() - unchanged);
+        let mut unchanged = start + matched;
+        if unchanged == self.rows.len() && matched == rows.len() {
+            return;
+        }
+        let top = self.list.logical_scroll_top();
+        let mut replacements = rows.into_iter().skip(matched).peekable();
+        // Quotes and reactions change height without changing row identity. Replacing the whole
+        // suffix would reset GPUI's scroll position to the first decorated row in it.
+        for old in &mut self.rows[unchanged..] {
+            let Some(new) = replacements.next_if(|new| old.same_content_as(new)) else {
+                break;
+            };
+            if !old.same_as(&new) {
+                *old = new;
+                self.list.splice(unchanged..unchanged + 1, 1);
+                if top.item_ix == unchanged {
+                    self.list.scroll_to(top);
+                }
+            }
+            unchanged += 1;
+        }
+        if unchanged == self.rows.len() && replacements.peek().is_none() {
+            cx.notify();
+            return;
         }
         self.selection.borrow_mut().rows_changed(unchanged);
+        if self
+            .found
+            .as_ref()
+            .is_some_and(|found| found.end > unchanged)
+        {
+            self.cancel_reveal();
+        }
+        self.list
+            .splice(unchanged..self.rows.len(), replacements.len());
+        self.rows.truncate(unchanged);
         let mut missing = Vec::new();
-        for row in &rows {
+        for row in replacements {
             if let RowKind::Part(Part::Files(files)) = &row.kind {
                 for file in &files.items {
                     let previewable = file.kind == AttachmentKind::Picture
@@ -216,8 +309,8 @@ impl ChatView {
                     }
                 }
             }
+            self.rows.push(row);
         }
-        self.rows = rows;
         if !missing.is_empty() {
             cx.emit(ChatEvent::LoadAttachments(missing));
         }
@@ -288,10 +381,17 @@ impl ChatView {
         // The message would sit right under the header. The end of what came before it is
         // brought into view as well, which takes two frames: the list only knows the heights
         // of the rows above once it has drawn at the new place.
-        cx.on_next_frame(window, |_, window, cx| {
-            cx.on_next_frame(window, |this, _, cx| {
-                this.scroll_by(-FOUND_CONTEXT);
-                cx.notify();
+        self.reveal_generation += 1;
+        let generation = self.reveal_generation;
+        cx.on_next_frame(window, move |this, window, cx| {
+            if this.reveal_generation != generation {
+                return;
+            }
+            cx.on_next_frame(window, move |this, _, cx| {
+                if this.reveal_generation == generation {
+                    this.scroll_by(-FOUND_CONTEXT);
+                    cx.notify();
+                }
             });
             cx.notify();
         });
@@ -305,6 +405,20 @@ impl ChatView {
             .ok();
         }));
         cx.notify();
+    }
+
+    fn cancel_reveal(&mut self) {
+        self.found = None;
+        self.reveal_generation += 1;
+        self._found = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_position(&self) -> (Option<usize>, usize) {
+        (
+            self.found.as_ref().map(|rows| rows.start),
+            self.list.logical_scroll_top().item_ix,
+        )
     }
 
     /// Escape closes the menu of a right click, or else drops the selection.
@@ -471,6 +585,7 @@ impl ChatView {
     }
 
     pub fn scroll_to_latest(&mut self, cx: &mut Context<Self>) {
+        self.cancel_reveal();
         // A reset is the list's way back to "follow the newest row".
         self.list.reset(self.rows.len());
         self.at_latest = true;
@@ -740,6 +855,7 @@ mod tests {
                 side: Side::Theirs,
                 joined_above: false,
                 joined_below: false,
+                decorations: Default::default(),
             })
             .collect();
         view.update(cx, |view, cx| view.set_rows(rows, cx));
@@ -822,6 +938,130 @@ mod tests {
     }
 
     #[gpui::test]
+    fn activity_and_grouped_appends_keep_selection_and_search_position(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx, &[]);
+        let now = Local::now();
+        let messages: Vec<_> = (1..=200)
+            .map(|seq| crate::convert::outgoing(seq.to_string(), "hello", seq, seq as f64))
+            .collect();
+        let suffix_at = messages.len() - 2;
+        let prefix = &messages[..suffix_at];
+        let mut starts = Vec::new();
+        view.update_in(cx, |view, window, cx| {
+            view.project_rows(0, &mut starts, None, prefix, now, cx);
+            view.selection.borrow_mut().select_all(&view.rows);
+            view.reveal(starts[35]..starts[36], window, cx);
+        });
+        cx.run_until_parked();
+        let selected = view.read_with(cx, |view, _| view.selection.borrow().text(&view.rows));
+        assert!(selected.is_some());
+        let top = view.read_with(cx, |view, _| view.list.logical_scroll_top().item_ix);
+        let found = starts[35]..starts[36];
+        view.update(cx, |view, cx| {
+            for activity in [Some(None), Some(Some("Working".into())), None, Some(None)] {
+                view.set_activity(activity, cx);
+                assert_eq!(view.selection.borrow().text(&view.rows), selected);
+                assert_eq!(view.found, Some(found.clone()));
+                assert_eq!(view.list.item_count(), view.rows.len());
+                assert_eq!(view.list.logical_scroll_top().item_ix, top);
+            }
+            let boundary = *starts.last().unwrap();
+            assert!(!view.rows[boundary].joined_below);
+            view.project_rows(
+                boundary + 1,
+                &mut starts,
+                prefix.last(),
+                &messages[suffix_at..],
+                now,
+                cx,
+            );
+            assert!(view.rows[boundary].joined_below);
+            assert_eq!(view.selection.borrow().text(&view.rows), selected);
+            assert_eq!(view.found, Some(found));
+            assert_eq!(view.list.logical_scroll_top().item_ix, top);
+            assert_eq!(view.list.item_count(), view.rows.len());
+            let (full_rows, full_starts) = crate::model::build_rows(&messages, Some(None), now);
+            assert_eq!(view.rows, full_rows);
+            assert_eq!(starts, full_starts);
+        });
+    }
+
+    #[gpui::test]
+    fn decorations_keep_the_scrollback_anchor_and_body_selection(cx: &mut TestAppContext) {
+        use crate::model::{Quote, ReactionBadge};
+
+        let (view, cx) = open(cx, &[]);
+        let now = Local::now();
+        let mut messages: Vec<_> = (1..=200)
+            .map(|seq| crate::convert::outgoing(seq.to_string(), "본문", seq, seq as f64))
+            .collect();
+        let mut starts = Vec::new();
+        view.update_in(cx, |view, window, cx| {
+            view.project_rows(0, &mut starts, None, &messages, now, cx);
+            view.selection.borrow_mut().select_all(&view.rows);
+            let selected = view.selection.borrow().text(&view.rows).unwrap();
+            let found = starts[100]..starts[101];
+            view.reveal(found.clone(), window, cx);
+            let top = ListOffset {
+                item_ix: found.start,
+                offset_in_item: px(6.),
+            };
+            view.list.scroll_to(top);
+
+            let changed = 10;
+            let start = starts[changed];
+            starts.truncate(changed);
+            messages[changed].decorations.reactions = Some(
+                vec![ReactionBadge {
+                    emoji: "👍".into(),
+                    count: 2,
+                }]
+                .into(),
+            );
+            messages[100].decorations.quote = Some(Arc::new(Quote {
+                author: Some("User"),
+                snippet: "quoted words".into(),
+            }));
+            view.project_rows(
+                start,
+                &mut starts,
+                Some(&messages[changed - 1]),
+                &messages[changed..],
+                now,
+                cx,
+            );
+
+            let projected_top = view.list.logical_scroll_top();
+            assert_eq!(projected_top.item_ix, top.item_ix);
+            assert_eq!(projected_top.offset_in_item, top.offset_in_item);
+            assert_eq!(view.found, Some(found));
+            assert_eq!(view.selection.borrow().text(&view.rows), Some(selected));
+            let (expected, expected_starts) = crate::model::build_rows(&messages, None, now);
+            assert_eq!(view.rows, expected);
+            assert_eq!(starts, expected_starts);
+            assert_eq!(view.list.item_count(), view.rows.len());
+        });
+    }
+
+    #[gpui::test]
+    fn replacing_revealed_content_invalidates_the_deferred_scroll(cx: &mut TestAppContext) {
+        let texts: Vec<_> = (0..200).map(|n| format!("Row {n}")).collect();
+        let (view, cx) = open(cx, &texts);
+        view.update_in(cx, |view, window, cx| {
+            view.reveal(100..101, window, cx);
+            let generation = view.reveal_generation;
+            let mut rows = view.rows.clone();
+            rows[100].kind = RowKind::Part(Part::Bubble(Arc::new(RichText {
+                text: "Replacement".into(),
+                spans: vec![],
+            })));
+            view.set_rows(rows, cx);
+            assert!(view.found.is_none());
+            assert_ne!(view.reveal_generation, generation);
+        });
+    }
+
+    #[gpui::test]
     fn select_all_copies_rows_that_were_never_drawn(cx: &mut TestAppContext) {
         let texts: Vec<String> = (0..300).map(|n| format!("말 {n}")).collect();
         let (_, cx) = open(cx, &texts);
@@ -888,6 +1128,7 @@ mod tests {
             side: Side::Theirs,
             joined_above: false,
             joined_below: false,
+            decorations: Default::default(),
         };
         view.update(cx, |view, cx| {
             view.set_rows(
@@ -955,6 +1196,7 @@ mod tests {
                 side: Side::Theirs,
                 joined_above: false,
                 joined_below: false,
+                decorations: Default::default(),
             }]
         };
         view.update(cx, |view, cx| view.set_rows(rows(), cx));

@@ -1,15 +1,16 @@
 #!/usr/bin/env bun
 // Small CLI over PickleClient. Output is JSON, except `search`, `explore`, `attachments`,
 // `thumbnail` and `download`. Credentials come from one of:
-//   PICKLE_SESSION_FILE  a JSON file holding {"login_session_token": "ls_…"}. Each run refreshes
-//                        once and writes the next token back, so never run two at once.
+//   PICKLE_SESSION_FILE  a JSON file holding {"login_session_token": "ls_…"}. A CLI command
+//                        holds an exclusive lock while it can read or rotate this file.
 //   PICKLE_TOKEN         an access token (the app's Authorization header), valid for 5 minutes.
 
-import { readFileSync } from "node:fs";
-import { mkdir, rename, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { lstatSync, mkdirSync, readFileSync, realpathSync, rmdirSync } from "node:fs";
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { PickleClient, decodeAccessToken } from "./client.ts";
+import { saveAttachmentResponse } from "./download.ts";
 import type { HistoryItem, LoginSessionRefresh } from "./types.ts";
 
 const USAGE = `usage: PICKLE_SESSION_FILE=<file> pickle <command>
@@ -46,33 +47,83 @@ if (!command || (!sessionFile && !token)) {
   process.exit(2);
 }
 
-/** Replaces the session file in one step, so a crash cannot leave it holding a spent token. */
-async function saveSession(file: string, refresh: LoginSessionRefresh): Promise<void> {
-  const next = { login_session_token: refresh.login_session_token, expires_at: refresh.expires_at };
-  await mkdir(dirname(file), { recursive: true });
-  await writeFile(`${file}.tmp`, JSON.stringify(next), { mode: 0o600 });
-  await rename(`${file}.tmp`, file);
+/** Locks this path before reading it or issuing fresh credentials. Never reclaim another lock. */
+function openSessionFile(input: string, createParent: boolean) {
+  const parent = dirname(input);
+  if (createParent) mkdirSync(parent, { recursive: true });
+  let file = join(realpathSync.native(parent), basename(input));
+  try {
+    const stat = lstatSync(file);
+    if (!stat.isFile() || stat.nlink > 1) {
+      throw new Error("PICKLE_SESSION_FILE must be a regular file without symlinks or hard links to it");
+    }
+    file = realpathSync.native(file);
+  } catch (error) {
+    if (!createParent || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const lock = `${file}.lock`;
+  try {
+    mkdirSync(lock, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    throw new Error(`Session file is locked: ${lock}. Remove the lock only after confirming no CLI command is using the session.`);
+  }
+  process.once("exit", () => {
+    try {
+      rmdirSync(lock);
+    } catch {
+      console.error(`Could not remove the session lock: ${lock}`);
+    }
+  });
+
+  return {
+    file,
+    async save(refresh: LoginSessionRefresh) {
+      const next = { login_session_token: refresh.login_session_token, expires_at: refresh.expires_at };
+      const temporary = join(lock, "next");
+      try {
+        await writeFile(temporary, JSON.stringify(next), { mode: 0o600, flag: "wx" });
+        await rename(temporary, file);
+      } catch (error) {
+        await rm(temporary, { force: true }).catch(() => {});
+        throw error;
+      }
+    },
+  };
 }
 
+function readSessionToken(file: string): string {
+  const text = readFileSync(file, "utf8");
+  let token: unknown;
+  try {
+    token = JSON.parse(text)?.login_session_token;
+  } catch {}
+  if (typeof token !== "string" || token.length === 0) {
+    throw new Error("PICKLE_SESSION_FILE must contain a nonempty login_session_token");
+  }
+  return token;
+}
+
+const session = sessionFile && command !== "token" ? openSessionFile(sessionFile, command === "login") : undefined;
 if (command === "login") {
   const [phone, carrier] = args;
-  if (!phone || !sessionFile) throw new Error("PICKLE_SESSION_FILE=<file> pickle login <phone> [carrier]");
+  if (!phone || !session) throw new Error("PICKLE_SESSION_FILE=<file> pickle login <phone> [carrier]");
   const signedOut = new PickleClient();
   const { pending_id, expires_in } = await signedOut.requestPhoneCode(phone, { carrier });
   const prompt = createInterface({ input: process.stdin, output: process.stderr });
   const code = (await prompt.question(`Code texted to ${phone} (valid ${expires_in / 60} min): `)).trim();
   prompt.close();
   const issued = await signedOut.verifyPhoneCode(pending_id, code);
-  await saveSession(sessionFile, issued);
+  await session.save(issued);
   console.log(JSON.stringify({ user_id: issued.user_id, expires_at: issued.expires_at, saved_to: sessionFile }, null, 2));
   process.exit(0);
 }
 
-const pickle = sessionFile
+const pickle = session
   ? new PickleClient({
       loginSession: {
-        token: JSON.parse(readFileSync(sessionFile, "utf8")).login_session_token,
-        onRotate: (refresh) => saveSession(sessionFile, refresh),
+        token: readSessionToken(session.file),
+        onRotate: session.save,
       },
     })
   : new PickleClient({ accessToken: token! });
@@ -187,9 +238,9 @@ switch (command) {
   case "download": {
     const [path, out] = args;
     if (!path || !out) throw new Error("download <path> <out file>");
-    const { bytes, contentType } = await pickle.getAttachment(path);
-    await writeFile(out, bytes);
-    console.error(`${contentType}, ${bytes.length} bytes written to ${out}`);
+    const response = await pickle.getAttachmentResponse(path);
+    const bytes = await saveAttachmentResponse(response, out);
+    console.error(`${response.headers.get("content-type") ?? ""}, ${bytes} bytes written to ${out}`);
     break;
   }
   case "export": {
@@ -214,9 +265,22 @@ switch (command) {
     }
     break;
   }
-  case "events":
-    for await (const event of pickle.events()) console.log(JSON.stringify(event));
+  case "events": {
+    const controller = new AbortController();
+    const stop = () => controller.abort();
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+    try {
+      for await (const event of pickle.events({ signal: controller.signal })) console.log(JSON.stringify(event));
+    } catch (error) {
+      const aborted = error === controller.signal.reason || (error instanceof Error && error.name === "AbortError");
+      if (!controller.signal.aborted || !aborted) throw error;
+    } finally {
+      process.off("SIGINT", stop);
+      process.off("SIGTERM", stop);
+    }
     break;
+  }
   case "session":
     print(await pickle.startSession());
     break;

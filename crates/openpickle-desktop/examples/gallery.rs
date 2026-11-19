@@ -577,6 +577,7 @@ fn message(seq: u64, minutes_ago: f64, side: Side, text: &str) -> Message {
         at: Local::now().timestamp() as f64 - minutes_ago * 60.,
         side,
         parts,
+        decorations: Default::default(),
     }
 }
 
@@ -613,6 +614,7 @@ fn main() {
             options: vec![],
             status: RequestStatus::Expired,
         }))],
+        decorations: Default::default(),
     });
     messages.push(message(5, 20., Side::Theirs, "<bubble>확인 시간이 지나서 그 자리는 다시 풀렸어요! 빈자리 알림은 계속 켜 둘게요.</bubble>"));
     messages.push(message(
@@ -792,9 +794,9 @@ fn main() {
                 std::thread::spawn(move || {
                     while let Some(command) = asked.blocking_recv() {
                         let update = match command {
-                            Command::Search(query) => Update::Found {
+                            Command::Search { request, query } => Update::Found {
                                 results: Ok(search(&messages, &query)),
-                                query,
+                                request,
                             },
                             Command::LoadSocial => Update::Social(Ok(sample_social())),
                             Command::LoadProfile => Update::Profile(Ok(sample_profile())),
@@ -839,8 +841,8 @@ fn main() {
                                 result: Ok(()),
                             },
                             Command::LoadExplore => Update::Explore(Ok(sample_explore())),
-                            Command::LoadArchive => Update::Archive {
-                                room_id: "primary".into(),
+                            Command::WatchArchive(Some(room_id)) => Update::Archive {
+                                room_id,
                                 attachments: sample_archive(),
                                 complete: true,
                             },
@@ -874,11 +876,14 @@ fn main() {
                                 result: Err("No thumbnail exists for this sample file.".into()),
                             },
                             // Nothing is written: the sample only shows where a file would be.
-                            Command::DownloadAttachment(path) => Update::AttachmentDownloaded {
-                                result: Ok(std::path::Path::new("/Users/sample/Downloads")
-                                    .join(path.rsplit('/').next().unwrap_or_default())),
-                                path,
-                            },
+                            Command::DownloadAttachment { room_id, path } => {
+                                Update::AttachmentDownloaded {
+                                    result: Ok(std::path::Path::new("/Users/sample/Downloads")
+                                        .join(path.rsplit('/').next().unwrap_or_default())),
+                                    room_id,
+                                    path,
+                                }
+                            }
                             _ => continue,
                         };
                         updates.unbounded_send(update).ok();

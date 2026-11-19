@@ -16,6 +16,12 @@ pub enum HandoffCard {
     Phone(PhoneCallTranscript),
 }
 
+/// An intent belongs to one room and one generation of the search screen's requests.
+pub struct SearchRequest {
+    pub room_id: String,
+    pub id: u64,
+}
+
 /// UI to backend. Neither side of the protocol can be printed with `{:?}`: a command may hold
 /// a phone number or a sign-in code, and both hold message text.
 pub enum Command {
@@ -52,8 +58,8 @@ pub enum Command {
     EndPhoneCall { call_id: String, action_id: String },
     /// These offers were on screen.
     OffersShown(Vec<String>),
-    /// List the pictures and files of the conversation, reading back to its first message.
-    LoadArchive,
+    /// Read the visible room's Archive; `None` cancels its in-flight backward page.
+    WatchArchive(Option<String>),
     /// Show this chat room instead: a friend's Pickle, or the character's again when empty.
     OpenRoom(String),
     /// Load these pictures of the Archive: the attachments themselves, by their paths.
@@ -61,14 +67,34 @@ pub enum Command {
     /// Download the thumbnail (or first-page preview) of one attachment in the open room.
     PreviewAttachment(String),
     /// Download one attachment of the open room, the file itself, into the Downloads folder.
-    DownloadAttachment(String),
-    /// Search the messages for this text.
-    Search(String),
+    DownloadAttachment { room_id: String, path: String },
+    /// Stop an active or queued download, even after the user has switched rooms.
+    CancelAttachmentDownload { room_id: String, path: String },
+    /// Search the messages for this text in the open character room.
+    Search {
+        request: SearchRequest,
+        query: String,
+    },
+    /// Resolve a search hit that is not in the timeline yet.
+    OpenSearchResult { request: SearchRequest, seq: u64 },
+    /// Discard queued search work and stop publishing its in-flight result.
+    CancelSearch,
     /// Whether the chat can be read now: the window is in front and shows the chat. Only
     /// then do new messages count as read.
     Active(bool),
+    /// Forget the session and cached account data on this computer. Does not call the server.
+    SignOut,
     /// The app is quitting: stop after the network call in flight, if there is one.
     Quit,
+}
+
+#[derive(PartialEq, Eq)]
+pub struct RoomMetadata {
+    pub room_id: String,
+    pub is_character: bool,
+    pub can_send: bool,
+    pub name: String,
+    pub avatar: Option<PathBuf>,
 }
 
 /// Backend to UI.
@@ -89,6 +115,8 @@ pub enum Update {
         avatar: Option<PathBuf>,
         messages: Vec<Message>,
     },
+    /// The open room's roster metadata changed without replacing its conversation.
+    RoomMetadata(RoomMetadata),
     /// The character's name or picture changed (or was just downloaded).
     Identity {
         name: String,
@@ -105,10 +133,16 @@ pub enum Update {
         id: String,
         reason: String,
     },
-    /// What a search for `query` found, or why it could not be done.
+    /// What this search found, or why it could not be done.
     Found {
-        query: String,
+        request: SearchRequest,
         results: Result<Vec<SearchResult>, String>,
+    },
+    /// The context to apply before revealing an uncached hit, or why it could not be opened.
+    SearchResultOpened {
+        request: SearchRequest,
+        seq: u64,
+        result: Result<Vec<Message>, String>,
     },
     /// The friends and the invite link, or why they could not be read.
     Social(Result<Social, String>),
@@ -164,8 +198,16 @@ pub enum Update {
         path: String,
         result: Result<PathBuf, String>,
     },
+    /// Bytes received for a queued or active original transfer (total may be unknown).
+    AttachmentDownloadProgress {
+        room_id: String,
+        path: String,
+        received: u64,
+        total: Option<u64>,
+    },
     /// An attachment was downloaded into this file, or why it was not.
     AttachmentDownloaded {
+        room_id: String,
         path: String,
         result: Result<PathBuf, String>,
     },

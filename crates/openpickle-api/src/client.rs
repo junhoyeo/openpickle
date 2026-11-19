@@ -3,7 +3,10 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::io;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -303,6 +306,7 @@ enum Bearer {
     Session {
         state: Arc<tokio::sync::Mutex<SessionState>>,
         on_rotate: RotateCallback,
+        closing: AtomicBool,
     },
 }
 
@@ -403,6 +407,7 @@ impl PickleClient {
                         unsaved: None,
                     })),
                     on_rotate: session.on_rotate,
+                    closing: AtomicBool::new(false),
                 }
             }
         };
@@ -568,20 +573,23 @@ impl PickleClient {
         Ok(response.bytes().await?)
     }
 
-    /// `GET /api/attachments/{path}`: the attachment itself, the file as it was sent or as the
-    /// character made it. `path` is as messages name it and ends in the file's name. A file
-    /// may be large, so the exchange gets more time than a call.
+    /// `GET /api/attachments/{path}`: the attachment itself as bytes. Use
+    /// [`get_attachment_response`](Self::get_attachment_response) to stream large files.
     pub async fn get_attachment(&self, path: &str) -> Result<bytes::Bytes> {
+        Ok(self.get_attachment_response(path).await?.bytes().await?)
+    }
+
+    /// Opens the original attachment without buffering its body. `path` is as messages name
+    /// it and ends in the file's name. Use [`Response::chunk`] for incremental reads.
+    pub async fn get_attachment_response(&self, path: &str) -> Result<Response> {
         let options = RequestOptions::default().auth(Auth::BearerOnly);
-        let response = self
-            .dispatch(
-                Method::GET,
-                &attachment_path(path),
-                options,
-                Some(DOWNLOAD_TIMEOUT),
-            )
-            .await?;
-        Ok(response.bytes().await?)
+        self.dispatch(
+            Method::GET,
+            &attachment_path(path),
+            options,
+            Some(DOWNLOAD_TIMEOUT),
+        )
+        .await
     }
 
     /// `GET /api/rooms/{room}/history`: the latest messages of a room (up to 200).
@@ -1038,15 +1046,48 @@ impl PickleClient {
             .header("x-client-platform", &self.inner.profile.platform)
     }
 
+    /// Closes this client's login session to further authenticated calls across all clones.
+    /// Waits for a rotation that already started to finish storing its replacement token.
+    /// Unlike signing out, this does not revoke or erase the persisted session.
+    pub async fn close_login_session(&self) -> Result<()> {
+        let Bearer::Session {
+            state,
+            on_rotate,
+            closing,
+        } = &self.inner.bearer
+        else {
+            return Ok(());
+        };
+        closing.store(true, Ordering::Release);
+        let mut state = state.lock().await;
+        if let Some(refresh) = state.unsaved.as_ref() {
+            on_rotate(refresh).map_err(Error::Rotate)?;
+            state.unsaved = None;
+        }
+        Ok(())
+    }
+
+    fn ensure_login_session_open(&self) -> Result<()> {
+        match &self.inner.bearer {
+            Bearer::Session { closing, .. } if closing.load(Ordering::Acquire) => {
+                Err(Error::SignedOut)
+            }
+            _ => Ok(()),
+        }
+    }
+
     async fn bearer_header(&self) -> Result<HeaderValue> {
         match &self.inner.bearer {
             Bearer::SignedOut => Err(Error::SignedOut),
             Bearer::Static(header) => Ok(header.clone()),
             Bearer::Provider(provider) => bearer_value(&provider()),
-            Bearer::Session { state, on_rotate } => {
+            Bearer::Session {
+                state, on_rotate, ..
+            } => {
                 // Holding the lock across the refresh makes it single-flight: two concurrent
                 // refreshes would spend the same token twice. Waiters then see the new token.
                 let mut state = state.clone().lock_owned().await;
+                self.ensure_login_session_open()?;
                 // Refresh a minute early so clock skew and slow requests do not meet an expired token.
                 if let Some(access) = &state.access
                     && access.exp - 60 > now_secs()
@@ -1063,6 +1104,9 @@ impl PickleClient {
                         let (refresh, fresh) = match state.unsaved.take() {
                             Some(refresh) => (refresh, false),
                             None => {
+                                // Saving a pending rotation can leave us needing another refresh;
+                                // closing must not spend that newly saved token.
+                                client.ensure_login_session_open()?;
                                 let refresh =
                                     client.refresh_login_session(&state.refresh_token).await?;
                                 state.refresh_token.clone_from(&refresh.login_session_token);
@@ -1087,7 +1131,9 @@ impl PickleClient {
                         return Ok(header);
                     }
                 });
-                refresh.await.unwrap_or(Err(Error::RefreshAborted))
+                let header = refresh.await.unwrap_or(Err(Error::RefreshAborted))?;
+                self.ensure_login_session_open()?;
+                Ok(header)
             }
         }
     }

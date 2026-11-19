@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -16,7 +17,6 @@ from pathlib import Path
 
 __all__ = ["run", "load", "search", "around", "info", "Message", "Hit", "Info", "Conversation", "CacheError"]
 
-DEFAULT_CACHE = Path.home() / "Library/Application Support/openpickle/cache"
 BUBBLE = re.compile(r"</?bubble>")
 SNIPPET = 60
 
@@ -67,67 +67,127 @@ class Info:
 
 
 def cache_dir() -> Path:
-    """The app's cache; ``PICKLE_SESSIONS_CACHE`` replaces it in tests."""
-    return Path(os.environ.get("PICKLE_SESSIONS_CACHE") or DEFAULT_CACHE)
+    """Find the app's data directory unless an explicit cache path was supplied."""
+    if override := os.environ.get("PICKLE_SESSIONS_CACHE"):
+        return Path(override)
+    if sys.platform == "darwin":
+        data = Path.home() / "Library" / "Application Support"
+    elif sys.platform == "win32":
+        data = Path(os.environ.get("APPDATA", ""))
+        if not data.is_absolute():
+            raise CacheError(
+                "Cannot locate the OpenPickle cache: APPDATA must be an absolute path on Windows. "
+                "Set PICKLE_SESSIONS_CACHE to the app's cache directory."
+            )
+    else:
+        xdg = Path(os.environ.get("XDG_DATA_HOME", ""))
+        data = xdg if xdg.is_absolute() else Path.home() / ".local" / "share"
+    return data / "openpickle" / "cache"
 
 
-def body(item: dict) -> str:
-    """A history item as plain text, read by role the way the app reads it: your own text as written, a request card as its question and options, a sub-agent run as its title, and the character's bubbles as paragraphs."""
-    role = item.get("role")
-    text = item.get("text") if isinstance(item.get("text"), str) else ""
+def _optional_text(value: object) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("expected text")
+    return value
+
+
+def _body(item: dict, role: str) -> str:
+    text = _optional_text(item.get("text"))
     if role == "user":
         return text
-    request = item.get("request")
-    if role == "agent_request" and isinstance(request, dict):
-        lines = [request.get("question") or ""]
-        lines += [f"- {option.get('label', '')}" for option in request.get("options") or [] if isinstance(option, dict)]
-        asked = "\n".join(line for line in lines if line)
-        if asked:
-            return asked
-    if role == "subagent" and item.get("title"):
-        return item["title"]
+    if role == "agent_request" and (request := item.get("request")) is not None:
+        if not isinstance(request, dict):
+            raise ValueError("invalid request")
+        question = _optional_text(request.get("question"))
+        lines = [question] if question else []
+        options = request.get("options")
+        if options is not None:
+            if not isinstance(options, list):
+                raise ValueError("invalid request options")
+            for option in options:
+                if not isinstance(option, dict) or not isinstance(option.get("label"), str):
+                    raise ValueError("invalid request option")
+                lines.append(f"- {option['label']}")
+        if lines:
+            return "\n".join(lines)
+    if role == "subagent" and (title := _optional_text(item.get("title"))):
+        return title
     parts = [part.strip() for part in BUBBLE.split(text)]
     return "\n\n".join(part for part in parts if part)
 
 
+def _message(item: dict) -> tuple[str, Message]:
+    item_id = item.get("id")
+    seq = item.get("seq")
+    role = item.get("role")
+    seconds = item.get("at")
+    if not isinstance(item_id, str) or not isinstance(role, str):
+        raise ValueError("invalid message id or role")
+    if type(seq) is not int or not -(1 << 63) <= seq < (1 << 63):
+        raise ValueError("invalid message sequence")
+    if type(seconds) not in (int, float):
+        raise ValueError("invalid message timestamp")
+    at = float(seconds)
+    datetime.fromtimestamp(at)  # Reject timestamps the local platform cannot render.
+    attachments = item.get("attachments")
+    if attachments is not None and (
+        not isinstance(attachments, list) or not all(isinstance(path, str) for path in attachments)
+    ):
+        raise ValueError("invalid attachments")
+    text = _body(item, role)
+    # Python's JSON decoder accepts lone surrogate escapes, which UTF-8 output cannot render.
+    item_id.encode()
+    role.encode()
+    text.encode()
+    return item_id, Message(
+        seq=seq, at=at, role=role, text=text, attachments=len(attachments) if attachments else 0,
+    )
+
+
+def _character(cache: Path) -> str | None:
+    try:
+        identity = json.loads((cache / "identity.json").read_bytes())
+        name = identity.get("name") if isinstance(identity, dict) else None
+        if isinstance(name, str) and name:
+            name.encode()
+            return name
+    except (OSError, ValueError, RecursionError):
+        pass
+    return None
+
+
 def load() -> Conversation:
-    """Reads the room's log the way the app does: later items replace earlier ones with the same id; unreadable lines are skipped."""
+    """Read the primary room log, retaining the last valid record for each message id."""
     cache = cache_dir()
+    items: dict[str, Message] = {}
     try:
         room = json.loads((cache / "room.json").read_bytes())
+        if not isinstance(room, str) or not room or any(c in room for c in "/\\:\0"):
+            raise ValueError("invalid room id")
         log = cache / f"room-{room}.jsonl"
-        data = log.read_bytes()
-        written = log.stat().st_mtime
-    except (OSError, ValueError) as error:
+        with log.open("rb") as stream:
+            written = os.fstat(stream.fileno()).st_mtime
+            for line in stream:
+                try:
+                    record = json.loads(line.decode("utf-8"))
+                    if not isinstance(record, dict) or record.get("t") != "item":
+                        continue
+                    item = record.get("v")
+                    if not isinstance(item, dict):
+                        continue
+                    item_id, message = _message(item)
+                except (ValueError, OverflowError, OSError, RecursionError):
+                    continue
+                items[item_id] = message
+    except (OSError, ValueError, RecursionError) as error:
         raise CacheError(
             f"No Pickle conversation cached in {cache} ({error.__class__.__name__}). "
             "Run the openpickle desktop app and sign in once; it writes the conversation there."
         ) from None
-    items: dict[str, dict] = {}
-    for line in data.split(b"\n"):
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        item = record.get("v") if isinstance(record, dict) and record.get("t") == "item" else None
-        if isinstance(item, dict) and isinstance(item.get("id"), str) and isinstance(item.get("seq"), int):
-            items[item["id"]] = item
-    try:
-        character = json.loads((cache / "identity.json").read_bytes()).get("name") or None
-    except (OSError, ValueError, AttributeError):
-        character = None
-    messages = [
-        Message(
-            seq=item["seq"],
-            at=float(item.get("at") or 0),
-            role=str(item.get("role", "")),
-            text=body(item),
-            attachments=len(item.get("attachments") or []),
-        )
-        for item in items.values()
-    ]
-    messages.sort(key=lambda message: message.seq)
-    return Conversation(log=log, written=written, character=character, messages=messages)
+    messages = sorted(items.values(), key=lambda message: message.seq)
+    return Conversation(log=log, written=written, character=_character(cache), messages=messages)
 
 
 def _bound(value: str | None, end: bool) -> float | None:
