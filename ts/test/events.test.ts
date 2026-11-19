@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { SseParser, toPickleEvent } from "../src/events.ts";
+import { PickleClient } from "../src/client.ts";
+import { SseParser, toPickleEvent, type PickleEvent } from "../src/events.ts";
 
 const stream =
   "retry: 2200\n\n" +
@@ -46,4 +47,57 @@ test("types known events and keeps unknown ones", () => {
     { event: "chat", data: { v: 1, kind: "pending", on: true } },
     { event: "unknown", name: "novel", data: { v: 1 } },
   ]);
+});
+
+test("unknown frames do not interrupt the client event iterator", async () => {
+  const futureChat = { v: 1, kind: "future" };
+  const futureUsage = { v: 1, kind: "weather", temp: 3 };
+  const valid = {
+    v: 1 as const,
+    kind: "assistant_partial" as const,
+    role: "assistant",
+    id: "reply-1",
+    at: 1.5,
+    channel: "chat",
+    text: "hello",
+    parts: [0, 1],
+    new_field: true,
+  };
+  const malformedChat = { ...valid, parts: [0, "1"] };
+  const raw = "plain words\nsecond line";
+  const body =
+    "retry: 1250\n\n" +
+    "event: notice\ndata: plain words\ndata: second line\n\n" +
+    `event: chat\ndata: ${JSON.stringify(futureChat)}\n\n` +
+    `event: usage\ndata: ${JSON.stringify(futureUsage)}\n\n` +
+    `event: chat\ndata: ${JSON.stringify(malformedChat)}\n\n` +
+    `event: chat\ndata: ${JSON.stringify(valid)}\n\n`;
+  const fetch = (async () =>
+    new Response(body, { headers: { "content-type": "text/event-stream" } })) as unknown as typeof globalThis.fetch;
+  const client = new PickleClient({ accessToken: "synthetic-token", fetch });
+  const events: PickleEvent[] = [];
+  for await (const event of client.events()) events.push(event);
+  expect(events).toEqual([
+    { event: "unknown", name: "notice", data: raw },
+    { event: "unknown", name: "chat", data: futureChat },
+    { event: "unknown", name: "usage", data: futureUsage },
+    { event: "unknown", name: "chat", data: malformedChat },
+    { event: "chat", data: valid },
+  ]);
+});
+
+test("typed events require the version and the declared field shapes", () => {
+  const badPayloads = [
+    { event: "chat", data: null },
+    { event: "chat", data: { v: 1, kind: "pending" } },
+    { event: "chat", data: { v: 1, kind: "activity", state: "tool", label: null } },
+    { event: "chat", data: { v: 2, kind: "pending", on: true } },
+    { event: "status", data: { v: 1 } },
+    { event: "sync", data: { v: 1, rev: "3" } },
+    { event: "room", data: { v: 1, kind: "advanced", room_id: "room-1", last_seq: 1, room: {} } },
+    { event: "widget", data: { v: 1, kind: "state", widget: "timer", revision: 2, data: [] } },
+  ];
+  for (const { event, data } of badPayloads) {
+    expect(toPickleEvent({ event, data: JSON.stringify(data) })).toEqual({ event: "unknown", name: event, data });
+  }
 });
