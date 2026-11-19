@@ -184,9 +184,7 @@ impl ChatView {
         self.selection.borrow_mut().clear();
         self.selection.borrow_mut().release();
         self.menu = None;
-        self.found = None;
-        self.reveal_generation += 1;
-        self._found = None;
+        self.cancel_reveal();
         self.requested_pictures.clear();
         // The cards are asked for again when they are next drawn.
         self.requested_handoff_cards.clear();
@@ -256,30 +254,44 @@ impl ChatView {
             .zip(&rows)
             .take_while(|(old, new)| old.same_as(new))
             .count();
-        let unchanged = start + matched;
+        let mut unchanged = start + matched;
         if unchanged == self.rows.len() && matched == rows.len() {
             return;
         }
-        let same_content = self.rows[unchanged..]
-            .iter()
-            .zip(&rows[matched..])
-            .take_while(|(old, new)| old.same_content_as(new))
-            .count();
-        self.selection
-            .borrow_mut()
-            .rows_changed(unchanged + same_content);
+        let top = self.list.logical_scroll_top();
+        let mut replacements = rows.into_iter().skip(matched).peekable();
+        // Quotes and reactions change height without changing row identity. Replacing the whole
+        // suffix would reset GPUI's scroll position to the first decorated row in it.
+        for old in &mut self.rows[unchanged..] {
+            let Some(new) = replacements.next_if(|new| old.same_content_as(new)) else {
+                break;
+            };
+            if !old.same_as(&new) {
+                *old = new;
+                self.list.splice(unchanged..unchanged + 1, 1);
+                if top.item_ix == unchanged {
+                    self.list.scroll_to(top);
+                }
+            }
+            unchanged += 1;
+        }
+        if unchanged == self.rows.len() && replacements.peek().is_none() {
+            cx.notify();
+            return;
+        }
+        self.selection.borrow_mut().rows_changed(unchanged);
         if self
             .found
             .as_ref()
-            .is_some_and(|found| found.end > unchanged + same_content)
+            .is_some_and(|found| found.end > unchanged)
         {
-            self.found = None;
-            self._found = None;
+            self.cancel_reveal();
         }
         self.list
-            .splice(unchanged..self.rows.len(), rows.len() - matched);
+            .splice(unchanged..self.rows.len(), replacements.len());
+        self.rows.truncate(unchanged);
         let mut missing = Vec::new();
-        for row in &rows[matched..] {
+        for row in replacements {
             if let RowKind::Part(Part::Files(files)) = &row.kind {
                 for file in &files.items {
                     let previewable = file.kind == AttachmentKind::Picture
@@ -289,9 +301,8 @@ impl ChatView {
                     }
                 }
             }
+            self.rows.push(row);
         }
-        self.rows.truncate(unchanged);
-        self.rows.extend(rows.into_iter().skip(matched));
         if !missing.is_empty() {
             cx.emit(ChatEvent::LoadAttachments(missing));
         }
@@ -386,6 +397,12 @@ impl ChatView {
             .ok();
         }));
         cx.notify();
+    }
+
+    fn cancel_reveal(&mut self) {
+        self.found = None;
+        self.reveal_generation += 1;
+        self._found = None;
     }
 
     #[cfg(test)]
@@ -560,6 +577,7 @@ impl ChatView {
     }
 
     pub fn scroll_to_latest(&mut self, cx: &mut Context<Self>) {
+        self.cancel_reveal();
         // A reset is the list's way back to "follow the newest row".
         self.list.reset(self.rows.len());
         self.at_latest = true;
@@ -957,6 +975,81 @@ mod tests {
             let (full_rows, full_starts) = crate::model::build_rows(&messages, Some(None), now);
             assert_eq!(view.rows, full_rows);
             assert_eq!(starts, full_starts);
+        });
+    }
+
+    #[gpui::test]
+    fn decorations_keep_the_scrollback_anchor_and_body_selection(cx: &mut TestAppContext) {
+        use crate::model::{Quote, ReactionBadge};
+
+        let (view, cx) = open(cx, &[]);
+        let now = Local::now();
+        let mut messages: Vec<_> = (1..=200)
+            .map(|seq| crate::convert::outgoing(seq.to_string(), "본문", seq, seq as f64))
+            .collect();
+        let mut starts = Vec::new();
+        view.update_in(cx, |view, window, cx| {
+            view.project_rows(0, &mut starts, None, &messages, now, cx);
+            view.selection.borrow_mut().select_all(&view.rows);
+            let selected = view.selection.borrow().text(&view.rows).unwrap();
+            let found = starts[100]..starts[101];
+            view.reveal(found.clone(), window, cx);
+            let top = ListOffset {
+                item_ix: found.start,
+                offset_in_item: px(6.),
+            };
+            view.list.scroll_to(top);
+
+            let changed = 10;
+            let start = starts[changed];
+            starts.truncate(changed);
+            messages[changed].decorations.reactions = Some(
+                vec![ReactionBadge {
+                    emoji: "👍".into(),
+                    count: 2,
+                }]
+                .into(),
+            );
+            messages[100].decorations.quote = Some(Arc::new(Quote {
+                author: Some("User"),
+                snippet: "quoted words".into(),
+            }));
+            view.project_rows(
+                start,
+                &mut starts,
+                Some(&messages[changed - 1]),
+                &messages[changed..],
+                now,
+                cx,
+            );
+
+            let projected_top = view.list.logical_scroll_top();
+            assert_eq!(projected_top.item_ix, top.item_ix);
+            assert_eq!(projected_top.offset_in_item, top.offset_in_item);
+            assert_eq!(view.found, Some(found));
+            assert_eq!(view.selection.borrow().text(&view.rows), Some(selected));
+            let (expected, expected_starts) = crate::model::build_rows(&messages, None, now);
+            assert_eq!(view.rows, expected);
+            assert_eq!(starts, expected_starts);
+            assert_eq!(view.list.item_count(), view.rows.len());
+        });
+    }
+
+    #[gpui::test]
+    fn replacing_revealed_content_invalidates_the_deferred_scroll(cx: &mut TestAppContext) {
+        let texts: Vec<_> = (0..200).map(|n| format!("Row {n}")).collect();
+        let (view, cx) = open(cx, &texts);
+        view.update_in(cx, |view, window, cx| {
+            view.reveal(100..101, window, cx);
+            let generation = view.reveal_generation;
+            let mut rows = view.rows.clone();
+            rows[100].kind = RowKind::Part(Part::Bubble(Arc::new(RichText {
+                text: "Replacement".into(),
+                spans: vec![],
+            })));
+            view.set_rows(rows, cx);
+            assert!(view.found.is_none());
+            assert_ne!(view.reveal_generation, generation);
         });
     }
 
