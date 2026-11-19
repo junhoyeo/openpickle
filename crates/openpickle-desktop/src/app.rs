@@ -2036,7 +2036,7 @@ mod tests {
             label: "Chat".into(),
             date: "Nov 16".into(),
             snippet: "An old message".into(),
-            matches: vec![3..6],
+            matches: std::iter::once(3..6).collect(),
         };
         // The same query text does not identify a request. Its earlier answer cannot open a row.
         updates
