@@ -34,7 +34,7 @@ use crate::{
     phone::CallSummary,
     profile::ProfileData,
     protocol::{Command, Update},
-    store::{Session, Store},
+    store::{LogStatus, Session, Store},
 };
 
 type EventStream = Pin<Box<dyn Stream<Item = openpickle_api::Result<PickleEvent>> + Send>>;
@@ -310,6 +310,26 @@ impl HistoryLog {
         }
     }
 
+    fn replay(&mut self, mut visit: impl FnMut(Record)) {
+        self.broken |= match self.store.read_log(&self.name, |record, after_gap| {
+            if Self::replayable(&record, after_gap) {
+                visit(record);
+            }
+        }) {
+            Ok(LogStatus::Clean) => false,
+            // Keep the last safe cursor on disk so catch-up can checkpoint repaired pages
+            // normally, even if another restart interrupts the backfill.
+            Ok(LogStatus::TornTail | LogStatus::Corrupt) => {
+                self.store.repair_log(&self.name, Self::replayable).is_err()
+            }
+            Err(_) => true,
+        };
+    }
+
+    fn replayable(record: &Record, after_gap: bool) -> bool {
+        !after_gap || !matches!(record, Record::Synced(_))
+    }
+
     fn append(&mut self, records: &[Record]) {
         if !self.broken {
             self.broken = self.store.append_log(&self.name, records).is_err();
@@ -331,22 +351,20 @@ struct Conversation {
 
 impl Conversation {
     fn load(store: &Store, room_id: &str) -> Self {
-        let log = HistoryLog::new(store, room_id);
+        let mut log = HistoryLog::new(store, room_id);
         let mut conversation = Self {
             room_id: room_id.to_owned(),
             ..Default::default()
         };
-        for record in store.log::<Record>(&log.name) {
-            match record {
-                Record::Item(item) => {
-                    conversation.items.insert(item.id.clone(), *item);
-                }
-                Record::Card(state) => {
-                    conversation.card_states.insert(state.id.clone(), state);
-                }
-                Record::Synced(seq) => conversation.synced = seq,
+        log.replay(|record| match record {
+            Record::Item(item) => {
+                conversation.items.insert(item.id.clone(), *item);
             }
-        }
+            Record::Card(state) => {
+                conversation.card_states.insert(state.id.clone(), state);
+            }
+            Record::Synced(seq) => conversation.synced = seq,
+        });
         conversation.log = Some(log);
         conversation
     }
@@ -3035,6 +3053,103 @@ mod tests {
         ))));
         assert!(!session_is_gone(&Error::RefreshAborted));
         assert!(!session_is_gone(&Error::InvalidHeader));
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_middle_record_replays_from_the_last_safe_cursor() {
+        let server = HistoryServer::start();
+        let (live, _) = fixture_live("repair-middle", &server);
+        let store = &live.store;
+        let log = HistoryLog::new(store, "primary");
+        let path = store.cache_path(&log.name);
+        let prefix = br#"{"t":"item","v":{"id":"fixture-1","role":"assistant","seq":1,"at":1.0}}
+{"t":"synced","v":1}
+"#;
+        let invalid = br#"{"t":"item","v":{"id":"missing-required-fields"}}
+"#;
+        let kept = br#"{"t":"item","v":{"id":"fixture-3","role":"assistant","seq":3,"at":1.0,"extra_field":"keep"}}
+{"t":"card","v":{"id":"fixture-3","seq":3,"state":"answered"}}
+"#;
+        let unsafe_cursor = b"{\"t\":\"synced\",\"v\":3}\n";
+        std::fs::write(
+            &path,
+            [prefix.as_slice(), invalid, kept, unsafe_cursor].concat(),
+        )
+        .unwrap();
+
+        let mut other = HistoryLog::new(store, "peer");
+        other.append(&[Record::Synced(42)]);
+        let other_path = store.cache_path(&other.name);
+        let other_data = std::fs::read(&other_path).unwrap();
+
+        let repaired = Conversation::load(store, "primary");
+        assert_eq!(repaired.synced, 1);
+        assert_eq!(repaired.items.len(), 2);
+        assert_eq!(repaired.card_states["fixture-3"].state, "answered");
+        let clean = [prefix.as_slice(), kept].concat();
+        assert_eq!(std::fs::read(&path).unwrap(), clean);
+        assert_eq!(std::fs::read(&other_path).unwrap(), other_data);
+        assert_eq!(Conversation::load(store, "peer").synced, 42);
+
+        // Restart before replay completes: the suspect cursor must stay invalidated.
+        let mut resumed = Conversation::load(store, "primary");
+        assert_eq!(resumed.synced, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), clean);
+        catch_up_conversation(&live.client, &mut resumed, |_| {})
+            .await
+            .unwrap();
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("after_seq=1"));
+        let reloaded = Conversation::load(store, "primary");
+        assert_eq!(reloaded.synced, 2);
+        assert_eq!(reloaded.items.len(), 3);
+        assert!(reloaded.items.contains_key("fixture-2"));
+        assert!(reloaded.items.contains_key("fixture-3"));
+        assert_eq!(reloaded.card_states["fixture-3"].state, "answered");
+    }
+
+    #[test]
+    fn an_unterminated_tail_does_not_invalidate_the_previous_cursor() {
+        let root = std::env::temp_dir().join(format!(
+            "openpickle-test-history-torn-tail-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root).unwrap();
+        let path = store.cache_path("room-primary.jsonl");
+        let prefix = b"{\"t\":\"synced\",\"v\":7}\n";
+        std::fs::write(&path, [prefix.as_slice(), b"{\"t\":\"item\""].concat()).unwrap();
+
+        let loaded = Conversation::load(&store, "primary");
+        assert_eq!(loaded.synced, 7);
+        assert_eq!(std::fs::read(&path).unwrap().as_slice(), prefix.as_slice());
+        loaded.log.unwrap().append(&[Record::Synced(8)]);
+        assert_eq!(Conversation::load(&store, "primary").synced, 8);
+    }
+
+    #[test]
+    fn a_failed_repair_neither_alters_the_log_nor_allows_new_checkpoints() {
+        let root = std::env::temp_dir().join(format!(
+            "openpickle-test-history-repair-failure-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::at(root).unwrap();
+        let path = store.cache_path("room-primary.jsonl");
+        let data = b"{\"t\":\"synced\",\"v\":1}\ninvalid\n{\"t\":\"synced\",\"v\":3}\n";
+        std::fs::write(&path, data).unwrap();
+        let temporary = path.with_extension("repair");
+        std::fs::create_dir(&temporary).unwrap();
+
+        let loaded = Conversation::load(&store, "primary");
+        assert_eq!(loaded.synced, 1);
+        let mut log = loaded.log.unwrap();
+        assert!(log.broken);
+        std::fs::remove_dir(&temporary).unwrap();
+        log.append(&[Record::Synced(4)]);
+        assert_eq!(std::fs::read(&path).unwrap().as_slice(), data.as_slice());
+        assert_eq!(Conversation::load(&store, "primary").synced, 1);
     }
 
     #[test]
