@@ -47,3 +47,14 @@ test("a failed transfer removes staging data and leaves the previous file intact
     expect(await readdir(dir)).toEqual(["sample.md"]);
   });
 });
+
+test("does not publish a partial response as a complete attachment", async () => {
+  await withDestination(async (out, dir) => {
+    const response = new Response(new Uint8Array([65]), {
+      status: 206,
+      headers: { "content-range": "bytes 0-0/3" },
+    });
+    await expect(saveAttachmentResponse(response, out)).rejects.toThrow("full attachment");
+    expect(await readdir(dir)).toEqual([]);
+  });
+});

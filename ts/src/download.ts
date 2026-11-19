@@ -8,6 +8,10 @@ import { pipeline } from "node:stream/promises";
 export async function saveAttachmentResponse(response: Response, out: string): Promise<number> {
   const body = response.body;
   if (!body) throw new Error("The attachment response has no file body.");
+  if (response.status !== 200 || response.headers.has("content-range")) {
+    await body.cancel().catch(() => {});
+    throw new Error("The server did not send the full attachment.");
+  }
   let bytes = 0;
   const directory = await mkdtemp(join(dirname(out), ".openpickle-download-")).catch(async (error) => {
     await body.cancel().catch(() => {});
