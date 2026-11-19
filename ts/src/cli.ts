@@ -10,6 +10,7 @@ import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { PickleClient, decodeAccessToken } from "./client.ts";
+import { saveAttachmentResponse } from "./download.ts";
 import type { HistoryItem, LoginSessionRefresh } from "./types.ts";
 
 const USAGE = `usage: PICKLE_SESSION_FILE=<file> pickle <command>
@@ -187,9 +188,9 @@ switch (command) {
   case "download": {
     const [path, out] = args;
     if (!path || !out) throw new Error("download <path> <out file>");
-    const { bytes, contentType } = await pickle.getAttachment(path);
-    await writeFile(out, bytes);
-    console.error(`${contentType}, ${bytes.length} bytes written to ${out}`);
+    const response = await pickle.getAttachmentResponse(path);
+    const bytes = await saveAttachmentResponse(response, out);
+    console.error(`${response.headers.get("content-type") ?? ""}, ${bytes} bytes written to ${out}`);
     break;
   }
   case "export": {

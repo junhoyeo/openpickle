@@ -389,12 +389,17 @@ export class PickleClient {
    * same headers. The response names the file in `Content-Disposition`.
    */
   async getAttachment(path: string): Promise<{ bytes: Uint8Array; contentType: string }> {
-    const encoded = path.split("/").map(encodeURIComponent).join("/");
-    const response = await this.send("GET", `/api/attachments/${encoded}`, { auth: "token" });
+    const response = await this.getAttachmentResponse(path);
     return {
       bytes: new Uint8Array(await response.arrayBuffer()),
       contentType: response.headers.get("content-type") ?? "",
     };
+  }
+
+  /** Opens the original attachment without buffering its body. The caller consumes or cancels it. */
+  getAttachmentResponse(path: string, options: Pick<RequestOptions, "signal"> = {}): Promise<Response> {
+    const encoded = path.split("/").map(encodeURIComponent).join("/");
+    return this.send("GET", `/api/attachments/${encoded}`, { auth: "token", signal: options.signal });
   }
 
   // ---- Profile, character and social ----
