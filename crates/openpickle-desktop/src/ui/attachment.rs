@@ -316,9 +316,16 @@ impl Render for AttachmentView {
                     .gap(px(12.))
                     .child(
                         img(source.clone())
+                            .id("attachment-thumbnail")
                             .w_full()
                             .h(preview_height)
-                            .object_fit(ObjectFit::Contain),
+                            .object_fit(ObjectFit::Contain)
+                            .with_loading(|| div().child("Loading preview…").into_any_element())
+                            .with_fallback(|| {
+                                div()
+                                    .child("This preview could not be displayed. Download the file to see the original.")
+                                    .into_any_element()
+                            }),
                     )
                     .child(muted().child(if file {
                         "The first page, as a preview"

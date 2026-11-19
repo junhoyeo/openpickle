@@ -6,7 +6,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -82,7 +82,7 @@ fn begin(phase: &watch::Sender<Phase>, next: Phase) -> bool {
 
 struct Job {
     phase: watch::Sender<Phase>,
-    progress: watch::Receiver<Progress>,
+    progress: Arc<Mutex<Option<Progress>>>,
     task: JoinHandle<()>,
 }
 
@@ -112,11 +112,16 @@ impl OriginalDownloads {
     ) {
         self.jobs.retain(|_, job| !job.task.is_finished());
         if let Some(job) = self.jobs.get(&key) {
-            // Reopening a preview can attach to this transfer rather than creating a new file.
-            let progress = *job.progress.borrow();
-            key.progress(&updates, progress);
-            return;
+            // Serialize this replay with the terminal update: a late progress message would
+            // put a completed overlay back into Running with nothing left to finish it.
+            let progress = job.progress.lock().unwrap();
+            if let Some(progress) = *progress {
+                key.progress(&updates, progress);
+                return;
+            }
         }
+        // A task may have posted its result but not yet returned from Tokio's wrapper.
+        self.jobs.remove(&key);
         if self.jobs.len() >= JOB_LIMIT {
             key.finished(
                 &updates,
@@ -125,12 +130,12 @@ impl OriginalDownloads {
             return;
         }
         let (phase, mut stopped) = watch::channel(Phase::Pending);
-        let (latest, progress) = watch::channel((0, None));
+        let progress = Arc::new(Mutex::new(Some((0, None))));
         let reporter = Reporter {
             key: key.clone(),
             updates,
             active: self.account_active.clone(),
-            latest,
+            latest: progress.clone(),
         };
         reporter.progress(0, None);
         let (folder, slots, writer_phase) =
@@ -146,9 +151,7 @@ impl OriginalDownloads {
                 }
                 None => Err(CANCELED.into()),
             };
-            if reporter.active.load(Ordering::Acquire) {
-                reporter.key.finished(&reporter.updates, result);
-            }
+            reporter.finish(result);
         });
         self.jobs.insert(
             key,
@@ -190,14 +193,23 @@ struct Reporter {
     key: DownloadKey,
     updates: Updates<Update>,
     active: Arc<AtomicBool>,
-    latest: watch::Sender<Progress>,
+    latest: Arc<Mutex<Option<Progress>>>,
 }
 
 impl Reporter {
     fn progress(&self, received: u64, total: Option<u64>) {
         if self.active.load(Ordering::Acquire) {
-            self.latest.send_replace((received, total));
+            let mut latest = self.latest.lock().unwrap();
+            *latest = Some((received, total));
             self.key.progress(&self.updates, (received, total));
+        }
+    }
+
+    fn finish(self, result: Result<PathBuf, String>) {
+        let mut latest = self.latest.lock().unwrap();
+        *latest = None;
+        if self.active.load(Ordering::Acquire) {
+            self.key.finished(&self.updates, result);
         }
     }
 }
@@ -651,6 +663,47 @@ mod tests {
             [folder.0.join("report (1).pdf"), folder.0.join("report.pdf")]
         );
         assert!(server.requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn completed_job_cannot_replay_progress_even_before_its_task_exits() {
+        let folder = Folder::new();
+        let server = Server::start();
+        let (updates, mut received) = futures::channel::mpsc::unbounded();
+        let active = Arc::new(AtomicBool::new(true));
+        let mut downloads = OriginalDownloads::new(folder.0.clone(), active.clone());
+        let key = key("oversize");
+        let (phase, _stopped) = watch::channel(Phase::Pending);
+        let progress = Arc::new(Mutex::new(Some((42, Some(42)))));
+        let reporter = Reporter {
+            key: key.clone(),
+            updates: updates.clone(),
+            active,
+            latest: progress.clone(),
+        };
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            wait.await.ok();
+        });
+        downloads.jobs.insert(
+            key.clone(),
+            Job {
+                phase,
+                progress,
+                task,
+            },
+        );
+        reporter.finish(Err(CANCELED.into()));
+        assert_eq!(finished(&mut received).await.1.unwrap_err(), CANCELED);
+        assert!(!downloads.jobs[&key].task.is_finished());
+
+        downloads.start(key, server.client(), "report.pdf".into(), updates);
+        assert!(matches!(
+            next(&mut received).await,
+            Update::AttachmentDownloadProgress { received: 0, .. }
+        ));
+        assert_eq!(finished(&mut received).await.1.unwrap_err(), SIZE_ERROR);
+        release.send(()).unwrap();
     }
 
     #[tokio::test]
