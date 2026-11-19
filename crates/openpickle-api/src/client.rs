@@ -568,20 +568,23 @@ impl PickleClient {
         Ok(response.bytes().await?)
     }
 
-    /// `GET /api/attachments/{path}`: the attachment itself, the file as it was sent or as the
-    /// character made it. `path` is as messages name it and ends in the file's name. A file
-    /// may be large, so the exchange gets more time than a call.
+    /// `GET /api/attachments/{path}`: the attachment itself as bytes. Use
+    /// [`get_attachment_response`](Self::get_attachment_response) to stream large files.
     pub async fn get_attachment(&self, path: &str) -> Result<bytes::Bytes> {
+        Ok(self.get_attachment_response(path).await?.bytes().await?)
+    }
+
+    /// Opens the original attachment without buffering its body. `path` is as messages name
+    /// it and ends in the file's name. Use [`Response::chunk`] for incremental reads.
+    pub async fn get_attachment_response(&self, path: &str) -> Result<Response> {
         let options = RequestOptions::default().auth(Auth::BearerOnly);
-        let response = self
-            .dispatch(
-                Method::GET,
-                &attachment_path(path),
-                options,
-                Some(DOWNLOAD_TIMEOUT),
-            )
-            .await?;
-        Ok(response.bytes().await?)
+        self.dispatch(
+            Method::GET,
+            &attachment_path(path),
+            options,
+            Some(DOWNLOAD_TIMEOUT),
+        )
+        .await
     }
 
     /// `GET /api/rooms/{room}/history`: the latest messages of a room (up to 200).

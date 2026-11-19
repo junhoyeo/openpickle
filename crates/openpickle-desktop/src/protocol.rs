@@ -61,7 +61,9 @@ pub enum Command {
     /// Download the thumbnail (or first-page preview) of one attachment in the open room.
     PreviewAttachment(String),
     /// Download one attachment of the open room, the file itself, into the Downloads folder.
-    DownloadAttachment(String),
+    DownloadAttachment { room_id: String, path: String },
+    /// Stop an active or queued download, even after the user has switched rooms.
+    CancelAttachmentDownload { room_id: String, path: String },
     /// Search the messages for this text.
     Search(String),
     /// Whether the chat can be read now: the window is in front and shows the chat. Only
@@ -164,8 +166,16 @@ pub enum Update {
         path: String,
         result: Result<PathBuf, String>,
     },
+    /// Bytes received for a queued or active original transfer (total may be unknown).
+    AttachmentDownloadProgress {
+        room_id: String,
+        path: String,
+        received: u64,
+        total: Option<u64>,
+    },
     /// An attachment was downloaded into this file, or why it was not.
     AttachmentDownloaded {
+        room_id: String,
         path: String,
         result: Result<PathBuf, String>,
     },

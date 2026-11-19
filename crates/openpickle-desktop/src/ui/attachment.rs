@@ -17,6 +17,7 @@ pub enum AttachmentEvent {
     Retry,
     /// Download the file itself.
     Download,
+    CancelDownload,
 }
 enum State {
     Loading,
@@ -27,7 +28,8 @@ enum State {
 /// Where the download of the file itself stands.
 enum Download {
     NotAsked,
-    Running,
+    Running { received: u64, total: Option<u64> },
+    Canceling,
     Saved(PathBuf),
     Failed(String),
 }
@@ -62,6 +64,13 @@ impl AttachmentView {
         cx.notify();
     }
 
+    pub fn download_progress(&mut self, received: u64, total: Option<u64>, cx: &mut Context<Self>) {
+        if !matches!(self.download, Download::Canceling) {
+            self.download = Download::Running { received, total };
+            cx.notify();
+        }
+    }
+
     /// The download ended: the file it was saved as, or why there is none.
     pub fn downloaded(&mut self, result: Result<PathBuf, String>, cx: &mut Context<Self>) {
         self.download = match result {
@@ -72,7 +81,10 @@ impl AttachmentView {
     }
 
     fn start_download(&mut self, cx: &mut Context<Self>) {
-        self.download = Download::Running;
+        self.download = Download::Running {
+            received: 0,
+            total: None,
+        };
         cx.emit(AttachmentEvent::Download);
         cx.notify();
     }
@@ -104,7 +116,28 @@ impl AttachmentView {
                     .child(icon("download", 16., theme::TEXT))
                     .on_click(cx.listener(|this, _, _, cx| this.start_download(cx))),
             ),
-            Download::Running => line.child("Downloading…"),
+            Download::Running { received, total } => {
+                let status = match (received, total) {
+                    (_, Some(0)) => "Downloading…".to_owned(),
+                    (received, Some(total)) => {
+                        format!("Downloading… {}%", (received * 100 / total).min(100))
+                    }
+                    (0, None) => "Waiting for download…".to_owned(),
+                    (received, None) => {
+                        format!("Downloading… {:.1} MiB", *received as f64 / (1024. * 1024.))
+                    }
+                };
+                line.child(status).child(
+                    button("cancel-download", "Cancel")
+                        .text_color(theme::color(theme::TEXT))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.download = Download::Canceling;
+                            cx.emit(AttachmentEvent::CancelDownload);
+                            cx.notify();
+                        })),
+                )
+            }
+            Download::Canceling => line.child("Canceling download…"),
             Download::Saved(file) => {
                 let name = |path: Option<&std::path::Path>| {
                     path.and_then(|path| path.file_name())

@@ -6,7 +6,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::PathBuf,
     pin::Pin,
     sync::{
         Arc,
@@ -36,6 +36,9 @@ use crate::{
     protocol::{Command, Update},
     store::{Session, Store},
 };
+
+mod attachment_downloads;
+use attachment_downloads::{DownloadKey, OriginalDownloads};
 
 type EventStream = Pin<Box<dyn Stream<Item = openpickle_api::Result<PickleEvent>> + Send>>;
 
@@ -224,7 +227,8 @@ async fn sign_in(
             | Command::ResolvePhoneTask(_)
             | Command::LoadHandoffCard(_)
             | Command::WatchHandoff(_)
-            | Command::DownloadAttachment(_)
+            | Command::DownloadAttachment { .. }
+            | Command::CancelAttachmentDownload { .. }
             | Command::WatchPhoneCall(_)
             | Command::EndPhoneCall { .. }
             | Command::OffersShown(_)
@@ -559,8 +563,7 @@ struct Live {
     handoff_watch: Option<HandoffWatch>,
     phone_watch: Option<PhoneWatch>,
     handoff_cards: HandoffCards,
-    /// Where downloaded attachments go: the user's Downloads folder.
-    download_dir: PathBuf,
+    original_downloads: OriginalDownloads,
     /// Whether the window is in front; only then does reading count as "seen".
     active: bool,
     /// Whether the history on this computer reaches back to the first message.
@@ -645,7 +648,7 @@ async fn converse(
         handoff_watch: None,
         phone_watch: None,
         handoff_cards: HandoffCards::default(),
-        download_dir: download_dir(),
+        original_downloads: OriginalDownloads::new(download_dir(), account_active.clone()),
         // The window says when it comes to the front.
         active: false,
         history_complete: false,
@@ -658,7 +661,13 @@ async fn converse(
         marked_read: 0,
     };
     live.send_startup_conversation();
+    let ended = converse_live(&mut live, commands).await;
+    live.account_active.store(false, Ordering::Release);
+    live.original_downloads.shutdown().await;
+    ended
+}
 
+async fn converse_live(live: &mut Live, commands: &mut Commands<Command>) -> Ended {
     let mut events: Option<EventStream> = None;
     let mut connect_at = Instant::now();
     let mut opened_at = Instant::now();
@@ -828,7 +837,12 @@ async fn converse(
                         return Ended::SignedOut;
                     }
                 }
-                Some(Command::DownloadAttachment(path)) => live.download_attachment(path),
+                Some(Command::DownloadAttachment { room_id, path }) => {
+                    live.download_attachment(DownloadKey { room_id, path });
+                }
+                Some(Command::CancelAttachmentDownload { room_id, path }) => {
+                    live.original_downloads.cancel(&DownloadKey { room_id, path });
+                }
                 Some(Command::OffersShown(offers)) => {
                     // Nothing on screen depends on this report, so a failure is not shown.
                     if let Err(error) = live.client.report_offer_impressions(&offers).await
@@ -1343,42 +1357,33 @@ impl Live {
         }
     }
 
-    /// Downloads an attachment of the open conversation, the file itself, into the Downloads
-    /// folder. A file may take minutes, so it is fetched beside the conversation, which goes
-    /// on meanwhile.
-    fn download_attachment(&mut self, path: String) {
-        let attachments = self.conversation.attachments();
-        let Some(attachment) = attachments.iter().find(|item| item.path == path) else {
-            self.send(Update::AttachmentDownloaded {
-                path,
-                result: Err("This attachment does not belong to the open conversation.".to_owned()),
-            });
+    /// Authorize once against the room that was open when the download was requested.
+    fn download_attachment(&mut self, key: DownloadKey) {
+        let name = (key.room_id == self.conversation.room_id)
+            .then(|| {
+                // Use the newest matching metadata without building and sorting the whole Archive.
+                self.conversation
+                    .items
+                    .values()
+                    .filter_map(|item| {
+                        let attachment = convert::attachments(item)
+                            .into_iter()
+                            .find(|attachment| attachment.path == key.path)?;
+                        Some((item.seq, attachment.name))
+                    })
+                    .max_by_key(|(seq, _)| *seq)
+                    .map(|(_, name)| name)
+            })
+            .flatten();
+        let Some(name) = name else {
+            key.finished(
+                &self.updates,
+                Err("This attachment does not belong to the open conversation.".to_owned()),
+            );
             return;
         };
-        let name = attachment.name.clone();
-        let client = self.client.clone();
-        let updates = self.updates.clone();
-        let account_active = self.account_active.clone();
-        let folder = self.download_dir.clone();
-        tokio::spawn(async move {
-            let result = match client.get_attachment(&path).await {
-                Ok(_) if !account_active.load(Ordering::Acquire) => {
-                    Err("The account was signed out before the download finished.".to_owned())
-                }
-                // Writing a large file takes its time too, and the backend has one thread: the
-                // write goes to a thread of its own.
-                Ok(bytes) => {
-                    tokio::task::spawn_blocking(move || save_download(&folder, &name, &bytes))
-                        .await
-                        .unwrap_or_else(|stopped| Err(std::io::Error::other(stopped)))
-                        .map_err(|error| format!("Could not save the file: {error}"))
-                }
-                Err(error) => Err(explain(&error)),
-            };
-            updates
-                .unbounded_send(Update::AttachmentDownloaded { path, result })
-                .ok();
-        });
+        self.original_downloads
+            .start(key, self.client.clone(), name, self.updates.clone());
     }
 
     /// What the disk has under `name`, the first time it is asked for in this run. The window
@@ -2066,7 +2071,6 @@ impl Downloads {
     }
 }
 
-/// The cache file of the picture with this key. The extension tells GPUI how to decode it.
 /// The user's Downloads folder. A system that names none gets one in the home folder.
 fn download_dir() -> PathBuf {
     dirs::download_dir()
@@ -2074,55 +2078,7 @@ fn download_dir() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
-/// Writes a downloaded file into `folder` under its own name, or under the next free one
-/// ("report (1).pdf") when a file of that name is there. Only the last part of the name is
-/// used and what a file name may not hold is replaced, so that a name from the server cannot
-/// lead out of the folder.
-fn save_download(folder: &Path, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
-    use std::io::Write;
-
-    let name: String = Path::new(name)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("attachment")
-        .chars()
-        .map(|c| match c {
-            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
-            c if c.is_control() => '_',
-            c => c,
-        })
-        .collect();
-    let (stem, extension) = match name.rfind('.') {
-        Some(dot) if dot > 0 => name.split_at(dot),
-        _ => (name.as_str(), ""),
-    };
-    std::fs::create_dir_all(folder)?;
-    for count in 0.. {
-        let file = if count == 0 {
-            folder.join(&name)
-        } else {
-            folder.join(format!("{stem} ({count}){extension}"))
-        };
-        // Creating the file fails when it exists: two downloads cannot take one name.
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&file)
-        {
-            Ok(mut created) => {
-                if let Err(error) = created.write_all(bytes) {
-                    std::fs::remove_file(&file).ok();
-                    return Err(error);
-                }
-                return Ok(file);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-    }
-    unreachable!("the count has no end")
-}
-
+/// The cache file of the picture with this key. The extension tells GPUI how to decode it.
 fn picture_file(key: &str) -> String {
     // FNV-1a: the name has to be the same in every run, which the standard hasher does not
     // promise.
@@ -2459,7 +2415,10 @@ mod tests {
             handoff_watch: None,
             phone_watch: None,
             handoff_cards: HandoffCards::default(),
-            download_dir: store.cache_path("downloads"),
+            original_downloads: OriginalDownloads::new(
+                store.cache_path("downloads"),
+                account_active.clone(),
+            ),
             active: false,
             history_complete: false,
             character_room: "primary".to_owned(),
@@ -2777,32 +2736,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_download_keeps_its_name_or_takes_the_next_free_one_and_stays_in_its_folder() {
-        let folder =
-            std::env::temp_dir().join(format!("openpickle-test-downloads-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&folder);
-        let first = save_download(&folder, "보고서 최종.pdf", b"one").unwrap();
-        let second = save_download(&folder, "보고서 최종.pdf", b"two").unwrap();
-        assert_eq!(first, folder.join("보고서 최종.pdf"));
-        assert_eq!(second, folder.join("보고서 최종 (1).pdf"));
-        assert_eq!(std::fs::read(&first).unwrap(), b"one");
-        assert_eq!(std::fs::read(&second).unwrap(), b"two");
-        // A name from the server cannot lead out of the folder. A name without an extension
-        // is counted without one.
-        let notes = save_download(&folder, "../../notes", b"x").unwrap();
-        assert_eq!(notes, folder.join("notes"));
-        assert_eq!(
-            save_download(&folder, "notes", b"y").unwrap(),
-            folder.join("notes (1)")
-        );
-        assert_eq!(
-            save_download(&folder, "..", b"z").unwrap(),
-            folder.join("attachment")
-        );
-        std::fs::remove_dir_all(&folder).ok();
-    }
-
     #[tokio::test]
     async fn an_attachment_of_the_open_conversation_is_downloaded_under_its_own_name() {
         let server = HistoryServer::start();
@@ -2815,21 +2748,38 @@ mod tests {
         .unwrap();
         live.conversation.apply(vec![item], vec![]);
 
-        // A path that no message of the conversation carries is not asked for.
-        live.download_attachment("attachments/2026-11-05/other.pdf".into());
-        assert!(matches!(
-            received.try_recv().unwrap(),
-            Update::AttachmentDownloaded { result: Err(_), .. }
-        ));
+        let key = |room_id: &str, file: &str| DownloadKey {
+            room_id: room_id.into(),
+            path: format!("attachments/2026-11-05/{file}"),
+        };
+        // Unknown paths and requests from a room that is no longer open never reach HTTP.
+        for unauthorized in [key("primary", "other.pdf"), key("peer", "계획서.md")] {
+            live.download_attachment(unauthorized);
+            assert!(matches!(
+                received.try_recv().unwrap(),
+                Update::AttachmentDownloaded { result: Err(_), .. }
+            ));
+        }
         assert!(server.requests.lock().unwrap().is_empty());
 
-        live.download_attachment("attachments/2026-11-05/계획서.md".into());
-        let Some(Update::AttachmentDownloaded { path, result }) = received.next().await else {
-            panic!("the download reports how it ended");
-        };
+        live.download_attachment(key("primary", "계획서.md"));
+        let (room_id, path, file) = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(Update::AttachmentDownloaded {
+                    room_id,
+                    path,
+                    result,
+                }) = received.next().await.expect("the backend is still running")
+                {
+                    break (room_id, path, result.unwrap());
+                }
+            }
+        })
+        .await
+        .expect("the download reports how it ended");
+        assert_eq!(room_id, "primary");
         assert_eq!(path, "attachments/2026-11-05/계획서.md");
-        let file = result.unwrap();
-        assert_eq!(file, live.download_dir.join("계획서.md"));
+        assert_eq!(file, live.store.cache_path("downloads").join("계획서.md"));
         assert_eq!(std::fs::read(&file).unwrap(), b"the file as it was made");
         assert_eq!(
             *server.requests.lock().unwrap(),
