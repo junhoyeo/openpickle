@@ -325,15 +325,37 @@ struct Identity {
 struct HistoryLog {
     store: Store,
     name: String,
+    archive_rescan: bool,
     broken: bool,
 }
 
 impl HistoryLog {
     fn new(store: &Store, room_id: &str) -> Self {
+        let name = format!("room-{room_id}.jsonl");
+        let archive_rescan = store
+            .cached(&Self::archive_rescan_name(&name))
+            .unwrap_or(false);
         Self {
             store: store.clone(),
-            name: format!("room-{room_id}.jsonl"),
+            name,
+            archive_rescan,
             broken: false,
+        }
+    }
+
+    fn archive_rescan_name(name: &str) -> String {
+        format!("{name}.archive-rescan")
+    }
+
+    fn finish_archive_rescan(&mut self) {
+        if self.archive_rescan
+            && !self.broken
+            && self
+                .store
+                .cache(&Self::archive_rescan_name(&self.name), &false)
+                .is_ok()
+        {
+            self.archive_rescan = false;
         }
     }
 
@@ -346,8 +368,15 @@ impl HistoryLog {
             Ok(LogStatus::Clean) => false,
             // Keep the last safe cursor on disk so catch-up can checkpoint repaired pages
             // normally, even if another restart interrupts the backfill.
-            Ok(LogStatus::TornTail | LogStatus::Corrupt) => {
-                self.store.repair_log(&self.name, Self::replayable).is_err()
+            Ok(LogStatus::TornTail) => self.store.repair_log(&self.name, Self::replayable).is_err(),
+            Ok(LogStatus::Corrupt) => {
+                // An invalid row could be from backward paging, before even the last safe
+                // forward cursor. Record the need to rescan before removing the evidence.
+                self.archive_rescan = true;
+                self.store
+                    .cache(&Self::archive_rescan_name(&self.name), &true)
+                    .is_err()
+                    || self.store.repair_log(&self.name, Self::replayable).is_err()
             }
             Err(_) => true,
         };
@@ -1572,7 +1601,18 @@ impl Live {
             let before = self
                 .archive
                 .before
-                .or_else(|| self.conversation.first_seq())
+                .or_else(|| {
+                    let rescan = self
+                        .conversation
+                        .log
+                        .as_ref()
+                        .is_some_and(|log| log.archive_rescan);
+                    if rescan {
+                        None
+                    } else {
+                        self.conversation.first_seq()
+                    }
+                })
                 .unwrap_or(i64::MAX);
             self.request_archive_page(before);
         }
@@ -1611,6 +1651,9 @@ impl Live {
         self.archive.complete = !page.has_more;
         let attachments = self.apply_archive_page(before, page);
         if self.archive.complete {
+            if let Some(log) = &mut self.conversation.log {
+                log.finish_archive_rescan();
+            }
             // Include any live or delta messages received since the Archive opened.
             self.archive.attachments = self.conversation.attachments();
             self.show_archive();
@@ -3801,6 +3844,42 @@ mod tests {
         assert!(reloaded.items.contains_key("fixture-2"));
         assert!(reloaded.items.contains_key("fixture-3"));
         assert_eq!(reloaded.card_states["fixture-3"].state, "answered");
+    }
+
+    #[tokio::test]
+    async fn archive_rescans_older_history_after_middle_damage_and_restart() {
+        let server = HistoryServer::start();
+        let (mut live, _) = fixture_live("repair-archive", &server);
+        let path = live.store.cache_path("room-primary.jsonl");
+        std::fs::write(
+            path,
+            b"{\"t\":\"synced\",\"v\":30}\ninvalid archived row\n{\"t\":\"item\",\"v\":{\"id\":\"older\",\"role\":\"assistant\",\"seq\":5,\"at\":1.0}}\n",
+        )
+        .unwrap();
+        let repaired = Conversation::load(&live.store, "primary");
+        assert_eq!(repaired.synced, 30);
+        drop(repaired);
+
+        live.conversation = Conversation::load(&live.store, "primary");
+        assert_eq!(live.conversation.first_seq(), Some(5));
+        live.watch_archive(Some("primary"));
+        assert_eq!(live.archive.before, Some(i64::MAX));
+        let page = serde_json::from_value(serde_json::json!({
+            "v": 1,
+            "messages": [{"id":"missed", "role":"assistant", "seq":8, "at":2.0}],
+            "card_states": [], "reactions": [], "has_more": false, "next_before": 1,
+        }))
+        .unwrap();
+        live.finish_archive_page(ArchivePage {
+            room_id: "primary".into(),
+            before: i64::MAX,
+            result: Ok(page),
+        })
+        .unwrap();
+        let reloaded = Conversation::load(&live.store, "primary");
+        assert_eq!(reloaded.synced, 30);
+        assert!(reloaded.items.contains_key("missed"));
+        assert!(!reloaded.log.unwrap().archive_rescan);
     }
 
     #[test]
