@@ -18,7 +18,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::{
     content::LinkTarget,
     convert,
-    model::{Message, Part, RoomInfo, Social, UNCONFIRMED_SEQ, build_rows},
+    model::{Attachment, Message, Part, RoomInfo, Social, UNCONFIRMED_SEQ, build_rows},
     phone::CallSummary,
     protocol::{Command, HandoffCard, RoomMetadata, SearchRequest, Update},
     theme,
@@ -405,7 +405,27 @@ impl Shell {
                     view.update(cx, |view, cx| view.loaded(result, cx));
                 }
             }
-            Update::AttachmentDownloaded { path, result } => {
+            Update::AttachmentDownloadProgress {
+                room_id,
+                path,
+                received,
+                total,
+            } => {
+                if room_id == self.room_id
+                    && let Some(Over::Attachment(view)) = &self.over
+                    && view.read(cx).path() == path
+                {
+                    view.update(cx, |view, cx| view.download_progress(received, total, cx));
+                }
+            }
+            Update::AttachmentDownloaded {
+                room_id,
+                path,
+                result,
+            } => {
+                if room_id != self.room_id {
+                    return;
+                }
                 if let Some(Over::Attachment(view)) = &self.over
                     && view.read(cx).path() == path
                 {
@@ -831,8 +851,14 @@ impl Shell {
                             ArchiveEvent::Menu => this.open_drawer(window, cx),
                             ArchiveEvent::Invite => this.open_invite(window, cx),
                             ArchiveEvent::Open(tab) => this.open_tab(*tab, window, cx),
-                            ArchiveEvent::ShowInChat(seq) => {
-                                this.show_message(*seq, window, cx);
+                            ArchiveEvent::ShowInChat(seq) => this.show_message(*seq, window, cx),
+                            ArchiveEvent::PreviewFile(path) | ArchiveEvent::DownloadFile(path) => {
+                                this.open_archive_file(
+                                    path,
+                                    matches!(event, ArchiveEvent::DownloadFile(_)),
+                                    window,
+                                    cx,
+                                );
                             }
                             ArchiveEvent::Load(paths) => {
                                 this.commands
@@ -1264,36 +1290,7 @@ impl Shell {
                     .find(|item| item.path == path)
                     .cloned();
                 if let Some(attachment) = attachment {
-                    let preview = cx.new(|cx| AttachmentView::new(attachment, cx));
-                    self._over_events = Some(cx.subscribe_in(
-                        &preview,
-                        window,
-                        |this, view, event, window, cx| match event {
-                            AttachmentEvent::Close => this.close_over(window, cx),
-                            AttachmentEvent::Retry => {
-                                let path = view.read(cx).path().to_owned();
-                                this.commands.send(Command::PreviewAttachment(path)).ok();
-                            }
-                            AttachmentEvent::Download => {
-                                let path = view.read(cx).path().to_owned();
-                                if this
-                                    .commands
-                                    .send(Command::DownloadAttachment(path))
-                                    .is_err()
-                                {
-                                    let stopped = "OpenPickle has stopped. Reopen the app.";
-                                    view.update(cx, |view, cx| {
-                                        view.downloaded(Err(stopped.into()), cx)
-                                    });
-                                }
-                            }
-                        },
-                    ));
-                    window.focus(&preview.focus_handle(cx));
-                    self.set_over(Some(Over::Attachment(preview)));
-                    self.commands.send(Command::PreviewAttachment(path)).ok();
-                    self.report_reading(window);
-                    cx.notify();
+                    self.open_attachment(attachment, false, window, cx);
                 }
             }
             None => {
@@ -1301,6 +1298,89 @@ impl Shell {
                 cx.notify();
             }
         }
+    }
+
+    fn open_archive_file(
+        &mut self,
+        path: &str,
+        download_now: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tab != Tab::Archive || LinkTarget::attachment(path).is_none() {
+            return;
+        }
+        // Only the Archive projection for this room can supply the file. It may arrive before
+        // the corresponding timeline rows; the backend still checks conversation membership.
+        let attachment = self
+            .archive
+            .as_ref()
+            .and_then(|archive| archive.read(cx).file(path))
+            .cloned();
+        if let Some(attachment) = attachment {
+            self.open_attachment(attachment, download_now, window, cx);
+        }
+    }
+
+    fn open_attachment(
+        &mut self,
+        attachment: Attachment,
+        download_now: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.opening_room.is_some() {
+            return;
+        }
+        let preview = cx.new(|cx| AttachmentView::new(attachment, cx));
+        let room_id = self.room_id.clone();
+        self._over_events = Some(cx.subscribe_in(
+            &preview,
+            window,
+            move |this, view, event, window, cx| {
+                if this.room_id != room_id || this.opening_room.is_some() {
+                    return;
+                }
+                let path = view.read(cx).path().to_owned();
+                let stopped = "OpenPickle has stopped. Reopen the app.";
+                match event {
+                    AttachmentEvent::Close => this.close_over(window, cx),
+                    AttachmentEvent::Preview => {
+                        if this
+                            .commands
+                            .send(Command::PreviewAttachment(path))
+                            .is_err()
+                        {
+                            view.update(cx, |view, cx| view.loaded(Err(stopped.into()), cx));
+                        }
+                    }
+                    AttachmentEvent::Download | AttachmentEvent::CancelDownload => {
+                        let room_id = room_id.clone();
+                        let command = match event {
+                            AttachmentEvent::Download => {
+                                Command::DownloadAttachment { room_id, path }
+                            }
+                            _ => Command::CancelAttachmentDownload { room_id, path },
+                        };
+                        if this.commands.send(command).is_err() {
+                            view.update(cx, |view, cx| view.downloaded(Err(stopped.into()), cx));
+                        }
+                    }
+                }
+            },
+        ));
+        window.focus(&preview.focus_handle(cx));
+        self.set_over(Some(Over::Attachment(preview.clone())));
+        preview.update(cx, |view, cx| {
+            if download_now {
+                // A direct download need not wait on a separate preview request.
+                view.start_download(cx);
+            } else {
+                view.start_preview(cx);
+            }
+        });
+        self.report_reading(window);
+        cx.notify();
     }
 
     /// Keep the old conversation until the backend has opened the target successfully.
@@ -2201,13 +2281,15 @@ mod tests {
         cx.run_until_parked();
         assert!(std::iter::from_fn(|| sent.try_recv().ok()).any(|command| {
             matches!(command,
-            Command::DownloadAttachment(path) if path == "attachments/2026-01-01/report.pdf")
+            Command::DownloadAttachment { room_id, path }
+                if room_id == "primary" && path == "attachments/2026-01-01/report.pdf")
         }));
         cx.simulate_keystrokes("escape");
         shell.read_with(cx, |shell, _| assert!(shell.over.is_none()));
         // A download that ends after its preview was closed is reported in the window.
         updates
             .unbounded_send(Update::AttachmentDownloaded {
+                room_id: "primary".into(),
                 path: "attachments/2026-01-01/report.pdf".into(),
                 result: Ok("/made-up/Downloads/Report.pdf".into()),
             })
@@ -2223,6 +2305,114 @@ mod tests {
             shell.open_link("attachment:attachments/unknown.pdf", window, cx)
         });
         shell.read_with(cx, |shell, _| assert!(shell.over.is_none()));
+    }
+
+    #[gpui::test]
+    fn archive_files_preview_or_download_in_place_and_can_still_jump_to_chat(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::ui::bind_keys);
+        let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let (updates, received) = futures::channel::mpsc::unbounded();
+        const PATH: &str = "attachments/2026-01-01/archive-only.pdf";
+        let attachment = Attachment {
+            path: PATH.into(),
+            seq: 13,
+            at: 1.,
+            name: "Archive file.pdf".into(),
+            detail: String::new(),
+            kind: crate::model::AttachmentKind::File,
+        };
+        updates
+            .unbounded_send(Update::Conversation {
+                room_id: "primary".into(),
+                is_character: true,
+                can_send: true,
+                name: "Pickle".into(),
+                avatar: None,
+                messages: vec![],
+            })
+            .unwrap();
+        let (shell, cx) =
+            cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
+        cx.simulate_resize(gpui::size(px(440.), px(900.)));
+        shell.update_in(cx, |shell, window, cx| {
+            shell.open_tab(Tab::Archive, window, cx)
+        });
+        updates
+            .unbounded_send(Update::Archive {
+                room_id: "primary".into(),
+                complete: true,
+                attachments: vec![attachment.clone()],
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let click = |cx: &mut gpui::VisualTestContext, selector| {
+            cx.update(|window, cx| window.draw(cx).clear());
+            let bounds = cx.debug_bounds(selector).expect(selector);
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        };
+        let mut commands = || std::iter::from_fn(|| sent.try_recv().ok()).collect::<Vec<_>>();
+
+        click(cx, "archive-Files");
+        click(cx, "archive-preview-file");
+        let preview = shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.tab, Tab::Archive);
+            let Some(Over::Attachment(view)) = &shell.over else {
+                panic!("Archive-only file should open the shared preview");
+            };
+            assert_eq!(view.read(cx).path(), PATH);
+            view.clone()
+        });
+        assert!(commands().into_iter().any(|command| {
+            matches!(command, Command::PreviewAttachment(path) if path == PATH)
+        }));
+        preview.update(cx, |_, cx| cx.emit(AttachmentEvent::Close));
+        cx.run_until_parked();
+
+        click(cx, "archive-download-file");
+        let requested = commands();
+        assert!(requested.iter().any(|command| {
+            matches!(command, Command::DownloadAttachment { room_id, path }
+                if room_id == "primary" && path == PATH)
+        }));
+        assert!(
+            !requested
+                .iter()
+                .any(|command| matches!(command, Command::PreviewAttachment(_)))
+        );
+        let result = |room: &str| Update::AttachmentDownloaded {
+            room_id: room.into(),
+            path: PATH.into(),
+            result: Ok(std::env::temp_dir().join("openpickle-synthetic.pdf")),
+        };
+        updates.unbounded_send(result("other-room")).unwrap();
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("open-original").is_none());
+        updates.unbounded_send(result("primary")).unwrap();
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("open-original").is_some());
+        cx.simulate_keystrokes("escape");
+
+        updates
+            .unbounded_send(Update::Upsert {
+                room_id: "primary".into(),
+                messages: vec![Message {
+                    parts: vec![Part::Files(std::sync::Arc::new(crate::model::Files {
+                        items: vec![attachment],
+                    }))],
+                    ..message("archive-message", 13)
+                }],
+            })
+            .unwrap();
+        cx.run_until_parked();
+        click(cx, "archive-show-file-in-chat");
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.tab, Tab::Chat);
+            assert!(shell.over.is_none());
+        });
     }
 
     #[gpui::test]

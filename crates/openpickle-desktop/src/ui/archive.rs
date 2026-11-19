@@ -8,7 +8,7 @@ use gpui::{
 use crate::{
     model::{Attachment, AttachmentKind},
     theme,
-    ui::{Identity, Pictures, Tab, header_cover, icon, tab_bar, tab_header},
+    ui::{Identity, Pictures, Tab, chrome, header_cover, icon, tab_bar, tab_header},
 };
 
 pub enum ArchiveEvent {
@@ -17,6 +17,8 @@ pub enum ArchiveEvent {
     Open(Tab),
     /// Go to the message that carries this attachment.
     ShowInChat(u64),
+    PreviewFile(String),
+    DownloadFile(String),
     /// Load the pictures of these attachments.
     Load(Vec<String>),
 }
@@ -119,6 +121,11 @@ impl ArchiveView {
             .filter(move |attachment| attachment.kind == kind)
     }
 
+    pub fn file(&self, path: &str) -> Option<&Attachment> {
+        self.of_kind(AttachmentKind::File)
+            .find(|attachment| attachment.path == path)
+    }
+
     fn picture(&self, attachment: &Attachment, cx: &App) -> Option<gpui::ImageSource> {
         self.pictures.read(cx).get(&thumbnail_key(&attachment.path))
     }
@@ -195,42 +202,82 @@ impl ArchiveView {
                     ),
                     None => preview.child(icon("file-text", 22., theme::TEXT_FAINT)),
                 };
+                let preview_path = attachment.path.clone();
+                let download_path = attachment.path.clone();
+                let action = |id, label| {
+                    chrome(id)
+                        .px(px(10.))
+                        .py(px(4.))
+                        .rounded_full()
+                        .text_size(px(12.))
+                        .cursor_pointer()
+                        .child(label)
+                };
                 div()
                     .id(SharedString::from(attachment.path.clone()))
                     .px(px(10.))
                     .py(px(8.))
                     .rounded(px(20.))
                     .flex()
-                    .items_center()
-                    .gap(px(16.))
-                    .cursor_pointer()
+                    .flex_col()
+                    .gap(px(6.))
                     .hover(|row| row.bg(theme::alpha(0xffffff, 0.05)))
-                    .on_click(
-                        cx.listener(move |_, _, _, cx| cx.emit(ArchiveEvent::ShowInChat(seq))),
-                    )
-                    .child(preview)
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
+                            .id("archive-preview-file")
+                            .debug_selector(|| "archive-preview-file".into())
                             .flex()
-                            .flex_col()
-                            .gap(px(4.))
+                            .items_center()
+                            .gap(px(16.))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(ArchiveEvent::PreviewFile(preview_path.clone()));
+                            }))
+                            .child(preview)
                             .child(
                                 div()
-                                    .text_size(theme::LABEL)
-                                    .truncate()
-                                    .child(attachment.name.clone()),
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.))
+                                    .child(
+                                        div()
+                                            .text_size(theme::LABEL)
+                                            .truncate()
+                                            .child(attachment.name.clone()),
+                                    )
+                                    .when(!attachment.detail.is_empty(), |text| {
+                                        text.child(
+                                            div()
+                                                .text_size(px(14.))
+                                                .text_color(theme::color(theme::TEXT_MUTED))
+                                                .truncate()
+                                                .child(attachment.detail.clone()),
+                                        )
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .pl(px(74.))
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(6.))
+                            .child(
+                                action("archive-download-file", "Download")
+                                    .debug_selector(|| "archive-download-file".into())
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.emit(ArchiveEvent::DownloadFile(download_path.clone()));
+                                    })),
                             )
-                            .when(!attachment.detail.is_empty(), |text| {
-                                text.child(
-                                    div()
-                                        .text_size(px(14.))
-                                        .text_color(theme::color(theme::TEXT_MUTED))
-                                        .truncate()
-                                        .child(attachment.detail.clone()),
-                                )
-                            }),
+                            .child(
+                                action("archive-show-file-in-chat", "Show in Chat")
+                                    .debug_selector(|| "archive-show-file-in-chat".into())
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.emit(ArchiveEvent::ShowInChat(seq));
+                                    })),
+                            ),
                     )
             });
             page = page.child(
@@ -288,6 +335,7 @@ impl ArchiveView {
         let segment = |page: Page, label: &'static str, cx: &mut Context<Self>| {
             div()
                 .id(label)
+                .debug_selector(|| format!("archive-{label}"))
                 .flex_1()
                 .h(px(36.))
                 .rounded_full()

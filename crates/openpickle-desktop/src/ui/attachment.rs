@@ -1,5 +1,4 @@
-//! An attachment of a message: its thumbnail as a preview, and the download of the file itself
-//! into the Downloads folder.
+//! Preview, save, and view an attachment from Chat or Archive.
 
 use crate::{
     model::{Attachment, AttachmentKind},
@@ -7,19 +6,20 @@ use crate::{
     ui::{Cancel, chrome, icon},
 };
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, ImageSource, MouseButton, ObjectFit,
-    Window, div, img, prelude::*, px,
+    App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, ImageSource, MouseButton,
+    ObjectFit, RetainAllImageCache, Stateful, Window, div, img, prelude::*, px,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub enum AttachmentEvent {
     Close,
-    Retry,
+    Preview,
     /// Download the file itself.
     Download,
     CancelDownload,
 }
 enum State {
+    NotAsked,
     Loading,
     Ready(ImageSource),
     Failed(String),
@@ -34,10 +34,19 @@ enum Download {
     Failed(String),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImageView {
+    Preview,
+    OriginalFit,
+    OriginalActualSize,
+}
+
 pub struct AttachmentView {
     attachment: Attachment,
     state: State,
     download: Download,
+    image_view: ImageView,
+    original_cache: Entity<RetainAllImageCache>,
     focus: FocusHandle,
 }
 
@@ -46,14 +55,22 @@ impl AttachmentView {
     pub fn new(attachment: Attachment, cx: &mut Context<Self>) -> Self {
         Self {
             attachment,
-            state: State::Loading,
+            state: State::NotAsked,
             download: Download::NotAsked,
+            image_view: ImageView::Preview,
+            original_cache: RetainAllImageCache::new(cx),
             focus: cx.focus_handle(),
         }
     }
 
     pub fn path(&self) -> &str {
         &self.attachment.path
+    }
+
+    pub fn start_preview(&mut self, cx: &mut Context<Self>) {
+        self.state = State::Loading;
+        cx.emit(AttachmentEvent::Preview);
+        cx.notify();
     }
 
     pub fn loaded(&mut self, result: Result<PathBuf, String>, cx: &mut Context<Self>) {
@@ -80,7 +97,7 @@ impl AttachmentView {
         cx.notify();
     }
 
-    fn start_download(&mut self, cx: &mut Context<Self>) {
+    pub fn start_download(&mut self, cx: &mut Context<Self>) {
         self.download = Download::Running {
             received: 0,
             total: None,
@@ -89,18 +106,24 @@ impl AttachmentView {
         cx.notify();
     }
 
+    fn saved_image(&self) -> Option<&Path> {
+        let Download::Saved(file) = &self.download else {
+            return None;
+        };
+        (self.attachment.kind == AttachmentKind::Picture
+            && file.is_absolute()
+            && can_view_image(file))
+        .then_some(file.as_path())
+    }
+
+    fn show_image(&mut self, mode: ImageView, cx: &mut Context<Self>) {
+        self.image_view = mode;
+        cx.notify();
+    }
+
     /// The line about the file itself: the button that downloads it, then where it was saved.
     fn download_line(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let button = |id: &'static str, label: &'static str| {
-            chrome(id)
-                .flex_none()
-                .rounded_full()
-                .px(px(16.))
-                .py(px(9.))
-                .gap(px(8.))
-                .cursor_pointer()
-                .child(label)
-        };
+        let button = attachment_button;
         let line = div()
             .flex()
             .items_center()
@@ -139,18 +162,56 @@ impl AttachmentView {
             }
             Download::Canceling => line.child("Canceling download…"),
             Download::Saved(file) => {
-                let name = |path: Option<&std::path::Path>| {
-                    path.and_then(|path| path.file_name())
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                };
-                let saved = format!("Saved as {} in {}", name(Some(file)), name(file.parent()));
+                let name = file.file_name().unwrap_or_default().to_string_lossy();
+                let folder = file
+                    .parent()
+                    .and_then(Path::file_name)
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                let saved = format!("Saved as {name} in {folder}");
+                let mut actions = div().flex().flex_wrap().gap(px(6.));
+                if self.saved_image().is_some() {
+                    actions = match self.image_view {
+                        ImageView::Preview => actions.child(
+                            button("view-original", "View original").on_click(cx.listener(
+                                |this, _, _, cx| this.show_image(ImageView::OriginalFit, cx),
+                            )),
+                        ),
+                        ImageView::OriginalFit | ImageView::OriginalActualSize => {
+                            let (label, mode) = if self.image_view == ImageView::OriginalFit {
+                                ("Actual size", ImageView::OriginalActualSize)
+                            } else {
+                                ("Fit to view", ImageView::OriginalFit)
+                            };
+                            actions
+                                .child(button("resize-original", label).on_click(
+                                    cx.listener(move |this, _, _, cx| this.show_image(mode, cx)),
+                                ))
+                                .child(button("show-preview", "Show preview").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.show_image(ImageView::Preview, cx)
+                                    }),
+                                ))
+                        }
+                    };
+                } else if self.attachment.kind == AttachmentKind::File && can_open_document(file) {
+                    let file = file.clone();
+                    actions = actions.child(
+                        button("open-original", "Open original")
+                            .on_click(move |_, _, cx| cx.open_with_system(&file)),
+                    );
+                }
                 let file = file.clone();
-                line.child(div().flex_1().min_w_0().child(saved)).child(
-                    button("show-download", SHOW_FILE)
-                        .text_color(theme::color(theme::TEXT))
-                        .on_click(move |_, _, cx| cx.reveal_path(&file)),
-                )
+                line.flex_col()
+                    .items_start()
+                    .gap(px(6.))
+                    .child(div().w_full().truncate().child(saved))
+                    .child(
+                        actions.child(
+                            button("show-download", SHOW_FILE)
+                                .on_click(move |_, _, cx| cx.reveal_path(&file)),
+                        ),
+                    )
             }
             Download::Failed(reason) => line
                 .child(div().flex_1().min_w_0().child(reason.clone()))
@@ -161,6 +222,38 @@ impl AttachmentView {
                 ),
         }
     }
+}
+
+fn attachment_button(id: &'static str, label: &'static str) -> Stateful<Div> {
+    chrome(id)
+        .debug_selector(move || id.into())
+        .flex_none()
+        .rounded_full()
+        .px(px(16.))
+        .py(px(9.))
+        .gap(px(8.))
+        .text_color(theme::color(theme::TEXT))
+        .cursor_pointer()
+        .child(label)
+}
+
+fn saved_extension(file: &Path) -> Option<String> {
+    file.extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+}
+
+fn can_view_image(file: &Path) -> bool {
+    matches!(
+        saved_extension(file).as_deref(),
+        Some("jpg" | "jpeg" | "png" | "webp" | "gif")
+    )
+}
+
+/// Only hand documents to the OS on an explicit click, using the saved filename, never the
+/// attachment's remote path or metadata. Unknown types, scripts, and shortcuts are reveal-only.
+fn can_open_document(file: &Path) -> bool {
+    file.is_absolute() && matches!(saved_extension(file).as_deref(), Some("pdf" | "txt" | "md"))
 }
 
 /// What the system's file manager is asked to do with a saved file.
@@ -178,48 +271,74 @@ impl Render for AttachmentView {
                 .text_size(px(13.))
                 .text_color(theme::color(theme::TEXT_MUTED))
         };
-        let content = match &self.state {
-            State::Loading => muted().child("Loading preview…").into_any_element(),
-            // The picture is a thumbnail: what it shows of the file is said under it.
-            State::Ready(source) => div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(px(12.))
-                .child(
-                    img(source.clone())
+        let preview_height = (window.viewport_size().height - px(300.)).max(px(100.));
+        let original = self
+            .saved_image()
+            .filter(|_| self.image_view != ImageView::Preview);
+        let content = if let Some(file) = original {
+            let fit = self.image_view == ImageView::OriginalFit;
+            let image = img(file)
+                .image_cache(&self.original_cache)
+                .id("original-image")
+                .debug_selector(|| "attachment-original-image".into())
+                .flex_none()
+                .with_loading(|| div().child("Loading original…").into_any_element())
+                .with_fallback(|| {
+                    div()
+                        .child("This image could not be displayed.")
+                        .into_any_element()
+                })
+                .when(fit, |image| {
+                    image
                         .w_full()
-                        .h((window.viewport_size().height - px(300.)).max(px(100.)))
-                        .object_fit(ObjectFit::Contain),
-                )
-                .child(muted().child(if file {
-                    "The first page, as a preview"
-                } else {
-                    "A smaller copy of the picture"
-                }))
-                .into_any_element(),
-            // Not every kind of file has a preview. The file can be downloaded all the same.
-            State::Failed(reason) => muted()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(px(12.))
-                .child(format!("No preview: {reason}"))
-                .child(
-                    chrome("retry-preview")
-                        .rounded_full()
-                        .px(px(16.))
-                        .py(px(10.))
-                        .cursor_pointer()
-                        .child("Try again")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.state = State::Loading;
-                            cx.emit(AttachmentEvent::Retry);
-                            cx.notify();
-                        })),
-                )
-                .into_any_element(),
+                        .h(preview_height)
+                        .object_fit(ObjectFit::Contain)
+                });
+            div()
+                .id("original-image-scroll")
+                .w_full()
+                .h(preview_height)
+                .when(!fit, |area| area.overflow_scroll())
+                .child(image)
+                .into_any_element()
+        } else {
+            match &self.state {
+                State::NotAsked => attachment_button("load-preview", "Load preview")
+                    .on_click(cx.listener(|this, _, _, cx| this.start_preview(cx)))
+                    .into_any_element(),
+                State::Loading => muted().child("Loading preview…").into_any_element(),
+                // The picture is a thumbnail: what it shows of the file is said under it.
+                State::Ready(source) => div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(
+                        img(source.clone())
+                            .w_full()
+                            .h(preview_height)
+                            .object_fit(ObjectFit::Contain),
+                    )
+                    .child(muted().child(if file {
+                        "The first page, as a preview"
+                    } else {
+                        "A smaller copy of the picture"
+                    }))
+                    .into_any_element(),
+                // Not every kind of file has a preview. The file can be downloaded all the same.
+                State::Failed(reason) => muted()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(format!("No preview: {reason}"))
+                    .child(
+                        attachment_button("retry-preview", "Try again")
+                            .on_click(cx.listener(|this, _, _, cx| this.start_preview(cx))),
+                    )
+                    .into_any_element(),
+            }
         };
         let close = chrome("close-preview")
             .size(px(36.))
@@ -252,7 +371,7 @@ impl Render for AttachmentView {
                     .id("attachment-preview")
                     .occlude()
                     .w_full()
-                    .max_w(px(720.))
+                    .max_w(px(if original.is_some() { 960. } else { 720. }))
                     .max_h_full()
                     .overflow_y_scroll()
                     .p(px(20.))
@@ -281,5 +400,93 @@ impl Render for AttachmentView {
 impl Focusable for AttachmentView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_allowed_saved_documents_can_launch_the_system_opener() {
+        let root = std::env::temp_dir();
+        for name in ["report.PDF", "README.md", "note (1).txt"] {
+            assert!(can_open_document(&root.join(name)), "{name}");
+        }
+        for name in [
+            "report.pdf.exe",
+            "run.command",
+            "run.sh",
+            "unknown",
+            "web.html",
+            "animation.svg",
+            "link.url",
+            "launch.desktop",
+        ] {
+            assert!(!can_open_document(&root.join(name)), "{name}");
+        }
+        assert!(!can_open_document(Path::new("report.pdf")));
+    }
+
+    #[gpui::test]
+    fn a_saved_photo_can_switch_from_thumbnail_to_original_and_actual_size(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // A 2 × 3 raster, independent of account data or the thumbnail cache.
+        let png = [
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x36, 0x88, 0x49, 0xd6, 0x00, 0x00, 0x00, 0x10, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x44, 0x0c, 0x28, 0x14, 0x00, 0x44, 0xd0, 0x05,
+            0xfb, 0xa4, 0xcf, 0xde, 0x80, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+            0x42, 0x60, 0x82,
+        ];
+        let path =
+            std::env::temp_dir().join(format!("openpickle-test-{}.png", uuid::Uuid::new_v4()));
+        std::fs::write(&path, png).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            AttachmentView::new(
+                Attachment {
+                    path: "attachments/2026-01-01/photo.png".into(),
+                    seq: 1,
+                    at: 1.,
+                    name: "Photo.png".into(),
+                    detail: String::new(),
+                    kind: AttachmentKind::Picture,
+                },
+                cx,
+            )
+        });
+        let click = |cx: &mut gpui::VisualTestContext, selector| {
+            cx.update(|window, cx| window.draw(cx).clear());
+            let bounds = cx.debug_bounds(selector).expect(selector);
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        };
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("view-original").is_none());
+
+        view.update(cx, |view, cx| {
+            view.loaded(Err("No thumbnail for the test".into()), cx);
+            view.downloaded(Ok(path.clone()), cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.saved_image(), Some(path.as_path()))
+        });
+        click(cx, "view-original");
+        view.read_with(cx, |view, _| {
+            assert!(view.image_view == ImageView::OriginalFit)
+        });
+        click(cx, "resize-original");
+        view.read_with(cx, |view, _| {
+            assert!(view.image_view == ImageView::OriginalActualSize)
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert_eq!(
+            cx.debug_bounds("attachment-original-image").unwrap().size,
+            gpui::size(px(2.), px(3.)),
+        );
+        click(cx, "show-preview");
+        view.read_with(cx, |view, _| assert!(view.image_view == ImageView::Preview));
+        std::fs::remove_file(path).unwrap();
     }
 }
