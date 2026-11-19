@@ -204,7 +204,15 @@ impl ChatView {
             self.list
                 .splice(unchanged..self.rows.len(), rows.len() - unchanged);
         }
-        self.selection.borrow_mut().rows_changed(unchanged);
+        let selectable_unchanged = unchanged
+            + self.rows[unchanged..]
+                .iter()
+                .zip(&rows[unchanged..])
+                .take_while(|(old, new)| old.same_content_as(new))
+                .count();
+        self.selection
+            .borrow_mut()
+            .rows_changed(selectable_unchanged);
         let mut missing = Vec::new();
         for row in &rows {
             if let RowKind::Part(Part::Files(files)) = &row.kind {
@@ -740,6 +748,7 @@ mod tests {
                 side: Side::Theirs,
                 joined_above: false,
                 joined_below: false,
+                decorations: Default::default(),
             })
             .collect();
         view.update(cx, |view, cx| view.set_rows(rows, cx));
@@ -888,6 +897,7 @@ mod tests {
             side: Side::Theirs,
             joined_above: false,
             joined_below: false,
+            decorations: Default::default(),
         };
         view.update(cx, |view, cx| {
             view.set_rows(
@@ -955,6 +965,7 @@ mod tests {
                 side: Side::Theirs,
                 joined_above: false,
                 joined_below: false,
+                decorations: Default::default(),
             }]
         };
         view.update(cx, |view, cx| view.set_rows(rows(), cx));

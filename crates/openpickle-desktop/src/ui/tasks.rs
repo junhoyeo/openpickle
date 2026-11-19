@@ -436,6 +436,7 @@ impl TaskView {
                     side: Side::Theirs,
                     joined_above: false,
                     joined_below: false,
+                    decorations: Default::default(),
                 };
                 let row = RowContext::new(
                     window,

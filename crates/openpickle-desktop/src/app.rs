@@ -1201,7 +1201,13 @@ fn mark_not_sent(messages: &mut [Message], id: &str, reason: &str) {
 fn upsert(messages: &mut Vec<Message>, message: Message) {
     if let Some(index) = messages.iter().rposition(|known| known.id == message.id) {
         if messages[index].seq == message.seq {
-            messages[index] = message;
+            let known = &mut messages[index];
+            let mut message = message;
+            if known.parts == message.parts {
+                // A decoration update can remeasure the row without invalidating its selection.
+                message.parts = std::mem::take(&mut known.parts);
+            }
+            *known = message;
             return;
         }
         messages.remove(index);
@@ -1319,6 +1325,7 @@ mod tests {
             at: seq as f64,
             side: Side::Mine,
             parts: vec![],
+            decorations: Default::default(),
         }
     }
 
@@ -1638,6 +1645,27 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("a", 1), ("b", 3), ("c", 5), ("sent", 6), ("d", 7)]
         );
+    }
+
+    #[test]
+    fn a_decoration_only_upsert_keeps_selectable_content_identity() {
+        use crate::model::build_rows;
+
+        let mut messages = vec![convert::outgoing("m".into(), "body", 1, 1.)];
+        let now = Local::now();
+        let (before, starts) = build_rows(&messages, None, now);
+        let mut decorated = convert::outgoing("m".into(), "body", 1, 1.);
+        decorated.decorations.quote = Some(std::sync::Arc::new(crate::model::Quote {
+            author: Some("Pickle"),
+            snippet: "Earlier words".into(),
+        }));
+        upsert(&mut messages, decorated);
+        let (after, new_starts) = build_rows(&messages, None, now);
+        assert_eq!(starts, new_starts);
+        let start = starts[0];
+        assert!(before[start].same_content_as(&after[start]));
+        assert!(!before[start].same_as(&after[start]));
+        assert_eq!(after[start].texts(), ["body"]);
     }
 
     #[gpui::test]

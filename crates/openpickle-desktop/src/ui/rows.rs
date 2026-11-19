@@ -11,7 +11,9 @@ use openpickle_api::{HandoffItem, PhoneCallTranscript};
 
 use crate::{
     content::{Card, CardRow, RichText, Span, SpanKind},
-    model::{AttachmentKind, Part, Request, RequestStatus, Row, RowKind, Side},
+    model::{
+        AttachmentKind, Part, Quote, ReactionBadge, Request, RequestStatus, Row, RowKind, Side,
+    },
     phone,
     protocol::HandoffCard,
     theme,
@@ -209,9 +211,93 @@ pub fn render_row(cx: &RowContext) -> AnyElement {
                     .child(request_card(surface, request, cx))
                     .into_any_element(),
             };
-            line.child(content).into_any_element()
+            let decorations = &row.decorations;
+            if decorations.quote.is_none() && decorations.reactions.is_none() {
+                return line.child(content).into_any_element();
+            }
+            let mine = row.side == Side::Mine;
+            let max = if mine { MINE_MAX } else { THEIRS_MAX };
+            line.flex_col()
+                .gap(theme::JOINED_GAP)
+                .when(mine, |line| line.items_end())
+                .when(!mine, |line| line.items_start())
+                .children(
+                    decorations
+                        .quote
+                        .as_deref()
+                        .map(|quote| quote_preview(quote, max)),
+                )
+                .child(content)
+                .children(
+                    decorations
+                        .reactions
+                        .as_deref()
+                        .map(|reactions| reaction_summary(reactions, max, mine)),
+                )
+                .into_any_element()
         }
     }
+}
+
+// These labels are intentionally not SelectableText: they do not change the row's text ordinals.
+fn quote_preview(quote: &Quote, max: f32) -> Div {
+    let label = quote.author.map_or_else(
+        || "Quoted message".into(),
+        |author| format!("Reply to {author}"),
+    );
+    div()
+        .max_w(relative(max))
+        .px(px(10.))
+        .py(px(4.))
+        .border_l_2()
+        .border_color(theme::color(theme::TEXT_FAINT))
+        .rounded_r(theme::JOINED_RADIUS)
+        .bg(theme::color(theme::SURFACE_INSET))
+        .text_size(theme::SMALL)
+        .line_height(theme::SMALL_LINE)
+        .child(
+            div()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme::color(theme::TEXT))
+                .child(label),
+        )
+        .when(!quote.snippet.is_empty(), |preview| {
+            preview.child(
+                div()
+                    .truncate()
+                    .text_color(theme::color(theme::TEXT_MUTED))
+                    .child(quote.snippet.clone()),
+            )
+        })
+}
+
+fn reaction_summary(reactions: &[ReactionBadge], max: f32, mine: bool) -> Div {
+    div()
+        .max_w(relative(max))
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .when(mine, |line| line.justify_end())
+        .gap(px(4.))
+        .text_size(theme::SMALL)
+        .line_height(theme::SMALL_LINE)
+        .text_color(theme::color(theme::TEXT_MUTED))
+        .child("Reactions")
+        .children(reactions.iter().map(|reaction| {
+            let label = if reaction.count == 1 {
+                reaction.emoji.clone()
+            } else {
+                format!("{} {}", reaction.emoji, reaction.count)
+            };
+            div()
+                .max_w_full()
+                .truncate()
+                .px(px(6.))
+                .rounded(theme::JOINED_RADIUS)
+                .bg(theme::color(theme::SURFACE))
+                .text_color(theme::color(theme::TEXT))
+                .child(label)
+        }))
 }
 
 /// A filled surface whose corners are squared where it meets a neighbor of the same group.
