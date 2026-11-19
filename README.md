@@ -20,8 +20,8 @@ servers the iOS app does, with your own account.
   the iOS chat screen. Korean lines break between words, and the text field supports Korean input.
 - **Live.** Your message, the character's replies and what it is doing right now ("Searching
   Web…") arrive over the server's event stream as they happen.
-- **Archive.** The third tab holds every picture and file of the conversation, grouped by day,
-  with documents listed by name, kind and size.
+- **Archive.** The third tab collects pictures and files as conversation history loads. It
+  groups them by day and lists documents by name, kind and size.
 - **Explore.** The second tab lists what your Pickle offers to do for you, in sections and by
   area. An offer shows how it would go about it, and Start asks for it in the chat.
 - **Phone calls.** A call Pickle placed shows in the chat as a card with the end of its
@@ -35,12 +35,12 @@ servers the iOS app does, with your own account.
 - **Friends and invites.** The menu leads to your friends, and Invite to your invite link, how
   many invites are left and who joined with it.
 - **Search.** Cmd-F (Ctrl-F on Windows), or the search button in the menu, searches your
-  messages on Pickle's server. Opening a result takes you to that message, with the
-  conversation around it to scroll through.
+  messages on Pickle's server. In v1.0.0, a result jumps to its place in the conversation only
+  if that message is already loaded.
 - **Select and copy.** Drag across messages to select text, or right-click for Copy, Copy Message
-  and Select All. Select All takes the whole conversation, not only what is on screen.
-- **Opens at once.** The app keeps the conversation on disk and draws it before it asks the
-  network for anything. See [the numbers](#speed).
+  and Select All. Select All includes loaded messages beyond what is on screen.
+- **Cached chat.** For a returning session, the app can show cached messages before the
+  network refresh. See [what the gallery benchmark measures](#speed).
 - **Its own sign-in.** You sign in with your phone number and a texted code. The app gets a login
   session of its own, so your phone stays signed in.
 
@@ -55,16 +55,16 @@ servers the iOS app does, with your own account.
   <img src="docs/screenshots/sign-in.png" alt="Sign-in with a phone number" height="380" />
 </p>
 
-Not built yet: editing account/settings, spending or buying tickets, direct microphone voice chat with Pickle, opening a picture full size, saving or sharing a
-file, link previews,
-reactions, answering a request card, and
-everything that changes your friends: adding one, answering a request, a friend's own page.
-The [desktop README](crates/openpickle-desktop/README.md) has the full list.
+The published v1.0.0 desktop app does not offer account or settings edits, ticket use or
+purchases, direct microphone chat with Pickle, an in-app full-size attachment viewer, file
+uploads or sharing, website preview cards, reactions, request-card answers, or friend management.
+[Original-file downloads](#chat-links-and-attachment-previews) are available. See the
+[desktop README](crates/openpickle-desktop/README.md) for more detail.
 
 ## Searching your chat from coding agents
 
 [`skills/pickle-sessions`](skills/pickle-sessions/SKILL.md) is an agent skill that searches and
-reads the conversation the desktop app keeps on disk (the history log in
+reads the primary conversation the desktop app keeps on disk (on macOS, under
 `~/Library/Application Support/openpickle/cache/`). It finds messages by text, role and date, shows
 the messages around a hit, and says how old the cache is. It only reads, needs nothing but the
 Python standard library, and never opens the login session or the network:
@@ -75,11 +75,16 @@ python3 skills/pickle-sessions/scripts/pickle-sessions search "dinner" --since 2
 
 ## Get it
 
-Each draft release has three downloads:
+Download the packaged app from [GitHub Releases](https://github.com/junhoyeo/openpickle/releases).
+[v1.0.0](https://github.com/junhoyeo/openpickle/releases/tag/v1.0.0) includes:
 
-- `OpenPickle-<version>-arm64.dmg` for Apple Silicon Macs;
-- `OpenPickle-<version>-x86_64.dmg` for Intel Macs;
-- `OpenPickle-<version>-windows-x86_64.zip` for 64-bit Windows 10 and 11.
+- `OpenPickle-1.0.0-arm64.dmg` for Apple Silicon Macs;
+- `OpenPickle-1.0.0-x86_64.dmg` for Intel Macs;
+- `OpenPickle-1.0.0-windows-x86_64.zip` for Windows 10 and 11 on x86-64 PCs.
+
+The Windows release check verifies that the unpacked executable opens a window. It does not
+verify sign-in, Korean input or other in-app workflows. The Intel build was launched under
+Rosetta, not tested on Intel hardware. There are no published Windows ARM64 or Linux packages.
 
 On macOS, drag OpenPickle to Applications. The app is ad hoc signed and is not notarized. On its
 first launch, Control-click OpenPickle in Finder, choose **Open**, then confirm **Open**. If macOS
@@ -101,16 +106,19 @@ Building needs a recent stable Rust (1.98 was used). macOS packaging also needs 
 
 ## Speed
 
-The message list only lays out the rows near the viewport, and a message's text is parsed once,
-off the UI thread. So a long history costs almost nothing at launch:
+The message list only lays out rows near the viewport. The `gallery` example measures how long
+it takes to open a chat window and draw its first frame from prebuilt sample messages:
 
-| Sample conversation | First frame after `main()` |
+| Sample conversation | First frame after the gallery timer starts |
 | --- | --- |
 | 8 messages | about 146 ms |
 | 2,000 messages | about 153 ms |
 
-Release build on an Apple Silicon Mac, median of six runs of the `gallery` example, which draws
-the chat screen with made-up messages. GPUI's own start-up is about 67 ms of that.
+These are historical medians of six release-build runs on an Apple Silicon Mac. The timer
+starts after creating the sample messages and, for the larger sample, cloning them. It does
+not measure production startup, including reading and converting the on-disk chat history, or
+waiting for the network. These numbers do not establish startup times on other platforms or
+with larger histories.
 
 ## How it was built
 
@@ -145,17 +153,21 @@ The notes on the API (endpoints, phone sign-in, login sessions, the event stream
 - Generated file links are resolved through the message's attachment map. Clicking a
   file card or its linked name opens a **thumbnail preview**. For a PDF this is its
   **first page**, not the original document. Loading failures show a retry action.
-- **Download** in that preview saves the file itself, a PDF, a Markdown file or any other
-  attachment, to your Downloads folder under its own name, or under the next free one
-  ("report (1).pdf"). Sharing a file from the app is not built.
+- **Download** saves the original to Downloads even if it has no thumbnail. The app chooses a
+  free filename (such as `report (1).pdf`) rather than overwriting a file. Use **Show in Finder**
+  or **Show in folder** to find the saved file and open it outside the app.
 
 ## Your data
 
 - The app stores a login session and a copy of your conversation under
   `~/Library/Application Support/openpickle` on macOS, readable by you only, or
-  `%APPDATA%\openpickle` on Windows, inside your user profile. Signing out removes both.
+  `%APPDATA%\openpickle` on Windows, inside your user profile. In v1.0.0, there is no in-app
+  sign-out control; the app attempts to clear the session and its cache if Pickle says the
+  session is no longer valid. Removing `session.json` alone does not remove cached messages.
+  Files you save to Downloads are separate from this cache.
 - The login session holds a single-use refresh token that changes on every refresh. Only one
-  copy of the app may run, and the session file should not be copied to another tool.
+  copy of the app can use that data directory at a time. Do not copy the session file to
+  another tool.
 - Captures, exported messages and session files hold bearer tokens and personal data. In this
   repository they belong in `.capture/`, which git ignores.
 

@@ -22,10 +22,10 @@ cargo run -p openpickle-desktop --example gallery -- app   # the whole window: m
 - **Live updates** over the server's event stream: your message, the character's replies and what
   it is doing appear as they happen.
 - **Sending**: a message shows at once and is replaced by the server's copy when it arrives.
-- **Archive** (the third tab, or Cmd-4, and in the menu): every picture and file of the
-  conversation, grouped by day, newest first. Media is a grid of three; a file is a row with its
-  preview, name, kind, pages and size. Opening one goes to that message in the chat. Until the
-  whole history has been read, an empty page says it is still reading.
+- **Archive** (the third tab, or Cmd-4, and in the menu): pictures and files from loaded
+  conversation history, grouped by day, newest first. Media is a grid of three; a file is a row
+  with its preview, name, kind, pages and size. Opening one goes to that message in the chat.
+  Until the whole history has been read, an empty page says it is still reading.
 - **Explore** (the second tab, or Cmd-2): the offers the server lists, as the app shows them.
   "For you" previews each section, with See all, and lists the rest under "More to explore"; an
   area's chip lists that area's offers by rank. An offer opens a sheet with its steps, and
@@ -45,20 +45,19 @@ cargo run -p openpickle-desktop --example gallery -- app   # the whole window: m
 - **Invite** (the header button): your invite link with Copy link, how many invites are left,
   and the people who joined with it or invited you.
 - **Searching**: Cmd-F, or the menu button and then the search button. The server searches;
-  the results show one line of each message with the match marked. The arrow keys and Enter, or
-  a click, open a result: the conversation scrolls to that message and stays there, so what was
-  said before and after is a scroll away. The search keeps its text and results for the next
-  time it is opened.
+  the results show one line of each message with the match marked. Select a result with the
+  arrow keys and Enter, or click it. In v1.0.0, the conversation scrolls to the result only
+  when that message is already loaded. Search keeps its text and results when reopened.
 - **Selecting and copying**: drag across messages, or right-click for Copy, Copy Message and
   Select All. Cmd-C and Cmd-A work too when the composer has no selection or text of its own. A
-  selection is read from the conversation, not from the rows on screen, so Select All copies all
-  of it.
+  selection is read from the loaded conversation, not just from the rows on screen.
 
-Not built: the menu's 3D World and direct microphone voice chat with Pickle; opening a picture full size, saving or sharing a file, the + that
-makes documents; website preview cards; reactions; answering a request card. No capture shows the requests for deleting an offer, adding a friend,
-answering a friend request or a friend's own page, so those are left out, as are the contacts
-list, sharing the invite through other apps and the Korean roulette promotion. The texts of the
-new screens are English readings of the app's string keys; the strings were not captured.
+In the published v1.0.0 app, the 3D World menu item is disabled. There is no direct microphone
+chat with Pickle, in-app full-size attachment viewer, upload or sharing action, website preview
+card, reaction display, or quoted reply. Request cards show their status but do not accept
+answers. Friends and invites show lists and let you copy an invite link; there is no
+friend-request management, friend detail page, contact import, or sharing through other apps.
+The desktop controls are in English; there is no full localization.
 
 ## Chat links and attachment previews
 
@@ -70,9 +69,10 @@ new screens are English readings of the app's string keys; the strings were not 
 - Generated file links are resolved through the message's attachment map. Clicking a
   file card or its linked name opens a **thumbnail preview**. For a PDF this is its
   **first page**, not the original document. Loading failures show a retry action.
-- **Original-file opening, downloading and sharing are not implemented.** The captures
-  show only the thumbnail endpoint, not an original-file download route. Open the
-  original in the Pickle phone app until that route has been captured.
+- **Download** saves the original to Downloads, even if there is no thumbnail. The app chooses
+  a free filename (such as `report (1).pdf`) rather than overwriting an existing file. Use
+  **Show in Finder** or **Show in folder** to find the saved file and open it outside the app.
+  There is no separate Save As dialog or sharing action.
 
 ## Profile data and limits
 
@@ -80,14 +80,11 @@ Profile loads the captured account, session-bootstrap and connection-catalog rou
 small `profile-view.json` snapshot is cached; the bootstrap token and session response are
 never persisted in it. Usage continues to update from the existing event stream.
 
-Reset-ticket use/buy, auto-use edits, account edits, payment methods, notification/language/
-appearance settings and the mobile widget are visibly unavailable on desktop. No mutation
-endpoints for these controls were supplied. Ticket history is also unavailable: its sample
-layout is in the UI definitions, but none of the supplied captures includes a history request
-or history payload. OpenPickle does not invent a request or turn missing history into an empty
-history. Connected counts describe the server catalog and do not include device-only mobile
-permissions such as address-book access.
-
+Desktop does not implement spending or buying reset tickets, editing auto-use, account changes,
+payment methods, notification/language/appearance settings, or the mobile widget. Ticket
+history has a sample layout but no implemented data fetch. The app does not present missing
+history as an empty history. The connection count comes from the server catalog and excludes
+device-only permissions such as address-book access.
 
 ## Phone-call history and live transcripts
 
@@ -95,17 +92,22 @@ The phone button beside an empty composer, the menu's Phone calls row, or Cmd-Sh
 opens calls placed by Pickle. This is not microphone chat with Pickle and does not dial a
 number. A call can be opened from the list or the drawer's recent-call entries.
 
-Only the opened call is refreshed, every four seconds while its server state remains live.
-Closing the view or returning to the list stops that refresh and never ends the call.
-Ending a live call requires the explicit confirmation dialog. The same action id is reused
-when retrying a failed end request; a pending request cannot be submitted twice. All call
-responses are matched to their call id before updating the visible view.
+The opened transcript and live call cards in chat are polled about every four seconds, while
+the server reports those calls as live. Closing the transcript or returning to the call list
+stops that view's refresh; live chat cards can continue to update. Closing the view does not
+end the call. Ending a live call requires the explicit confirmation dialog. The same action id
+is reused when retrying a failed end request; a pending request cannot be submitted twice. All
+call responses are matched to their call id before updating the visible view.
 
-API contracts were observed in the supplied capture: GET /api/phone-calls/{id} and
-POST /api/actions with kind=end_phone_call. No dialer, microphone transport, full recording
-download, or unsupported action endpoint is inferred from these routes.
+The implemented routes are `GET /api/phone-calls/{id}` and `POST /api/actions` with
+`kind=end_phone_call`. These routes do not establish contracts for a dialer, microphone chat
+or recording downloads. The release audit checked End call offline, not on a live call.
 
 ## Packaging
+
+Use the [published releases](https://github.com/junhoyeo/openpickle/releases) for Apple Silicon,
+Intel Mac and Windows x86-64 builds. The [root README](../../README.md#get-it) lists the available
+downloads, first-launch steps and platform verification limits.
 
 `macos/package.sh` builds `OpenPickle.app` and a disk image into `target/macos/`. Pass
 `aarch64-apple-darwin` or `x86_64-apple-darwin` to choose an architecture; with no argument it
@@ -114,21 +116,18 @@ signs the app ad hoc.
 
 `windows/package.ps1` builds the MSVC release binary and writes a zip containing
 `OpenPickle.exe` and its install note into `target/windows/`. Windows uses its native title bar
-and Segoe UI, with the system font fallback for Korean text. See the
-[root README](../../README.md#get-it) for the unsigned-app first-launch steps on both platforms.
+and Segoe UI, with the system font fallback for Korean text.
 
-## Why it is fast
+## Startup and rendering
 
-- The backend thread starts before the window. It sends the conversation from the disk cache to
-  the UI before it asks the network for anything, and the UI applies it before its first frame.
-- The message list is virtual: only the rows near the viewport are laid out, so a long history
-  costs almost nothing.
-- A message's text is parsed once, on the backend thread, when it is loaded. Drawing never parses.
-- The network and the disk never run on the UI thread.
+The backend handles network requests and chat history on a separate thread. For a returning
+session it can send cached messages to the UI before refreshing from the network. The list
+only lays out rows near the viewport, but that does not eliminate cache reads, message
+conversion or building the list of rows.
 
-The `gallery` example prints its launch times. A release build on an Apple Silicon Mac drew its
-first frame about 146 ms after `main()` with 8 messages and about 153 ms with 2,000 (median of six
-runs each; GPUI's own start-up is about 67 ms of that).
+The [`gallery` benchmark](../../README.md#speed) measures time from a timer set after the
+sample messages are prepared to the first chat frame. It does not measure installed-app
+startup or the cost of reading and converting real cached history.
 
 ## Where things live
 
@@ -138,11 +137,11 @@ Everything is under the user's application-support directory
 
 - `session.json`: the login session. Its refresh token is single-use and
   replaced on every refresh, so the file is written atomically and only one instance of the app
-  may run. Deleting it signs the app out.
+  may use the data directory at a time. Removing this file alone leaves the cache on disk.
 - `cache/`: the room history as an append-only log, the character's picture, the last answers
   for Friends and Explore, the pictures of friends' characters and of offers, and a few small
-  files. Deleting it only makes the next launch fetch everything again. Signing out clears it.
-  The log's format (`room.json`, `room-<id>.jsonl`, `identity.json`) is also read by the
+  files. See [Your data](../../README.md#your-data) for the published app's session cleanup
+  behavior. The log's format (`room.json`, `room-<id>.jsonl`, `identity.json`) is also read by the
   [`pickle-sessions`](../../skills/pickle-sessions/SKILL.md) skill, so a change to it should change
   the skill too.
 
