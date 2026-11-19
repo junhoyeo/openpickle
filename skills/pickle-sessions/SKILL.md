@@ -1,15 +1,27 @@
 ---
 name: pickle-sessions
-description: Search and read the owner's Pickle conversation (the chat with their Pickle character) from the local cache the openpickle desktop app keeps on this Mac - case-insensitive or regex search with role and date filters, the messages around a hit, and how old the cache is. Read-only; works while the app runs. Use when the user asks what they or their Pickle said, to find something from the Pickle chat (피클 대화, 피클이 뭐라고 했는지), or to quote or summarise part of that conversation.
+description: Search and read the owner's primary Pickle conversation (the chat with their Pickle character) from the openpickle desktop app's local cache - case-insensitive or regex search with role and date filters, the messages around a hit, and how old the cache is. Read-only; works while the app runs. Use when the user asks what they or their Pickle said, to find something from the Pickle chat (피클 대화, 피클이 뭐라고 했는지), or to quote or summarise part of that conversation.
 ---
 
 # Pickle Sessions
 
-Reads `~/Library/Application Support/openpickle/cache/`, which the
-[openpickle](https://github.com/junhoyeo/openpickle) desktop app writes: `room.json` (the room id),
-`room-<id>.jsonl` (the append-only history log) and `identity.json` (the character's name). It only
-reads; it never touches `session.json`, the network, or the app's lock, so it is safe while the app
-runs. The cache is only as fresh as the app's last run: `info` says when the log was last written.
+Reads the primary character conversation from the cache written by the
+[openpickle](https://github.com/junhoyeo/openpickle) desktop app. The cache directory defaults to:
+
+| Platform | Cache directory |
+| --- | --- |
+| macOS | `~/Library/Application Support/openpickle/cache/` |
+| Windows | `%APPDATA%\openpickle\cache\` (Roaming, not Local) |
+| Linux | `$XDG_DATA_HOME/openpickle/cache/`, or `~/.local/share/openpickle/cache/` |
+
+`PICKLE_SESSIONS_CACHE` can point to an explicit cache directory. Use it on Windows if `APPDATA`
+is unavailable or does not point to the app's roaming data directory.
+
+`room.json` points to the primary room's `room-<id>.jsonl` history log. The skill does not list or
+search other room logs, even if the app has cached them. `identity.json` supplies the character's
+name when available. The skill only reads; it never touches `session.json`, the network, or the
+app's lock. `info` reports when the history log was last written, not whether it is up to date with
+the server.
 
 The conversation is private. Quote only what the task needs.
 
@@ -56,4 +68,5 @@ conversation = load()                                     # Conversation(log, wr
 - The character's text wraps each chat bubble in `<bubble>`; search matches the text without the
   tags, and `show` prints bubbles as paragraphs. Markdown and fenced `card` blocks stay as written.
 - Pictures and files are not in the log; `show` says how many attachments a message had.
-- A later record of a message replaces an earlier one; lines cut short by a crash are skipped.
+- The latest valid record for each message ID wins. Malformed records and lines cut short by a
+  crash are skipped without hiding earlier valid records or later messages.

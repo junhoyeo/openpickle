@@ -64,6 +64,35 @@ class CacheTest(unittest.TestCase):
         )
 
 
+class CacheDirectoryTest(unittest.TestCase):
+    def test_windows_uses_roaming_app_data_and_honors_override(self) -> None:
+        roaming = Path.cwd() / "synthetic-roaming"
+        override = Path.cwd() / "synthetic-cache"
+        variables = {"APPDATA": str(roaming), "LOCALAPPDATA": str(Path.cwd() / "synthetic-local")}
+        with patch.object(pickle_sessions.sys, "platform", "win32"), patch.dict(os.environ, variables, clear=True):
+            self.assertEqual(pickle_sessions.cache_dir(), roaming / "openpickle" / "cache")
+            with patch.dict(os.environ, {"PICKLE_SESSIONS_CACHE": str(override)}):
+                self.assertEqual(pickle_sessions.cache_dir(), override)
+
+    def test_windows_does_not_guess_a_path_without_appdata(self) -> None:
+        with patch.object(pickle_sessions.sys, "platform", "win32"), patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(CacheError, "APPDATA"):
+                pickle_sessions.cache_dir()
+
+    def test_macos_and_xdg_defaults(self) -> None:
+        home = Path.cwd() / "synthetic-home"
+        xdg = home / "synthetic-xdg"
+        with patch.object(Path, "home", return_value=home), patch.dict(os.environ, {}, clear=True):
+            with patch.object(pickle_sessions.sys, "platform", "darwin"):
+                self.assertEqual(
+                    pickle_sessions.cache_dir(), home / "Library" / "Application Support" / "openpickle" / "cache",
+                )
+            with patch.object(pickle_sessions.sys, "platform", "linux"):
+                self.assertEqual(pickle_sessions.cache_dir(), home / ".local" / "share" / "openpickle" / "cache")
+                with patch.dict(os.environ, {"XDG_DATA_HOME": str(xdg)}):
+                    self.assertEqual(pickle_sessions.cache_dir(), xdg / "openpickle" / "cache")
+
+
 class LoadTest(CacheTest):
     def test_a_later_item_replaces_an_earlier_one(self) -> None:
         self.write(item(1, "user", "first draft"), item(2, "assistant", "<bubble>hi</bubble>"), item(1, "user", "final words"))
@@ -73,8 +102,49 @@ class LoadTest(CacheTest):
         self.assertEqual(search("draft"), [])
 
     def test_torn_lines_and_bad_bytes_cost_only_themselves(self) -> None:
-        self.write(item(1, "user", "before"), b"\xff\xfe{\"cut", item(2, "user", "after the bad bytes"), b'{"t":"item","v":{"role"')
+        self.write(item(1, "user", "before"), b"\xff\xfe{\"cut", item(2, "user", "after the bad bytes"))
+        with (self.cache / f"room-{ROOM}.jsonl").open("ab") as log:
+            log.write(b'{"t":"item","v":{"role"')
         self.assertEqual([m.text for m in load().messages], ["before", "after the bad bytes"])
+
+    def test_invalid_items_do_not_replace_an_earlier_good_item(self) -> None:
+        invalid_fields = {
+            "timestamp type": {"at": "not a timestamp"},
+            "boolean timestamp": {"at": False},
+            "non-finite timestamp": {"at": float("nan")},
+            "out-of-range timestamp": {"at": 1e30},
+            "sequence type": {"seq": True},
+            "out-of-range sequence": {"seq": 1 << 63},
+            "role type": {"role": 0},
+            "text type": {"text": ["hi"]},
+            "invalid Unicode": {"text": "\ud800"},
+            "attachments type": {"attachments": "attachments/photo.png"},
+            "attachment entry type": {"attachments": [None]},
+            "question type": {"role": "agent_request", "request": {"question": 7}},
+            "options type": {"role": "agent_request", "request": {"options": 7}},
+            "option label type": {"role": "agent_request", "request": {"options": [{"label": 7}]}},
+            "title type": {"role": "subagent", "title": 7},
+        }
+        first = item(1, "user", "keep this message")
+        for reason, changes in invalid_fields.items():
+            with self.subTest(reason=reason):
+                replacement = json.loads(item(1, "user", "invalid replacement"))
+                replacement["v"].update(changes)
+                self.write(first, json.dumps(replacement).encode(), item(2, "assistant", "another message"))
+                self.assertEqual(info().messages, 2)
+                self.assertEqual([hit.seq for hit in search("message")], [2, 1])
+                self.assertIn("keep this message", run("show", seq=1, context=0))
+
+    def test_peer_log_is_not_read(self) -> None:
+        self.write(item(1, "user", "primary message"))
+        (self.cache / "room-peer.jsonl").write_bytes(item(2, "user", "peer message") + b"\n")
+        self.assertEqual([hit.seq for hit in search("message")], [1])
+
+    def test_room_pointer_must_be_a_string(self) -> None:
+        (self.cache / "room.json").write_text("null")
+        (self.cache / "room-None.jsonl").write_bytes(item(1, "user", "unrelated message"))
+        with self.assertRaises(CacheError):
+            load()
 
     def test_bubbles_become_paragraphs(self) -> None:
         self.sample()
@@ -161,6 +231,10 @@ class ShowAndInfoTest(CacheTest):
 
     def test_info_without_identity(self) -> None:
         self.write(item(1, "user", "hi"), name=None)
+        self.assertIsNone(info().character)
+
+    def test_info_ignores_invalid_identity(self) -> None:
+        (self.cache / "identity.json").write_text('{"name": ["not a name"]}')
         self.assertIsNone(info().character)
 
 
