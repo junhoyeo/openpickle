@@ -272,8 +272,10 @@ impl Shell {
                 self.show_active_task(cx);
                 self.refresh_room_avatar(cx);
                 self.refresh_rows(cx);
-                if self.tab == Tab::Archive {
-                    self.commands.send(Command::LoadArchive).ok();
+                if self.tab == Tab::Archive && changed_room && !self.room_id.is_empty() {
+                    self.commands
+                        .send(Command::WatchArchive(Some(self.room_id.clone())))
+                        .ok();
                 }
                 self.report_reading(window);
                 if is_character && let Some(action) = self.after_primary.take() {
@@ -459,7 +461,8 @@ impl Shell {
                 attachments,
                 complete,
             } => {
-                if room_id == self.room_id
+                if self.tab == Tab::Archive
+                    && room_id == self.room_id
                     && let Some(archive) = &self.archive
                 {
                     archive.update(cx, |archive, cx| {
@@ -611,6 +614,9 @@ impl Shell {
         if !matches!(self.screen, Screen::Chat(_)) {
             return;
         }
+        if self.tab == Tab::Archive && tab != Tab::Archive {
+            self.commands.send(Command::WatchArchive(None)).ok();
+        }
         match tab {
             Tab::Chat => {}
             Tab::Explore => {
@@ -695,7 +701,11 @@ impl Shell {
                     ));
                     self.archive = Some(archive);
                 }
-                self.commands.send(Command::LoadArchive).ok();
+                if !self.room_id.is_empty() {
+                    self.commands
+                        .send(Command::WatchArchive(Some(self.room_id.clone())))
+                        .ok();
+                }
             }
             Tab::Profile => {
                 if self.profile.is_none() {
@@ -1781,7 +1791,7 @@ mod tests {
     ) {
         use crate::model::{Attachment, AttachmentKind};
         cx.update(crate::ui::bind_keys);
-        let (commands, _sent) = tokio::sync::mpsc::unbounded_channel();
+        let (commands, mut sent) = tokio::sync::mpsc::unbounded_channel();
         let (updates, received) = futures::channel::mpsc::unbounded();
         let conversation = |room: &str| Update::Conversation {
             room_id: room.into(),
@@ -1796,6 +1806,15 @@ mod tests {
             cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
         cx.simulate_resize(gpui::size(px(440.), px(900.)));
         cx.simulate_keystrokes("secondary-4");
+        let mut archive_watches = || {
+            std::iter::from_fn(|| sent.try_recv().ok())
+                .filter_map(|command| match command {
+                    Command::WatchArchive(room_id) => Some(room_id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(archive_watches(), vec![Some("primary".into())]);
         let old_archive = || Update::Archive {
             room_id: "primary".into(),
             complete: true,
@@ -1812,6 +1831,7 @@ mod tests {
         cx.run_until_parked();
         updates.unbounded_send(conversation("peer")).unwrap();
         cx.run_until_parked();
+        assert_eq!(archive_watches(), vec![Some("peer".into())]);
         cx.simulate_click(gpui::point(px(60.), px(280.)), gpui::Modifiers::none());
         shell.read_with(cx, |shell, _| assert_eq!(shell.tab, Tab::Archive));
         // An old response cannot refill the view after it was cleared.
@@ -1819,6 +1839,8 @@ mod tests {
         cx.run_until_parked();
         cx.simulate_click(gpui::point(px(60.), px(280.)), gpui::Modifiers::none());
         shell.read_with(cx, |shell, _| assert_eq!(shell.tab, Tab::Archive));
+        cx.simulate_keystrokes("secondary-1");
+        assert_eq!(archive_watches(), vec![None]);
     }
 
     #[gpui::test]

@@ -52,8 +52,8 @@ pub enum Command {
     EndPhoneCall { call_id: String, action_id: String },
     /// These offers were on screen.
     OffersShown(Vec<String>),
-    /// List the pictures and files of the conversation, reading back to its first message.
-    LoadArchive,
+    /// Read the visible room's Archive; `None` cancels its in-flight backward page.
+    WatchArchive(Option<String>),
     /// Show this chat room instead: a friend's Pickle, or the character's again when empty.
     OpenRoom(String),
     /// Load these pictures of the Archive: the attachments themselves, by their paths.
