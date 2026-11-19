@@ -27,6 +27,7 @@ type InFlight = Pin<Box<dyn Future<Output = (SearchRequest, SearchReply)> + Send
 /// discarded, but the active read can finish any shared credential refresh it has entered.
 #[derive(Default)]
 pub(super) struct SearchReads {
+    room_id: Option<String>,
     active: Option<InFlight>,
     queued: Option<(SearchRequest, SearchJob)>,
     wanted: bool,
@@ -47,14 +48,24 @@ impl SearchReads {
         }
     }
 
-    pub(super) fn start_next(&mut self, client: &PickleClient, room_id: &str) {
-        if self.active.is_some() {
+    pub(super) fn start_next(
+        &mut self,
+        client: &PickleClient,
+        room_id: Option<&str>,
+        roster_current: bool,
+    ) {
+        if self.room_id.as_deref() != room_id {
+            // Roster reconciliation can replace the room without an explicit OpenRoom command.
+            self.cancel();
+            self.room_id = room_id.map(str::to_owned);
+        }
+        if self.active.is_some() || !roster_current {
             return;
         }
         let Some((request, job)) = self.queued.take() else {
             return;
         };
-        if request.room_id != room_id || room_id.is_empty() {
+        if Some(request.room_id.as_str()) != room_id {
             return;
         }
         self.wanted = true;
@@ -97,6 +108,7 @@ impl SearchReads {
 }
 
 const CONTEXT_LIMIT: u32 = 32;
+const UPDATING_PERMISSIONS: &str = "Room permissions are updating. Try again.";
 const MISSING: &str =
     "This message is no longer available in this conversation. Choose another result.";
 
@@ -202,18 +214,54 @@ impl Conversation {
 }
 
 impl Live {
+    pub(super) fn search_room(&self) -> Option<&str> {
+        let room_id = self.conversation.room_id.as_str();
+        (self.is_open_character() && self.known_room(room_id).is_some()).then_some(room_id)
+    }
+
+    pub(super) fn queue_search(
+        &self,
+        search: &mut SearchReads,
+        request: SearchRequest,
+        job: SearchJob,
+    ) {
+        if self.roster_refresh.is_none() && Some(request.room_id.as_str()) == self.search_room() {
+            search.queue(request, job);
+            return;
+        }
+        let reason = if self.roster_refresh.is_some() {
+            UPDATING_PERMISSIONS
+        } else if self.roster_rev.is_none() {
+            "Wait for the conversation to connect, then search again."
+        } else {
+            "Search is available only in the primary conversation."
+        };
+        self.send(match job {
+            SearchJob::Query(_) => Update::Found {
+                request,
+                results: Err(reason.to_owned()),
+            },
+            SearchJob::Open(seq) => Update::SearchResultOpened {
+                request,
+                seq,
+                result: Err(reason.to_owned()),
+            },
+        });
+    }
+
     pub(super) fn finish_search(
         &mut self,
         request: SearchRequest,
         reply: SearchReply,
         wanted: bool,
     ) -> Result<(), Error> {
-        let current = wanted && request.room_id == self.conversation.room_id;
+        let current = wanted && Some(request.room_id.as_str()) == self.search_room();
         match reply {
             SearchReply::Found(found) => {
                 let results = match found {
                     Err(error) if session_is_gone(&error) => return Err(error),
                     _ if !current => return Ok(()),
+                    _ if self.roster_refresh.is_some() => Err(UPDATING_PERMISSIONS.to_owned()),
                     _ => found.map_err(|error| explain(&error)),
                 };
                 self.send(Update::Found { request, results });
@@ -222,6 +270,7 @@ impl Live {
                 let result = match context {
                     Err(error) if session_is_gone(&error) => return Err(error),
                     _ if !current => return Ok(()),
+                    _ if self.roster_refresh.is_some() => Err(UPDATING_PERMISSIONS.to_owned()),
                     Ok(Some(context)) => Ok(self.conversation.apply_search_context(context)),
                     Ok(None) => Err(MISSING.to_owned()),
                     Err(error) if error.api().is_some_and(|api| api.status == 404) => Err(MISSING.to_owned()),
@@ -314,6 +363,33 @@ mod tests {
         assert_eq!(conversation.first_seq(), Some(44));
         assert_eq!(conversation.head_seq(), 121);
         assert!(!conversation.search_context.contains("older"));
+    }
+
+    #[tokio::test]
+    async fn a_read_cannot_publish_after_its_room_is_lost_and_restored() {
+        let (settle, outcome) = tokio::sync::oneshot::channel();
+        let mut search = SearchReads {
+            room_id: Some("primary".into()),
+            active: Some(Box::pin(async move {
+                outcome.await.unwrap();
+                let request = SearchRequest {
+                    room_id: "primary".into(),
+                    id: 1,
+                };
+                (request, SearchReply::Found(Ok(Vec::new())))
+            })),
+            wanted: true,
+            ..Default::default()
+        };
+        {
+            let active = std::pin::pin!(search.next());
+            assert!(futures::poll!(active).is_pending());
+        }
+        let client = PickleClient::new(Default::default()).unwrap();
+        search.start_next(&client, None, true);
+        search.start_next(&client, Some("primary"), true);
+        settle.send(()).unwrap();
+        assert!(!search.next().await.2);
     }
 
     #[tokio::test]

@@ -687,6 +687,7 @@ struct ArchivePage {
 
 #[derive(Default)]
 struct ArchiveLoad {
+    watching: bool,
     /// The cursor of the next page, including when the view closes or the request fails.
     before: Option<i64>,
     complete: bool,
@@ -697,6 +698,7 @@ struct ArchiveLoad {
 
 impl ArchiveLoad {
     fn pause(&mut self) {
+        self.watching = false;
         self.request = None;
         self.attachments = Vec::new();
     }
@@ -872,7 +874,11 @@ async fn conversation_loop(
     let mut backoff = Backoff::default();
     let mut search = SearchReads::default();
     loop {
-        search.start_next(&live.client, &live.conversation.room_id);
+        search.start_next(
+            &live.client,
+            live.search_room(),
+            live.roster_refresh.is_none(),
+        );
         let watch_deadline = live
             .phone_watch
             .as_ref()
@@ -898,7 +904,9 @@ async fn conversation_loop(
                 }
                 Some(Command::SignOut) => return Ended::SignedOut,
                 Some(Command::Send { room_id, id, text, offer }) => {
-                    let sync_failure = if live.last_rooms.is_empty() {
+                    let sync_failure = if room_id == live.conversation.room_id
+                        && (live.roster_rev.is_none() || live.roster_refresh.is_some())
+                    {
                         match live.find_room().await {
                             Ok(()) => None,
                             Err(error) if session_is_gone(&error) => return Ended::SignedOut,
@@ -922,8 +930,8 @@ async fn conversation_loop(
                         live.send(Update::SendFailed { room_id, id, reason });
                     }
                 }
-                Some(Command::Search { request, query }) => search.queue(request, SearchJob::Query(query)),
-                Some(Command::OpenSearchResult { request, seq }) => search.queue(request, SearchJob::Open(seq)),
+                Some(Command::Search { request, query }) => live.queue_search(&mut search, request, SearchJob::Query(query)),
+                Some(Command::OpenSearchResult { request, seq }) => live.queue_search(&mut search, request, SearchJob::Open(seq)),
                 Some(Command::CancelSearch) => search.cancel(),
                 Some(Command::LoadSocial) => {
                     if let Some(cached) = live.cached_once::<SocialSnapshot>("social.json") {
@@ -1281,6 +1289,9 @@ impl Live {
             return Ok(());
         }
         let first_roster = self.roster_rev.is_none();
+        let archive_waiting_for_roster = self.archive.watching
+            && self.archive.request.is_none()
+            && (first_roster || self.roster_refresh.is_some());
         let before = self.room_metadata(&self.conversation.room_id);
         let character_room = rooms
             .rooms
@@ -1326,6 +1337,9 @@ impl Live {
             let after = self.room_metadata(&wanted);
             if first_roster || before != after {
                 self.send(Update::RoomMetadata(after));
+            }
+            if archive_waiting_for_roster && self.roster_refresh.is_none() {
+                self.watch_archive(Some(&wanted));
             }
         }
         if let Some(room) = self.known_room(&wanted) {
@@ -1431,7 +1445,7 @@ impl Live {
         }
         if renamed || repainted {
             self.store.cache("identity.json", &self.identity).ok();
-            if self.conversation.room_id == self.character_room {
+            if self.is_open_character() {
                 self.send(Update::Identity {
                     name: self.display_name(),
                     avatar: self.avatar_path(),
@@ -1470,7 +1484,7 @@ impl Live {
             }) => {
                 // Chat events carry no room id and belong only to the primary character room.
                 // While a peer room is open, its messages arrive through scoped `room` events.
-                if self.conversation.room_id == self.character_room
+                if self.is_open_character()
                     && let Ok(item) = serde_json::from_value::<HistoryItem>(
                         serde_json::json!({ "role": role, "id": id, "text": text, "at": at, "seq": seq }),
                     )
@@ -1491,7 +1505,7 @@ impl Live {
                 seq,
                 ..
             }) => {
-                if self.conversation.room_id == self.character_room
+                if self.is_open_character()
                     && let Ok(item) = serde_json::from_value::<HistoryItem>(serde_json::json!({
                         "role":role,"id":id,"title":title,"path":path,"at":at,"seq":seq
                     }))
@@ -1512,8 +1526,7 @@ impl Live {
                 at,
                 ..
             }) => {
-                if !self.character_room.is_empty()
-                    && self.conversation.room_id == self.character_room
+                if self.is_open_character()
                     && let Some(message) = self.conversation.hear_reaction(Reaction {
                         seq,
                         target_id,
@@ -1530,7 +1543,7 @@ impl Live {
                 }
             }
             PickleEvent::Chat(ChatEvent::Pending { on }) => {
-                if self.conversation.room_id == self.character_room {
+                if self.is_open_character() {
                     self.send(Update::Activity {
                         room_id: self.character_room.clone(),
                         activity: on.then_some(None),
@@ -1538,7 +1551,7 @@ impl Live {
                 }
             }
             PickleEvent::Chat(ChatEvent::Activity { state, label, .. }) => {
-                if self.conversation.room_id == self.character_room {
+                if self.is_open_character() {
                     self.send(Update::Activity {
                         room_id: self.character_room.clone(),
                         activity: Some(label.filter(|_| state == "tool")),
@@ -1549,8 +1562,16 @@ impl Live {
                 let RoomEvent::Advanced {
                     room_id, last_seq, ..
                 } = *room;
-                if room_id == self.conversation.room_id && self.known_room(&room_id).is_some() {
-                    self.queue_history(last_seq);
+                if let Some(room) = self
+                    .last_rooms
+                    .iter_mut()
+                    .find(|room| room.room_id == room_id)
+                {
+                    room.last_seq = room.last_seq.max(last_seq);
+                    let through = room.last_seq;
+                    if room_id == self.conversation.room_id {
+                        self.queue_history(through);
+                    }
                 }
             }
             PickleEvent::Sync(sync) if self.roster_rev.is_none_or(|rev| sync.rev > rev) => {
@@ -1595,9 +1616,13 @@ impl Live {
         {
             return;
         }
+        self.archive.watching = true;
         self.archive.attachments = self.conversation.attachments();
         self.show_archive();
-        if !self.archive.complete {
+        if !self.archive.complete
+            && self.roster_refresh.is_none()
+            && self.known_room(room_id).is_some()
+        {
             let before = self
                 .archive
                 .before
@@ -1662,7 +1687,10 @@ impl Live {
             self.show_archive();
         }
         if let Some(next) = next {
-            self.request_archive_page(next);
+            self.archive.before = Some(next);
+            if self.roster_refresh.is_none() {
+                self.request_archive_page(next);
+            }
         }
         Ok(())
     }
@@ -2202,7 +2230,24 @@ impl Live {
     /// Tells the window which other chat rooms exist, and shows their characters' pictures.
     fn show_rooms(&mut self, rooms: &openpickle_api::SyncResponse) {
         let (infos, pictures) = convert::rooms(&rooms.rooms);
-        self.last_rooms = rooms.rooms.clone();
+        let previous: HashMap<_, _> = self
+            .last_rooms
+            .iter()
+            .map(|room| (room.room_id.as_str(), room))
+            .collect();
+        self.last_rooms = rooms
+            .rooms
+            .iter()
+            .cloned()
+            .map(|mut room| {
+                if let Some(old) = previous.get(room.room_id.as_str())
+                    && old.log_epoch == room.log_epoch
+                {
+                    room.last_seq = room.last_seq.max(old.last_seq);
+                }
+                room
+            })
+            .collect();
         self.send(Update::Rooms(infos));
         self.fetch_pictures(pictures);
     }
@@ -2211,9 +2256,15 @@ impl Live {
         self.last_rooms.iter().find(|room| room.room_id == room_id)
     }
 
+    fn is_open_character(&self) -> bool {
+        !self.character_room.is_empty() && self.conversation.room_id == self.character_room
+    }
+
     fn send_block_reason(&self, room_id: &str) -> Option<&'static str> {
         if room_id != self.conversation.room_id {
             Some("Not sent. This conversation is no longer open.")
+        } else if self.roster_refresh.is_some() {
+            Some("Not sent. Room permissions are updating. Try again.")
         } else if !self.known_room(room_id).is_some_and(|room| !room.observer) {
             Some("Not sent. This room is read-only.")
         } else {
@@ -2250,7 +2301,10 @@ impl Live {
     /// old conversation intact.
     async fn open_room(&mut self, requested: &str) -> Result<(), OpenRoomError> {
         let mut refreshed = false;
-        if self.last_rooms.is_empty() || self.character_room.is_empty() {
+        if self.last_rooms.is_empty()
+            || self.character_room.is_empty()
+            || self.roster_refresh.is_some()
+        {
             self.find_room().await.map_err(OpenRoomError::Session)?;
             refreshed = true;
         }
@@ -2269,11 +2323,20 @@ impl Live {
                 requested.to_owned()
             };
         }
-        if wanted.is_empty() || self.known_room(&wanted).is_none() {
+        if self.roster_refresh.is_some() {
+            return Err(OpenRoomError::Visible(
+                "Room permissions are updating. Try opening this room again.".to_owned(),
+            ));
+        }
+        let Some(through) = self
+            .known_room(&wanted)
+            .filter(|_| !wanted.is_empty())
+            .map(|room| room.last_seq)
+        else {
             return Err(OpenRoomError::Visible(
                 "This chat room is not available for this account.".to_owned(),
             ));
-        }
+        };
         if wanted == self.conversation.room_id {
             // Opening a room is also a UI handshake: a no-op still acknowledges the request so
             // the window can clear its pending switch state and restore the composer.
@@ -2289,6 +2352,8 @@ impl Live {
         self.room_override = (wanted != self.character_room).then(|| wanted.clone());
         self.conversation = target;
         self.reset_room_state();
+        // The staged delta can succeed before it reaches the last advertised room sequence.
+        self.queue_history(through);
         self.send_update_for(&wanted);
         self.mark_read().await;
         Ok(())
@@ -2980,6 +3045,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cached_room_waits_for_roster_before_remote_archive_and_search_reads() {
+        let server = HistoryServer::start();
+        let (mut live, mut received) = fixture_live("archive-search-roster", &server);
+        live.character_room.clear();
+        live.last_rooms.clear();
+        live.watch_archive(Some("primary"));
+        assert!(live.archive.request.is_none());
+        drain(&mut received);
+
+        let mut search = SearchReads::default();
+        live.queue_search(
+            &mut search,
+            crate::protocol::SearchRequest {
+                room_id: "primary".into(),
+                id: 1,
+            },
+            SearchJob::Query("fixture".into()),
+        );
+        search.start_next(&live.client, live.search_room(), true);
+        assert!(!search.is_active());
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Update::Found {
+                results: Err(_),
+                ..
+            })
+        ));
+
+        live.find_room().await.unwrap();
+        assert!(live.archive.request.is_some());
+        assert_eq!(live.search_room(), Some("primary"));
+    }
+
+    #[tokio::test]
     async fn a_pending_archive_read_does_not_delay_events_timers_or_opening_another_room() {
         let server = HistoryServer::start();
         let (mut live, mut updates) = fixture_live("archive-interrupt", &server);
@@ -3207,6 +3306,62 @@ mod tests {
             Ok(Update::Conversation { room_id, messages, can_send: false, .. })
                 if room_id.is_empty() && messages.is_empty()
         ));
+    }
+
+    #[tokio::test]
+    async fn open_retries_from_a_staged_delta_behind_the_last_announced_sequence() {
+        let server = HistoryServer::start();
+        let (mut live, mut received) = fixture_live("staged-lag", &server);
+        live.find_room().await.unwrap();
+        drain(&mut received);
+        live.handle(PickleEvent::Room(Box::new(RoomEvent::Advanced {
+            room_id: "peer".into(),
+            last_seq: 2,
+            room: fixture_room("peer", "character_pair", false),
+        })));
+        assert!(live.history_refresh.is_none());
+
+        // A same-epoch roster response can still be behind the room event.
+        live.find_room().await.unwrap();
+        drain(&mut received);
+        live.open_room("peer").await.unwrap();
+        assert_eq!(live.conversation.synced, 1);
+        assert_eq!(live.history_refresh.as_ref().unwrap().through, 2);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Update::Conversation { room_id, .. }) if room_id == "peer"
+        ));
+
+        live.reconcile().await.unwrap();
+        assert_eq!(live.conversation.synced, 2);
+        assert!(live.history_refresh.is_none());
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Update::Upsert { room_id, messages })
+                if room_id == "peer" && messages[0].seq == 2
+        ));
+    }
+
+    #[tokio::test]
+    async fn known_stale_roster_cannot_authorize_a_send_or_open() {
+        let server = HistoryServer::start();
+        let (mut live, _) = fixture_live("stale-roster", &server);
+        live.find_room().await.unwrap();
+        live.handle(sync_event(2));
+        assert!(live.send_block_reason("primary").is_some());
+        assert!(matches!(
+            live.open_room("peer").await,
+            Err(OpenRoomError::Visible(_))
+        ));
+        assert_eq!(live.conversation.room_id, "primary");
+        assert!(
+            !server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.contains("/history/"))
+        );
     }
 
     #[tokio::test]
