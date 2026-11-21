@@ -1,4 +1,4 @@
-//! Sign-in: a phone number, then the code Pickle texts to it.
+//! Sign-in with SMS or browser-based Kakao OAuth.
 
 use gpui::{
     App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, SharedString,
@@ -11,6 +11,8 @@ use crate::{
 };
 
 pub enum LoginEvent {
+    StartKakao(u64),
+    CancelKakao,
     /// The user asked for a code to be texted to this number (E.164).
     RequestCode(String),
     /// The user typed the code they received.
@@ -18,6 +20,7 @@ pub enum LoginEvent {
 }
 
 enum Step {
+    Kakao,
     Phone,
     /// Waiting for the code texted to this number.
     Code(SharedString),
@@ -28,6 +31,7 @@ pub struct LoginView {
     phone: Entity<TextInput>,
     code: Entity<TextInput>,
     busy: bool,
+    kakao_attempt: u64,
     error: Option<SharedString>,
     _subscriptions: Vec<Subscription>,
 }
@@ -58,6 +62,7 @@ impl LoginView {
             phone,
             code,
             busy: false,
+            kakao_attempt: 0,
             error: None,
             _subscriptions: subscriptions,
         }
@@ -77,8 +82,27 @@ impl LoginView {
 
     /// The last request failed; show why and let the user try again.
     pub fn failed(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        if matches!(self.step, Step::Kakao) {
+            self.step = Step::Phone;
+        }
         self.busy = false;
         self.error = Some(message.into());
+        cx.notify();
+    }
+
+    pub fn is_kakao_attempt(&self, attempt: u64) -> bool {
+        matches!(self.step, Step::Kakao) && self.kakao_attempt == attempt
+    }
+
+    fn start_kakao(&mut self, cx: &mut Context<Self>) {
+        if self.busy || !matches!(self.step, Step::Phone) {
+            return;
+        }
+        self.kakao_attempt += 1;
+        self.step = Step::Kakao;
+        self.busy = true;
+        self.error = None;
+        cx.emit(LoginEvent::StartKakao(self.kakao_attempt));
         cx.notify();
     }
 
@@ -87,6 +111,7 @@ impl LoginView {
             return;
         }
         match &self.step {
+            Step::Kakao => return,
             Step::Phone => match normalize_phone(self.phone.read(cx).text()) {
                 Some(phone) => {
                     self.busy = true;
@@ -118,6 +143,9 @@ impl LoginView {
     }
 
     fn use_another_number(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.step, Step::Kakao) {
+            cx.emit(LoginEvent::CancelKakao);
+        }
         self.step = Step::Phone;
         self.busy = false;
         self.error = None;
@@ -159,7 +187,7 @@ fn field(id: &'static str, input: &Entity<TextInput>) -> Stateful<Div> {
 impl Focusable for LoginView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match self.step {
-            Step::Phone => self.phone.focus_handle(cx),
+            Step::Phone | Step::Kakao => self.phone.focus_handle(cx),
             Step::Code(_) => self.code.focus_handle(cx),
         }
     }
@@ -167,7 +195,13 @@ impl Focusable for LoginView {
 
 impl Render for LoginView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let waiting = matches!(self.step, Step::Kakao);
         let (prompt, input, action): (SharedString, _, _) = match &self.step {
+            Step::Kakao => (
+                "Complete sign-in in your browser…".into(),
+                field("phone", &self.phone),
+                "Waiting for Kakao…",
+            ),
             Step::Phone => (
                 "Sign in with your phone number".into(),
                 field("phone", &self.phone),
@@ -181,6 +215,7 @@ impl Render for LoginView {
         };
         let button = div()
             .id("submit")
+            .debug_selector(|| "submit".into())
             .w_full()
             .h(px(50.))
             .flex()
@@ -216,8 +251,28 @@ impl Render for LoginView {
                     .text_color(theme::color(theme::TEXT_MUTED))
                     .child(prompt),
             )
-            .child(input)
-            .child(button);
+            .when(!waiting, |form| form.child(input).child(button));
+        if matches!(self.step, Step::Phone) {
+            form = form.child(
+                div()
+                    .id("kakao")
+                    .debug_selector(|| "kakao".into())
+                    .w_full()
+                    .h(px(50.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(theme::color(theme::CHROME))
+                    .border_1()
+                    .border_color(theme::color(theme::HAIRLINE))
+                    .font_weight(FontWeight::MEDIUM)
+                    .when(self.busy, |button| button.opacity(0.5))
+                    .when(!self.busy, |button| button.cursor_pointer())
+                    .child("Continue with Kakao")
+                    .on_click(cx.listener(|this, _, _, cx| this.start_kakao(cx))),
+            );
+        }
         if let Some(error) = &self.error {
             form = form.child(
                 div()
@@ -225,14 +280,19 @@ impl Render for LoginView {
                     .child(error.clone()),
             );
         }
-        if matches!(self.step, Step::Code(_)) {
+        if matches!(self.step, Step::Code(_) | Step::Kakao) {
             form = form.child(
                 div()
                     .id("another")
+                    .debug_selector(|| "another".into())
                     .pt(px(4.))
                     .cursor_pointer()
                     .text_color(theme::color(theme::LINK))
-                    .child("Use another number")
+                    .child(if waiting {
+                        "Cancel"
+                    } else {
+                        "Use another number"
+                    })
                     .on_click(
                         cx.listener(|this, _, window, cx| this.use_another_number(window, cx)),
                     ),
@@ -254,7 +314,60 @@ impl Render for LoginView {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_phone;
+    use super::*;
+
+    #[gpui::test]
+    fn kakao_cancel_and_failure_leave_sms_usable(cx: &mut gpui::TestAppContext) {
+        use std::{cell::RefCell, rc::Rc};
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            window.activate_window();
+            LoginView::new(cx)
+        });
+        cx.simulate_resize(gpui::size(px(440.), px(700.)));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let observed = events.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&view, move |_, event, _| {
+                observed.borrow_mut().push(match event {
+                    LoginEvent::StartKakao(_) => "kakao".to_owned(),
+                    LoginEvent::CancelKakao => "cancel".to_owned(),
+                    LoginEvent::RequestCode(phone) => phone.clone(),
+                    LoginEvent::VerifyCode(code) => code.clone(),
+                });
+            })
+            .detach();
+        });
+        let click = |cx: &mut gpui::VisualTestContext, selector| {
+            cx.update(|window, cx| window.draw(cx).clear());
+            let bounds = cx.debug_bounds(selector).expect(selector);
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        };
+        click(cx, "kakao");
+        cx.update(|window, cx| window.draw(cx).clear());
+        view.read_with(cx, |view, _| assert!(view.is_kakao_attempt(1)));
+        click(cx, "another");
+        click(cx, "kakao");
+        view.update(cx, |view, cx| {
+            assert!(!view.is_kakao_attempt(1));
+            assert!(view.is_kakao_attempt(2));
+            view.failed("Denied", cx);
+            view.phone
+                .update(cx, |input, cx| input.set_text("010-1234-5678", cx));
+        });
+        click(cx, "submit");
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.code_requested(window, cx);
+                view.code
+                    .update(cx, |input, cx| input.set_text("123456", cx));
+            });
+        });
+        click(cx, "submit");
+        assert_eq!(
+            &*events.borrow(),
+            &["kakao", "cancel", "kakao", "+821012345678", "123456"]
+        );
+    }
 
     #[test]
     fn local_numbers_become_korean_e164() {

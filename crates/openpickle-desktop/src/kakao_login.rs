@@ -1,4 +1,4 @@
-//! Terminal entry point until the GPUI login screen can receive OAuth callbacks.
+//! Manual terminal fallback for development; normal users sign in through GPUI.
 use openpickle_api::{ClientOptions, PickleClient, kakao::KakaoConfig};
 use openpickle_desktop::store::{Session, Store};
 

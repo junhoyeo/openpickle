@@ -203,9 +203,93 @@ async fn sign_in(
         ))
     })?;
     let mut pending_id = None;
-    while let Some(command) = commands.recv().await {
+    let config = openpickle_api::kakao::KakaoConfig::default();
+    let mut kakao_verifier = None;
+    'sign_in: while let Some(command) = commands.recv().await {
         let failure = match command {
+            Command::StartKakao(attempt) => {
+                pending_id = None;
+                kakao_verifier = None;
+                match client.request_kakao_authorize_url(&config) {
+                    Ok(pending) => {
+                        kakao_verifier = Some((attempt, pending.verifier));
+                        updates
+                            .unbounded_send(Update::KakaoAuthorize {
+                                attempt,
+                                url: pending.url,
+                            })
+                            .ok();
+                        continue;
+                    }
+                    Err(_) => {
+                        updates
+                            .unbounded_send(Update::KakaoFailed {
+                                attempt,
+                                reason: "Could not start Kakao sign-in. Please try again."
+                                    .to_owned(),
+                            })
+                            .ok();
+                        continue;
+                    }
+                }
+            }
+            Command::CancelKakao | Command::SignOut => {
+                kakao_verifier = None;
+                continue;
+            }
+            Command::CompleteKakao { redirect_or_code } => {
+                let Some((attempt, verifier)) = kakao_verifier.take() else {
+                    continue;
+                };
+                let exchange = async {
+                    let code = config
+                        .parse_code(&redirect_or_code)
+                        .map_err(|e| e.to_string())?;
+                    let id_token = client
+                        .exchange_kakao_code(&config, &code, &verifier)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    // Never display server-controlled error detail containing OAuth credentials.
+                    client
+                        .login_with_kakao_id_token(&id_token)
+                        .await
+                        .map_err(|_| "Kakao sign-in to Pickle failed. Please try again.".to_owned())
+                };
+                tokio::pin!(exchange);
+                let result = loop {
+                    tokio::select! {
+                        biased;
+                        command = commands.recv() => match command {
+                            Some(Command::CancelKakao | Command::SignOut) => continue 'sign_in,
+                            None | Some(Command::Quit) => return Err(Ended::Closed),
+                            // Duplicate callbacks and window activity cannot start another exchange.
+                            _ => {}
+                        },
+                        result = &mut exchange => break result,
+                    }
+                };
+                let reason = match result {
+                    Ok(issued) => {
+                        let session = Session {
+                            login_session_token: issued.login_session_token,
+                            device_id: uuid::Uuid::new_v4().to_string().to_uppercase(),
+                        };
+                        match store.start_session(&session) {
+                            Ok(()) => return Ok((session, issued.login_session_jwt)),
+                            Err(error) => {
+                                format!("Could not finish signing in on this computer: {error}")
+                            }
+                        }
+                    }
+                    Err(reason) => reason,
+                };
+                updates
+                    .unbounded_send(Update::KakaoFailed { attempt, reason })
+                    .ok();
+                continue;
+            }
             Command::RequestCode(phone) => {
+                kakao_verifier = None;
                 match client.request_phone_code(&phone, None, None).await {
                     Ok(requested) => {
                         pending_id = Some(requested.pending_id);
@@ -235,8 +319,7 @@ async fn sign_in(
                 None => "Ask for a code first.".to_owned(),
             },
             Command::Quit => break,
-            Command::SignOut
-            | Command::Send { .. }
+            Command::Send { .. }
             | Command::Search { .. }
             | Command::OpenSearchResult { .. }
             | Command::CancelSearch
@@ -1055,7 +1138,7 @@ async fn conversation_loop(
                     live.active = active;
                     live.mark_read().await;
                 }
-                Some(Command::RequestCode(_) | Command::VerifyCode(_)) => {}
+                Some(Command::RequestCode(_) | Command::VerifyCode(_) | Command::StartKakao(_) | Command::CompleteKakao { .. } | Command::CancelKakao) => {}
             },
             page = next_archive_page(&mut live.archive.request), if live.archive.request.is_some() => {
                 if let Err(error) = live.finish_archive_page(page)
@@ -2644,6 +2727,72 @@ mod tests {
         sync::{Mutex, atomic::AtomicI64},
         thread,
     };
+
+    #[tokio::test]
+    async fn kakao_callbacks_require_pending_login_and_cancel_aborts_exchange() {
+        let root = std::env::temp_dir().join(format!("kakao-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::at(root.clone()).unwrap();
+        let (tx, mut commands) = unbounded_channel();
+        let (updates, mut received) = futures::channel::mpsc::unbounded();
+        let callback = || Command::CompleteKakao {
+            redirect_or_code: "offline-test-code".into(),
+        };
+        tx.send(callback()).unwrap(); // No verifier: ignored without network I/O.
+        tx.send(Command::StartKakao(1)).unwrap();
+        tx.send(Command::CancelKakao).unwrap();
+        tx.send(callback()).unwrap(); // Canceled verifier: ignored.
+        tx.send(Command::StartKakao(2)).unwrap();
+        tx.send(callback()).unwrap();
+        tx.send(Command::CancelKakao).unwrap(); // Wins over polling the exchange future.
+        tx.send(Command::Quit).unwrap();
+        assert!(matches!(
+            sign_in(&store, &mut commands, &updates).await,
+            Err(Ended::Closed)
+        ));
+        for expected in [1, 2] {
+            assert!(
+                matches!(received.try_recv(), Ok(Update::KakaoAuthorize { attempt, .. }) if attempt == expected)
+            );
+        }
+        assert!(received.try_recv().is_err());
+        assert!(store.session().unwrap().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn kakao_denial_is_scoped_and_consumes_the_pending_verifier() {
+        let root = std::env::temp_dir().join(format!("kakao-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::at(root.clone()).unwrap();
+        let (tx, mut commands) = unbounded_channel();
+        let (updates, mut received) = futures::channel::mpsc::unbounded();
+        tx.send(Command::StartKakao(7)).unwrap();
+        tx.send(Command::CompleteKakao {
+            redirect_or_code: format!(
+                "{}?error=access_denied&error_description=untrusted-detail",
+                openpickle_api::kakao::KAKAO_REDIRECT_URI
+            ),
+        })
+        .unwrap();
+        let drive = async {
+            assert!(matches!(
+                received.next().await,
+                Some(Update::KakaoAuthorize { attempt: 7, .. })
+            ));
+            assert!(
+                matches!(received.next().await, Some(Update::KakaoFailed { attempt: 7, reason }) if reason == "Kakao authorization was denied")
+            );
+            tx.send(Command::CompleteKakao {
+                redirect_or_code: "offline-test-code".into(),
+            })
+            .unwrap();
+            tx.send(Command::Quit).unwrap();
+        };
+        let (result, ()) = tokio::join!(sign_in(&store, &mut commands, &updates), drive);
+        assert!(matches!(result, Err(Ended::Closed)));
+        assert!(received.try_recv().is_err());
+        assert!(store.session().unwrap().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     struct HistoryServer {
         base_url: String,

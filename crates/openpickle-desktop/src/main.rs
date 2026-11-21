@@ -31,32 +31,44 @@ fn main() {
             std::process::exit(1);
         }
     };
-    Application::new()
-        .with_assets(Assets)
-        .run(move |cx: &mut App| {
-            ui::bind_keys(cx);
-            cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
-            cx.on_action(|_: &Quit, cx| cx.quit());
-            // Runs on every way out: the menu, the last window closing, the Dock, logging out.
-            cx.on_app_quit(move |_| {
-                stop.stop();
-                async {}
-            })
-            .detach();
-            cx.set_menus(vec![Menu {
-                name: "OpenPickle".into(),
-                items: vec![MenuItem::action("Quit OpenPickle", Quit)],
-            }]);
-            cx.on_window_closed(|cx| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
-            cx.open_window(ui::window_options(cx), |window, cx| {
-                cx.new(|cx| Shell::new(commands, updates, window, cx))
-            })
-            .expect("the main window");
-            cx.activate(true);
-        });
+    let callback_commands = commands.clone();
+    let app = Application::new().with_assets(Assets);
+    app.on_open_urls(move |urls| {
+        for url in urls {
+            // The backend additionally requires an in-memory pending verifier.
+            if url.starts_with(&format!("{}?", openpickle_api::kakao::KAKAO_REDIRECT_URI)) {
+                callback_commands
+                    .send(openpickle_desktop::protocol::Command::CompleteKakao {
+                        redirect_or_code: url,
+                    })
+                    .ok();
+            }
+        }
+    });
+    app.run(move |cx: &mut App| {
+        ui::bind_keys(cx);
+        cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        // Runs on every way out: the menu, the last window closing, the Dock, logging out.
+        cx.on_app_quit(move |_| {
+            stop.stop();
+            async {}
+        })
+        .detach();
+        cx.set_menus(vec![Menu {
+            name: "OpenPickle".into(),
+            items: vec![MenuItem::action("Quit OpenPickle", Quit)],
+        }]);
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+        cx.open_window(ui::window_options(cx), |window, cx| {
+            cx.new(|cx| Shell::new(commands, updates, window, cx))
+        })
+        .expect("the main window");
+        cx.activate(true);
+    });
 }
