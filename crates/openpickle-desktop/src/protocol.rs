@@ -29,6 +29,12 @@ pub enum Command {
     RequestCode(String),
     /// Sign in with the texted code.
     VerifyCode(String),
+    /// Begin browser OAuth; attempt scopes delayed browser/registration work to the UI.
+    StartKakao(u64),
+    /// Consume a callback only while a PKCE verifier is pending in the sign-in loop.
+    CompleteKakao { redirect_or_code: String },
+    /// Discard the pending verifier and cancel any in-flight Kakao exchange.
+    CancelKakao,
     /// Send a message to the open conversation. The UI shows it already, under this id, which
     /// the server keeps for its copy. `offer` names the Explore offer the message asks for.
     Send {
@@ -103,7 +109,11 @@ pub enum Update {
     SignedOut,
     /// The code was texted.
     CodeSent,
-    /// Requesting or verifying the code failed; the text is shown to the user.
+    /// PKCE is pending in memory; register the callback handler, then open this URL.
+    KakaoAuthorize { attempt: u64, url: String },
+    /// OAuth failed for this attempt; ignore it after cancellation or retry.
+    KakaoFailed { attempt: u64, reason: String },
+    /// Requesting or verifying sign-in failed; the text is shown to the user.
     SignInFailed(String),
     /// Signed in. Carries the conversation as far as it is known, which at launch is whatever
     /// the disk cache holds.

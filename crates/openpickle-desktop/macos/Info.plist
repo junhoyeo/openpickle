@@ -8,6 +8,17 @@
 	<string>OpenPickle</string>
 	<key>CFBundleIdentifier</key>
 	<string>io.junho.openpickle</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>Kakao OAuth</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>kakao41aae57a320049f89503212f8452b399</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleExecutable</key>
 	<string>openpickle</string>
 	<key>CFBundleIconFile</key>

@@ -14,7 +14,7 @@ cargo run -p openpickle-desktop --example gallery -- app   # the whole window: m
 
 ## What it does
 
-- **Sign-in** with a phone number and the texted code. The app gets its own login session, so the
+- **Sign-in** with a phone number and the texted code, or Kakao in your browser on macOS. The app gets its own login session, so the
   phone stays signed in.
 - **The chat with your character**, following the Figma frames of the iOS chat screen: grouped
   bubbles, info cards, request cards, timestamps, the composer and the tab bar. Korean lines break
@@ -158,3 +158,32 @@ Everything is under the user's application-support directory
 | `src/app.rs` | The root view: sign-in or chat, applying updates. |
 | `src/ui/` | The sections (chat, Explore, Friends), what opens over them (the menu, search, the invite sheet), the sign-in screen, the text field (with IME), row drawing, text selection, line breaking. |
 | `src/theme.rs`, `assets/icons/` | Colors and sizes read off the Figma frames; Lucide icons (ISC). |
+
+## Kakao sign-in on macOS
+
+1. Quit any running OpenPickle instance, including `cargo run`.
+2. Run `./crates/openpickle-desktop/macos/package.sh` from the repository root.
+3. Open the generated DMG in `target/macos/`, drag OpenPickle to Applications, and launch
+   `/Applications/OpenPickle.app`. Replace an older installed copy if necessary.
+4. On the signed-out phone form, click **Continue with Kakao**. If already signed in, use
+   the app's Sign out control first (this clears the local session and cache).
+5. Finish Kakao sign-in in the macOS authentication session. The app
+   exchanges the callback and enters the same signed-in chat flow as SMS login.
+
+Kakao first uses `ASWebAuthenticationSession` through a small Objective-C bridge,
+compiled with Clang and Command Line Tools (no Swift SPM or full Xcode dependency).
+The session allows existing browser cookies. Success brings the app window forward;
+closing the session or pressing **Cancel** clears the pending login UI.
+
+If the session cannot start, the app falls back to registering its callback scheme and
+opening the system browser. That fallback needs an installed `.app` and macOS 12 or
+later; registration failure is shown in the login form. `cargo run` cannot reliably
+receive callbacks through this fallback. The existing URL handler remains available.
+
+PKCE stays in memory only, so
+quitting/restarting the app invalidates an unfinished login. Codes, tokens, and verifiers are
+not logged. `--kakao-login` remains a manual terminal fallback for developers.
+
+For local checks without the Metal shader build tools:
+`cargo check --locked -p openpickle-desktop --all-targets --features gpui/runtime_shaders`.
+The package script uses the normal release build and requires the macOS build tools.

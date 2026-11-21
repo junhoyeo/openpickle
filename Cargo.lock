@@ -3944,6 +3944,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.21",
  "tokio",
  "uuid",
@@ -3954,6 +3955,7 @@ dependencies = [
 name = "openpickle-desktop"
 version = "1.0.0"
 dependencies = [
+ "cc",
  "chrono",
  "dirs 6.0.0",
  "futures",

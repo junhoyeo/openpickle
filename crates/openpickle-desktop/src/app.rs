@@ -246,6 +246,90 @@ impl Shell {
                     login.update(cx, |login, cx| login.code_requested(window, cx));
                 }
             }
+            Update::KakaoAuthorize { attempt, url } => {
+                if let Screen::Login(login) = &self.screen
+                    && login.read(cx).is_kakao_attempt(attempt)
+                {
+                    let login = login.downgrade();
+                    let commands = self.commands.clone();
+                    let scheme = openpickle_api::kakao::KAKAO_REDIRECT_URI
+                        .split_once(':')
+                        .expect("Kakao redirect scheme")
+                        .0;
+                    #[cfg(target_os = "macos")]
+                    {
+                        let (sender, receiver) = futures::channel::oneshot::channel();
+                        if crate::asweb::start(
+                            &url,
+                            scheme,
+                            Box::new(move |result| {
+                                sender.send(result).ok();
+                            }),
+                        )
+                        .is_ok()
+                        {
+                            cx.spawn_in(window, async move |this, cx| {
+                                let Ok(result) = receiver.await else {
+                                    return;
+                                };
+                                this.update_in(cx, |_, window, cx| {
+                                    login
+                                        .update(cx, |login, cx| {
+                                            if !login.is_kakao_attempt(attempt) {
+                                                return;
+                                            }
+                                            match result {
+                                                Ok(url) => {
+                                                    cx.activate(true);
+                                                    window.activate_window();
+                                                    commands
+                                                        .send(Command::CompleteKakao {
+                                                            redirect_or_code: url,
+                                                        })
+                                                        .ok();
+                                                }
+                                                Err(error) => {
+                                                    commands.send(Command::CancelKakao).ok();
+                                                    if error == "cancelled" {
+                                                        login.kakao_cancelled(cx);
+                                                    } else {
+                                                        login.failed(error, cx);
+                                                    }
+                                                }
+                                            }
+                                        })
+                                        .ok();
+                                })
+                                .ok();
+                            })
+                            .detach();
+                            return;
+                        }
+                    }
+                    let registration = cx.register_url_scheme(scheme);
+                    cx.spawn(async move |_, cx| {
+                        let registered = registration.await.is_ok();
+                        login.update(cx, |login, cx| {
+                            if !login.is_kakao_attempt(attempt) {
+                                return;
+                            }
+                            if registered {
+                                cx.open_url(&url);
+                            } else {
+                                commands.send(Command::CancelKakao).ok();
+                                login.failed("Could not register the Kakao callback. Install and launch OpenPickle.app on macOS 12 or later, then try again.", cx);
+                            }
+                        }).ok();
+                    }).detach();
+                }
+            }
+            Update::KakaoFailed { attempt, reason } => {
+                if let Screen::Login(login) = &self.screen
+                    && login.read(cx).is_kakao_attempt(attempt)
+                {
+                    login.update(cx, |login, cx| login.failed(reason, cx));
+                }
+            }
             Update::SignInFailed(reason) => {
                 if let Screen::Login(login) = &self.screen {
                     login.update(cx, |login, cx| login.failed(reason, cx));
@@ -758,6 +842,12 @@ impl Shell {
         let login = cx.new(LoginView::new);
         self._screen_events = Some(cx.subscribe(&login, |this, _, event, _| {
             let command = match event {
+                LoginEvent::StartKakao(attempt) => Command::StartKakao(*attempt),
+                LoginEvent::CancelKakao => {
+                    #[cfg(target_os = "macos")]
+                    crate::asweb::cancel();
+                    Command::CancelKakao
+                }
                 LoginEvent::RequestCode(phone) => Command::RequestCode(phone.clone()),
                 LoginEvent::VerifyCode(code) => Command::VerifyCode(code.clone()),
             };

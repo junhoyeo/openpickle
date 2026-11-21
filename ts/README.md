@@ -438,3 +438,33 @@ without a client method are listed as `skip`.
 
 Captures contain bearer tokens and personal data. `.gitignore` excludes `*.proxymanlogv2` and
 `.capture/`; keep them out of the repository.
+
+### Kakao login (library)
+
+`PickleClient` exposes `requestKakaoAuthorizeUrl`, `exchangeKakaoCode`, and
+`loginWithKakaoIdToken`, plus `parseKakaoCode` from `src/kakao.ts`. The flow is
+Kakao authorize with PKCE, a `kakao<client id>://oauth?code=…` redirect, a token
+exchange at `kauth.kakao.com` with no client secret or App Attest, and
+`POST /api/login-sessions` with `{provider: "kakao", kind: "id_token"}`. Public
+configuration defaults are named constants in `src/kakao.ts`; they are native-client
+identifiers, not secrets. SMS login is unchanged.
+
+### Rust / desktop terminal entry point
+
+Quit the desktop app, then run from the repository root:
+
+```sh
+cargo run -p openpickle-desktop --bin openpickle -- --kakao-login
+```
+
+Open the printed URL, capture its redirect, and paste the redirect URL or code into
+that same terminal. The verifier stays in memory. This writes through the desktop
+`Store::start_session` path, clearing old account caches and preserving the normal
+rotation behavior; restart the desktop app afterwards. It uses the same public
+`PICKLE_KAKAO_*` overrides. Do not point the TS CLI at the desktop session file.
+
+The Rust API exposes `request_kakao_authorize_url`, `exchange_kakao_code`, and
+`login_with_kakao_id_token`, plus `KakaoConfig::parse_code`. The minimal desktop
+entry point is terminal-based: GPUI Kakao buttons, macOS `CFBundleURLTypes`
+registration, and incoming-URL event routing are still pending. The bundle does not
+claim the Kakao URL scheme until a working in-app receiver is wired up.

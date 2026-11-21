@@ -481,6 +481,32 @@ impl PickleClient {
             .await
     }
 
+    /// Starts the verified Kakao native OAuth flow with fresh PKCE randomness.
+    pub fn request_kakao_authorize_url(
+        &self,
+        config: &crate::kakao::KakaoConfig,
+    ) -> std::result::Result<crate::kakao::KakaoAuthorization, crate::kakao::KakaoError> {
+        config.authorize()
+    }
+
+    pub async fn exchange_kakao_code(
+        &self,
+        config: &crate::kakao::KakaoConfig,
+        code: &str,
+        verifier: &str,
+    ) -> std::result::Result<String, crate::kakao::KakaoError> {
+        config.exchange_code(code, verifier).await
+    }
+
+    /// The result uses exactly the same persistence and rotation path as SMS login.
+    pub async fn login_with_kakao_id_token(&self, id_token: &str) -> Result<LoginSessionIssued> {
+        let options = self.sign_in_options()?.json(&json!({
+            "provider": "kakao", "kind": "id_token", "id_token": id_token,
+        }))?;
+        self.request(Method::POST, "/api/login-sessions", options)
+            .await
+    }
+
     /// `POST /api/login-sessions/refresh`: trades a refresh token for an access token and the next
     /// refresh token. The sent token is spent. A client with a login session calls this itself.
     pub async fn refresh_login_session(
