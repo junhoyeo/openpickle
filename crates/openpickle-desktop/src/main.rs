@@ -49,6 +49,8 @@ fn main() {
         cx.on_action(|_: &Quit, cx| cx.quit());
         // Runs on every way out: the menu, the last window closing, the Dock, logging out.
         cx.on_app_quit(move |_| {
+            #[cfg(target_os = "macos")]
+            openpickle_desktop::asweb::cancel();
             stop.stop();
             async {}
         })

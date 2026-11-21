@@ -90,6 +90,13 @@ impl LoginView {
         cx.notify();
     }
 
+    pub fn kakao_cancelled(&mut self, cx: &mut Context<Self>) {
+        self.step = Step::Phone;
+        self.busy = false;
+        self.error = None;
+        cx.notify();
+    }
+
     pub fn is_kakao_attempt(&self, attempt: u64) -> bool {
         matches!(self.step, Step::Kakao) && self.kakao_attempt == attempt
     }

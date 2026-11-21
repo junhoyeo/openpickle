@@ -167,17 +167,20 @@ Everything is under the user's application-support directory
    `/Applications/OpenPickle.app`. Replace an older installed copy if necessary.
 4. On the signed-out phone form, click **Continue with Kakao**. If already signed in, use
    the app's Sign out control first (this clears the local session and cache).
-5. Finish Kakao sign-in in the system browser and allow it to open OpenPickle. The app
+5. Finish Kakao sign-in in the macOS authentication session. The app
    exchanges the callback and enters the same signed-in chat flow as SMS login.
 
-Each Kakao attempt registers OpenPickle as the default handler of the callback scheme before
-opening the browser. This needs an installed `.app` and macOS 12 or later; it should take over
-from KakaoCatcher without removing KakaoCatcher.app. Registration failure is shown in the login
-form. `cargo run` has no application bundle and cannot reliably receive the callback.
+Kakao first uses `ASWebAuthenticationSession` through a small Objective-C bridge,
+compiled with Clang and Command Line Tools (no Swift SPM or full Xcode dependency).
+The session allows existing browser cookies. Success brings the app window forward;
+closing the session or pressing **Cancel** clears the pending login UI.
 
-The browser's **Continue** may appear stuck while macOS delivers the scheme to the app, just
-as with KakaoCatcher. Check the OpenPickle window. **Cancel** returns to the phone form and
-discards the pending attempt; retry from the app if needed. PKCE stays in memory only, so
+If the session cannot start, the app falls back to registering its callback scheme and
+opening the system browser. That fallback needs an installed `.app` and macOS 12 or
+later; registration failure is shown in the login form. `cargo run` cannot reliably
+receive callbacks through this fallback. The existing URL handler remains available.
+
+PKCE stays in memory only, so
 quitting/restarting the app invalidates an unfinished login. Codes, tokens, and verifiers are
 not logged. `--kakao-login` remains a manual terminal fallback for developers.
 
