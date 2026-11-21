@@ -619,3 +619,32 @@ fn token_claims_are_read_as_utf8() {
     let token = format!("Bearer h.{}.s", URL_SAFE_NO_PAD.encode(claims));
     assert_eq!(decode_access_token(&token).unwrap().sub, "피클");
 }
+
+#[tokio::test]
+async fn kakao_and_sms_issue_the_same_session_without_bearer_or_app_proof() {
+    let server = MockServer::start(|_| Reply::json(200,
+        r#"{"status":"ok","user_id":"fixture-user","login_session_token":"fixture-session","login_session_jwt":"fixture-jwt","expires_at":"2030-01-01T00:00:00Z"}"#
+    )).await;
+    let pickle = client(&server, Credentials::default());
+    let kakao = pickle
+        .login_with_kakao_id_token("fixture-id")
+        .await
+        .unwrap();
+    let sms = pickle.verify_phone_code("pending", "123456").await.unwrap();
+    assert_eq!(kakao.login_session_token, sms.login_session_token);
+    let calls = server.take();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&calls[0].body).unwrap(),
+        serde_json::json!({"provider":"kakao","kind":"id_token","id_token":"fixture-id"})
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&calls[1].body).unwrap(),
+        serde_json::json!({"pending_id":"pending","code":"123456","kind":"phone_code"})
+    );
+    for call in calls {
+        assert_eq!(call.path, "/api/login-sessions");
+        assert_eq!(call.header("authorization"), None);
+        assert_eq!(call.header("x-pickle-sign-in-flow"), Some("2"));
+    }
+}

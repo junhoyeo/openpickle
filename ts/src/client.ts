@@ -1,3 +1,4 @@
+import { kakaoAuthorize, exchangeKakaoCode, type KakaoConfig } from "./kakao.ts";
 import { SseParser, toPickleEvent, type PickleEvent } from "./events.ts";
 import type {
   ApiErrorBody,
@@ -211,6 +212,21 @@ export class PickleClient {
       auth: "app",
       body: { pending_id: pendingId, code, kind: "phone_code" },
       headers: this.signInHeaders(),
+    });
+  }
+
+  requestKakaoAuthorizeUrl(config?: KakaoConfig) {
+    return kakaoAuthorize(config);
+  }
+
+  exchangeKakaoCode(code: string, verifier: string, config?: KakaoConfig): Promise<string> {
+    return exchangeKakaoCode(this.fetchImpl, code, verifier, config);
+  }
+
+  loginWithKakaoIdToken(idToken: string): Promise<LoginSessionIssued> {
+    return this.request("POST", "/api/login-sessions", {
+      auth: "app", body: { provider: "kakao", kind: "id_token", id_token: idToken },
+      headers: this.signInHeaders(), signal: AbortSignal.timeout(30_000),
     });
   }
 

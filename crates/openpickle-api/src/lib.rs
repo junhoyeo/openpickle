@@ -5,6 +5,7 @@
 
 mod client;
 pub mod events;
+pub mod kakao;
 pub mod types;
 
 pub use client::{

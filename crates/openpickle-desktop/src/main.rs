@@ -3,9 +3,18 @@
 use gpui::{App, AppContext, Application, KeyBinding, Menu, MenuItem, actions};
 use openpickle_desktop::{app::Shell, assets::Assets, backend, ui};
 
+mod kakao_login;
+
 actions!(openpickle, [Quit]);
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--kakao-login") {
+        if let Err(error) = kakao_login::run() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // Started before GPUI so the cached conversation loads while the window is being created.
     let backend::Backend {
         commands,
