@@ -1,5 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+use futures::StreamExt;
 use gpui::{App, AppContext, Application, KeyBinding, Menu, MenuItem, actions};
 use openpickle_desktop::{app::Shell, assets::Assets, backend, ui};
 
@@ -32,16 +33,13 @@ fn main() {
         }
     };
     let callback_commands = commands.clone();
+    let (callbacks, mut callback_urls) = futures::channel::mpsc::unbounded();
     let app = Application::new().with_assets(Assets);
     app.on_open_urls(move |urls| {
         for url in urls {
             // The backend additionally requires an in-memory pending verifier.
             if url.starts_with(&format!("{}?", openpickle_api::kakao::KAKAO_REDIRECT_URI)) {
-                callback_commands
-                    .send(openpickle_desktop::protocol::Command::CompleteKakao {
-                        redirect_or_code: url,
-                    })
-                    .ok();
+                callbacks.unbounded_send(url).ok();
             }
         }
     });
@@ -65,10 +63,29 @@ fn main() {
             }
         })
         .detach();
-        cx.open_window(ui::window_options(cx), |window, cx| {
-            cx.new(|cx| Shell::new(commands, updates, window, cx))
+        let main_window = cx
+            .open_window(ui::window_options(cx), |window, cx| {
+                cx.new(|cx| Shell::new(commands, updates, window, cx))
+            })
+            .expect("the main window");
+        cx.spawn(async move |cx| {
+            while let Some(url) = callback_urls.next().await {
+                // Return from the browser before exchanging the code, including on failure.
+                cx.update(|cx| {
+                    cx.activate(true);
+                    main_window
+                        .update(cx, |_, window, _| window.activate_window())
+                        .ok();
+                })
+                .ok();
+                callback_commands
+                    .send(openpickle_desktop::protocol::Command::CompleteKakao {
+                        redirect_or_code: url,
+                    })
+                    .ok();
+            }
         })
-        .expect("the main window");
+        .detach();
         cx.activate(true);
     });
 }
