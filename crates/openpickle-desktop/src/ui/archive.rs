@@ -63,16 +63,13 @@ fn by_day<'a>(
     days
 }
 
-/// `November 14`, or with the year when it is not this year's.
+/// The local calendar date, including the year, e.g. `November 14, 2026`.
 fn day_label(at: f64) -> String {
-    use chrono::{Datelike, Local, TimeZone};
+    use chrono::{Local, TimeZone};
     let Some(time) = Local.timestamp_opt(at as i64, 0).single() else {
         return String::new();
     };
-    match time.year() == Local::now().year() {
-        true => time.format("%B %-d").to_string(),
-        false => time.format("%B %-d, %Y").to_string(),
-    }
+    time.format("%B %-d, %Y").to_string()
 }
 
 impl ArchiveView {
@@ -503,6 +500,15 @@ mod tests {
             .collect();
         assert_eq!(shape.len(), 2);
         assert_eq!((shape[0].1, shape[1].1), (2, 1));
-        assert!(shape[0].0.starts_with("November 14"));
+        assert_eq!(shape[0].0, "November 14, 2026");
+    }
+
+    #[test]
+    fn archive_date_labels_include_the_current_year() {
+        let now = chrono::Local::now();
+        assert_eq!(
+            day_label(now.timestamp() as f64),
+            now.format("%B %-d, %Y").to_string(),
+        );
     }
 }
