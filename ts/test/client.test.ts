@@ -281,6 +281,15 @@ test("query options join a path that already has a query", async () => {
   ]);
 });
 
+test("screen query options preserve repeated keys and their order", async () => {
+  const { calls, fetch } = recorder(200, "{}");
+  const pickle = new PickleClient({ accessToken: "t", fetch });
+  await pickle.getScreen("sample-screen", new URLSearchParams([
+    ["tag", "first"], ["q", "two words"], ["tag", "second"],
+  ]));
+  expect(calls[0]?.url).toBe(`${pickle.baseUrl}/api/screens/sample-screen?tag=first&q=two%20words&tag=second`);
+});
+
 test("token claims are read as UTF-8", () => {
   const claims = { sub: "피클", sid: "s", iat: 1, exp: 2, sexp: 3 };
   const bytes = new TextEncoder().encode(JSON.stringify(claims));

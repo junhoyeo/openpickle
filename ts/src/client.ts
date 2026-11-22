@@ -116,7 +116,8 @@ export type PickleClientOptions = Credentials & {
 };
 
 export interface RequestOptions {
-  query?: Record<string, string | number | undefined>;
+  /** Pass URLSearchParams to preserve duplicate query keys and their order. */
+  query?: Record<string, string | number | undefined> | URLSearchParams;
   /** Serialized as JSON. */
   body?: unknown;
   headers?: Record<string, string>;
@@ -696,7 +697,8 @@ export class PickleClient {
  * else is percent-encoded.
  */
 function queryString(query: RequestOptions["query"]): string {
-  return Object.entries(query ?? {})
+  const pairs = query instanceof URLSearchParams ? [...query] : Object.entries(query ?? {});
+  return pairs
     .filter((entry): entry is [string, string | number] => entry[1] !== undefined)
     .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value).replace(/%2C/g, ",")}`)
     .join("&");
