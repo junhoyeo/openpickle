@@ -3,8 +3,8 @@
 
 use crate::phone::CallSummary;
 use crate::profile::ProfileData;
-use openpickle_api::{HandoffItem, HandoffScreen, PhoneCallTranscript};
-use std::path::PathBuf;
+use openpickle_api::{HandoffItem, HandoffScreen, PhoneCallTranscript, ReplyTo};
+use std::{path::PathBuf, sync::Arc};
 
 use crate::model::{Attachment, Explore, Message, RoomInfo, SearchResult, Social};
 
@@ -42,6 +42,7 @@ pub enum Command {
         id: String,
         text: String,
         offer: Option<String>,
+        reply_to: Option<Arc<ReplyTo>>,
     },
     /// Read the friends and the invite link: what was cached first, then the server's answer.
     LoadSocial,

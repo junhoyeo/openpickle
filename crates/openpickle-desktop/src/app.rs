@@ -4,6 +4,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -13,6 +14,7 @@ use gpui::{
     AnyView, Context, Entity, Focusable, FontWeight, ImageSource, PromptButton, PromptLevel,
     SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
+use openpickle_api::ReplyTo;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
@@ -422,7 +424,9 @@ impl Shell {
                 {
                     match action {
                         PrimaryAction::Search => self.open_search(window, cx),
-                        PrimaryAction::Ask { text, offer } => self.send(&text, Some(offer), cx),
+                        PrimaryAction::Ask { text, offer } => {
+                            self.send(&text, Some(offer), None, cx)
+                        }
                     }
                 }
             }
@@ -871,7 +875,7 @@ impl Shell {
         let chat = cx.new(|cx| ChatView::new(pictures, cx));
         self._screen_events = Some(
             cx.subscribe_in(&chat, window, |this, _, event, window, cx| match event {
-                ChatEvent::Send(text) => this.send(text, None, cx),
+                ChatEvent::Send { text, reply_to } => this.send(text, None, reply_to.clone(), cx),
                 ChatEvent::Search => this.open_search(window, cx),
                 ChatEvent::Menu => this.open_drawer(window, cx),
                 ChatEvent::Invite => this.open_invite(window, cx),
@@ -926,7 +930,7 @@ impl Shell {
                                     this.open_room("", window, cx);
                                 } else {
                                     this.open_tab(Tab::Chat, window, cx);
-                                    this.send(text, Some(offer.clone()), cx);
+                                    this.send(text, Some(offer.clone()), None, cx);
                                 }
                             }
                             ExploreEvent::Shown(offers) => {
@@ -1561,7 +1565,13 @@ impl Shell {
     /// Shows the message at once and hands it to the backend, which may be busy for a while:
     /// connecting, or catching up after a long sleep. `offer` is the Explore offer the
     /// message asks for.
-    fn send(&mut self, text: &str, offer: Option<String>, cx: &mut Context<Self>) {
+    fn send(
+        &mut self,
+        text: &str,
+        offer: Option<String>,
+        reply_to: Option<Arc<ReplyTo>>,
+        cx: &mut Context<Self>,
+    ) {
         if !self.can_send || self.opening_room.is_some() {
             self.notice = Some("This conversation is read-only or still opening.".into());
             cx.notify();
@@ -1572,7 +1582,8 @@ impl Shell {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0., |elapsed| elapsed.as_secs_f64());
-        let message = convert::outgoing(id.clone(), text, UNCONFIRMED_SEQ + self.sent, now);
+        let mut message = convert::outgoing(id.clone(), text, UNCONFIRMED_SEQ + self.sent, now);
+        message.decorations.quote = reply_to.as_deref().map(convert::quoted_reply).map(Arc::new);
         let first_changed = upsert(&mut self.messages, &mut self.message_seqs, message);
         if let Some(offer) = &offer {
             self.offers_asked.insert(id.clone(), offer.clone());
@@ -1582,6 +1593,7 @@ impl Shell {
             id: id.clone(),
             text: text.to_owned(),
             offer,
+            reply_to,
         };
         if self.commands.send(command).is_err() {
             let _ = mark_not_sent(&mut self.messages, &id, "Not sent. OpenPickle has stopped.");
@@ -1836,6 +1848,7 @@ mod tests {
             at: seq as f64,
             side: Side::Mine,
             parts: vec![],
+            reply_role: None,
             decorations: Default::default(),
         }
     }
@@ -2340,6 +2353,20 @@ mod tests {
     }
 
     #[test]
+    fn the_confirmed_message_does_not_inherit_a_quote_the_server_omitted() {
+        let mut pending = convert::outgoing("m".into(), "body", u64::MAX, 1.);
+        pending.decorations.quote = Some(Arc::new(crate::model::Quote {
+            author: Some("Pickle"),
+            snippet: "Earlier words".into(),
+        }));
+        let mut messages = vec![pending];
+        let mut seqs = HashMap::from([("m".into(), u64::MAX)]);
+        let confirmed = convert::outgoing("m".into(), "body", 1, 1.);
+        upsert(&mut messages, &mut seqs, confirmed);
+        assert!(messages[0].decorations.quote.is_none());
+    }
+
+    #[test]
     fn a_decoration_only_upsert_keeps_selectable_content_identity() {
         use crate::model::build_rows;
 
@@ -2380,7 +2407,7 @@ mod tests {
             .unwrap();
         let (shell, cx) =
             cx.add_window_view(|window, cx| Shell::new(commands, received, window, cx));
-        shell.update(cx, |shell, cx| shell.send("pending", None, cx));
+        shell.update(cx, |shell, cx| shell.send("pending", None, None, cx));
         let id = std::iter::from_fn(|| sent.try_recv().ok())
             .find_map(|command| match command {
                 Command::Send { id, .. } => Some(id),

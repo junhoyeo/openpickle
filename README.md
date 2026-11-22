@@ -55,8 +55,11 @@ servers the iOS app does, with your own account.
   <img src="docs/screenshots/sign-in.png" alt="Sign-in with a phone number" height="380" />
 </p>
 
-The current source displays quoted replies and reactions already present in received messages.
-It does not send reactions or request-card answers, upload or share files, generate website
+Right-click a confirmed text bubble and choose **Reply** to attach a quote to your next
+message. Clear it with the × in the composer or Escape. Mixed-content messages do not offer
+Reply because their part numbering is not established. Outbound reply compatibility is
+inferred from saved history and has not been verified against the live service. The app also displays reactions in
+received messages. It does not send reactions or request-card answers, upload or share files, generate website
 previews, or manage friends, tickets, or account settings. Direct microphone chat is not
 implemented. See the [desktop README](crates/openpickle-desktop/README.md) for details.
 The published v1.0.0 downloads predate the newer source changes.

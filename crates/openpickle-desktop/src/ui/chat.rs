@@ -2,6 +2,7 @@
 
 use std::{
     ops::Range,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -12,9 +13,10 @@ use gpui::{
     SharedString, Subscription, Task, Window, anchored, deferred, div, list, point, prelude::*, px,
 };
 
-use openpickle_api::PhoneCallTranscript;
+use openpickle_api::{PhoneCallTranscript, ReplyTo};
 
 use crate::{
+    convert::quoted_reply,
     model::{AttachmentKind, Message, Part, Row, RowKind, append_message_rows},
     protocol::HandoffCard,
     theme,
@@ -38,7 +40,10 @@ const DRAG_SCROLL_MAX: Pixels = px(2400.);
 
 pub enum ChatEvent {
     /// The user sent this text.
-    Send(String),
+    Send {
+        text: String,
+        reply_to: Option<Arc<ReplyTo>>,
+    },
     /// The user asked for the search screen.
     Search,
     /// The header's menu button was pressed.
@@ -66,6 +71,7 @@ pub struct ChatView {
     rows: Vec<Row>,
     list: ListState,
     input: Entity<TextInput>,
+    reply_to: Option<Arc<ReplyTo>>,
     can_send: bool,
     room_focus: FocusHandle,
     requested_pictures: std::collections::HashSet<String>,
@@ -95,6 +101,7 @@ struct ContextMenu {
     at: Point<Pixels>,
     /// The text of the message that was clicked, as it was then.
     message: Option<String>,
+    reply_target: Option<Arc<ReplyTo>>,
 }
 
 fn card_running(card: &HandoffCard) -> bool {
@@ -139,6 +146,7 @@ impl ChatView {
             rows: Vec::new(),
             list,
             input,
+            reply_to: None,
             can_send: true,
             room_focus: cx.focus_handle(),
             requested_pictures: std::collections::HashSet::new(),
@@ -180,6 +188,7 @@ impl ChatView {
     /// A room switch must not carry selections, scroll positions or a different room's draft.
     pub fn switch_room(&mut self, can_send: bool, draft: &str, cx: &mut Context<Self>) {
         self.can_send = can_send;
+        self.reply_to = None;
         self.input.update(cx, |input, cx| input.set_text(draft, cx));
         self.selection.borrow_mut().clear();
         self.selection.borrow_mut().release();
@@ -423,7 +432,7 @@ impl ChatView {
 
     /// Escape closes the menu of a right click, or else drops the selection.
     fn cancel(&mut self, cx: &mut Context<Self>) {
-        if self.menu.take().is_none() {
+        if self.menu.take().is_none() && self.reply_to.take().is_none() {
             self.selection.borrow_mut().clear();
         }
         cx.notify();
@@ -436,7 +445,10 @@ impl ChatView {
         let text = input.update(cx, |input, cx| input.take(cx));
         if !text.trim().is_empty() {
             self.scroll_to_latest(cx);
-            cx.emit(ChatEvent::Send(text.trim().to_owned()));
+            cx.emit(ChatEvent::Send {
+                text: text.trim().to_owned(),
+                reply_to: self.reply_to.take(),
+            });
         }
     }
 
@@ -455,15 +467,25 @@ impl ChatView {
     /// The right button went down in the conversation.
     fn open_menu(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let row = self.selection.borrow_mut().take_context_row();
+        let row = row.and_then(|index| self.rows.get(index));
         let message = row
-            .and_then(|row| self.rows.get(row))
             .map(|row| row.texts().join("\n"))
             .filter(|text| !text.is_empty());
         self.menu = Some(ContextMenu {
             at: event.position,
             message,
+            reply_target: row.and_then(|row| row.decorations.reply_target.clone()),
         });
         cx.notify();
+    }
+
+    fn prepare_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.can_send
+            && let Some(reply) = self.menu.as_ref().and_then(|m| m.reply_target.clone())
+        {
+            self.reply_to = Some(reply);
+            window.focus(&self.input.focus_handle(cx));
+        }
     }
 
     fn copy_selection(&mut self, cx: &mut Context<Self>) {
@@ -522,7 +544,7 @@ impl ChatView {
 
     /// Scrolls the list by a distance in pixels, down when it is positive.
     fn scroll_by(&mut self, distance: Pixels) {
-        let (above, below) = list_padding();
+        let (above, below) = list_padding(self.visible_reply().is_some());
         // While the list follows the newest row it reports a place past its end, so the
         // place is brought back to the end before the distance is added.
         let end = self.list.max_offset_for_scrollbar().height + above + below;
@@ -533,9 +555,10 @@ impl ChatView {
     }
 
     fn context_menu(&self, menu: &ContextMenu, cx: &mut Context<Self>) -> impl IntoElement {
-        let item = |label: &'static str, action: fn(&mut Self, &mut Context<Self>)| {
+        let item = |label: &'static str, action: fn(&mut Self, &mut Window, &mut Context<Self>)| {
             div()
                 .id(label)
+                .debug_selector(|| format!("chat-menu-{label}"))
                 .h(px(30.))
                 .px(px(11.))
                 .flex()
@@ -543,8 +566,8 @@ impl ChatView {
                 .rounded(px(7.))
                 .hover(|item| item.bg(theme::color(theme::CHROME_SELECTED)))
                 .child(label)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    action(this, cx);
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    action(this, window, cx);
                     this.menu = None;
                     cx.notify();
                 }))
@@ -567,13 +590,16 @@ impl ChatView {
                 cx.notify();
             }))
             .when(has_selection, |menu| {
-                menu.child(item("Copy", Self::copy_selection))
+                menu.child(item("Copy", |this, _, cx| this.copy_selection(cx)))
             })
             .when(menu.message.is_some(), |menu| {
-                menu.child(item("Copy Message", Self::copy_message))
+                menu.child(item("Copy Message", |this, _, cx| this.copy_message(cx)))
+            })
+            .when(self.can_send && menu.reply_target.is_some(), |menu| {
+                menu.child(item("Reply", Self::prepare_reply))
             })
             .when(!self.rows.is_empty(), |menu| {
-                menu.child(item("Select All", Self::select_everything))
+                menu.child(item("Select All", |this, _, cx| this.select_everything(cx)))
             });
         deferred(
             anchored()
@@ -590,6 +616,64 @@ impl ChatView {
         self.list.reset(self.rows.len());
         self.at_latest = true;
         cx.notify();
+    }
+
+    fn visible_reply(&self) -> Option<&ReplyTo> {
+        self.reply_to.as_deref().filter(|_| self.can_send)
+    }
+
+    fn reply_strip(&self, reply: &ReplyTo, cx: &mut Context<Self>) -> impl IntoElement {
+        let quote = quoted_reply(reply);
+        let label = if reply.role == "user" {
+            "Replying to you".into()
+        } else {
+            format!("Replying to {}", self.name)
+        };
+        chrome("composer-reply")
+            .w_full()
+            .h(REPLY_STRIP_HEIGHT)
+            .rounded(px(12.))
+            .px(px(12.))
+            .gap(px(8.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .text_size(px(12.))
+                    .line_height(px(16.))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_color(theme::color(theme::LINK))
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_color(theme::color(theme::TEXT_MUTED))
+                            .child(quote.snippet),
+                    ),
+            )
+            .child(
+                div()
+                    .id("cancel-reply")
+                    .size(px(28.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .cursor_pointer()
+                    .hover(|button| button.bg(theme::color(theme::CHROME_SELECTED)))
+                    .child(icon("x", 15., theme::TEXT_MUTED))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.reply_to = None;
+                        window.focus(&this.input.focus_handle(cx));
+                        cx.notify();
+                    })),
+            )
     }
 
     fn bottom_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -670,6 +754,12 @@ impl ChatView {
                     .items_center()
                     .gap(px(10.))
                     .pb(px(21.))
+                    .children(self.visible_reply().map(|reply| {
+                        div()
+                            .w_full()
+                            .px(px(24.))
+                            .child(self.reply_strip(reply, cx))
+                    }))
                     .child(div().w_full().px(px(24.)).child(composer))
                     .child(
                         div()
@@ -685,8 +775,18 @@ impl ChatView {
 
 /// The room the list leaves above its first row and below its last, for the header and the
 /// bottom bar.
-fn list_padding() -> (Pixels, Pixels) {
-    (theme::HEADER_HEIGHT, theme::BOTTOM_BAR_HEIGHT + px(16.))
+const REPLY_STRIP_HEIGHT: Pixels = px(46.);
+
+fn list_padding(reply: bool) -> (Pixels, Pixels) {
+    let extra = if reply {
+        REPLY_STRIP_HEIGHT + px(10.)
+    } else {
+        px(0.)
+    };
+    (
+        theme::HEADER_HEIGHT,
+        theme::BOTTOM_BAR_HEIGHT + px(16.) + extra,
+    )
 }
 
 impl Focusable for ChatView {
@@ -708,6 +808,7 @@ impl Render for ChatView {
                 .update(cx, |_, cx| cx.emit(ChatEvent::Link(target.to_owned())))
                 .ok();
         });
+        let (top_padding, bottom_padding) = list_padding(self.visible_reply().is_some());
         let messages = list(
             self.list.clone(),
             cx.processor(move |this, index: usize, window: &mut Window, cx| {
@@ -735,12 +836,12 @@ impl Render for ChatView {
             }),
         )
         .size_full()
-        .pt(list_padding().0)
-        .pb(list_padding().1);
+        .pt(top_padding)
+        .pb(bottom_padding);
 
         let to_latest = div()
             .absolute()
-            .bottom(theme::BOTTOM_BAR_HEIGHT + px(9.))
+            .bottom(bottom_padding - px(7.))
             .left_0()
             .right_0()
             .flex()
@@ -1254,6 +1355,78 @@ mod tests {
     }
 
     #[gpui::test]
+    fn reply_menu_keeps_custom_draft_and_sends_the_selected_bubble(cx: &mut TestAppContext) {
+        use std::{cell::RefCell, rc::Rc};
+        let (view, cx) = open(cx, &[]);
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|_, cx| {
+            let sent = sent.clone();
+            cx.subscribe(&view, move |_, event, _| {
+                if let ChatEvent::Send { text, reply_to } = event {
+                    sent.borrow_mut().push((text.clone(), reply_to.clone()));
+                }
+            })
+            .detach();
+        });
+        let item = serde_json::from_value(serde_json::json!({
+            "id": "sample", "role": "assistant", "seq": 10, "at": 1.,
+            "text": "<bubble>First</bubble><bubble>Second</bubble>"
+        }))
+        .unwrap();
+        let message = crate::convert::message(&item, None);
+        let (rows, starts) = crate::model::build_rows(&[message], None, Local::now());
+        view.update(cx, |view, cx| view.set_rows(rows, cx));
+        let select_reply = |cx: &mut gpui::VisualTestContext| {
+            view.update_in(cx, |view, window, cx| {
+                view.selection.borrow_mut().set_context_row(starts[0] + 1);
+                view.open_menu(
+                    &MouseDownEvent {
+                        button: MouseButton::Right,
+                        position: point(px(60.), HEIGHT / 2.),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+            let bounds = cx
+                .debug_bounds("chat-menu-Reply")
+                .expect("Reply action is visible");
+            cx.simulate_click(bounds.center(), Modifiers::none());
+        };
+        select_reply(cx);
+        cx.simulate_keystrokes("enter");
+        assert!(sent.borrow().is_empty());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.visible_reply().unwrap().part, 1)
+        });
+        cx.simulate_input("synthetic followup");
+        cx.simulate_keystrokes("enter");
+        let events = sent.borrow();
+        let (text, reply) = &events[0];
+        assert_eq!(text, "synthetic followup");
+        let reply = reply.as_ref().unwrap();
+        assert_eq!(
+            (reply.target_id.as_str(), reply.part, reply.text.as_str()),
+            ("sample", 1, "Second")
+        );
+        drop(events);
+        view.read_with(cx, |view, _| assert!(view.visible_reply().is_none()));
+
+        select_reply(cx);
+        cx.simulate_input("preserve me");
+        cx.simulate_keystrokes("escape");
+        view.read_with(cx, |view, cx| {
+            assert!(view.visible_reply().is_none());
+            assert_eq!(view.draft(cx), "preserve me");
+        });
+        select_reply(cx);
+        view.update(cx, |view, cx| view.switch_room(true, "other draft", cx));
+        view.read_with(cx, |view, _| assert!(view.visible_reply().is_none()));
+    }
+
+    #[gpui::test]
     fn an_observer_composer_does_not_send_or_consume_its_draft(cx: &mut TestAppContext) {
         use std::{cell::Cell, rc::Rc};
         let (view, cx) = open(cx, &[]);
@@ -1261,7 +1434,7 @@ mod tests {
         cx.update(|_, cx| {
             let sent = sent.clone();
             cx.subscribe(&view, move |_, event, _| {
-                if matches!(event, ChatEvent::Send(_)) {
+                if matches!(event, ChatEvent::Send { .. }) {
                     sent.set(true);
                 }
             })
