@@ -509,13 +509,11 @@ impl ChatView {
     /// While a selection is dragged past the top or bottom of what the conversation shows,
     /// scrolls it that way, so a drag can reach text that is off screen.
     fn follow_drag(&mut self, window: &mut Window) {
-        let pointer = window.mouse_position().y;
-        let bottom = window.viewport_size().height - theme::BOTTOM_BAR_HEIGHT;
-        let past = if pointer < HEADER_SOLID {
-            pointer - HEADER_SOLID
-        } else {
-            (pointer - bottom).max(px(0.))
-        };
+        let past = drag_past_edge(
+            window.mouse_position().y,
+            window.viewport_size().height,
+            self.visible_reply().is_some(),
+        );
         let scrolling = {
             let mut selection = self.selection.borrow_mut();
             if !window.is_window_active() {
@@ -752,7 +750,7 @@ impl ChatView {
                     .flex()
                     .flex_col()
                     .items_center()
-                    .gap(px(10.))
+                    .gap(BOTTOM_BAR_GAP)
                     .pb(px(21.))
                     .children(self.visible_reply().map(|reply| {
                         div()
@@ -773,20 +771,29 @@ impl ChatView {
     }
 }
 
-/// The room the list leaves above its first row and below its last, for the header and the
-/// bottom bar.
 const REPLY_STRIP_HEIGHT: Pixels = px(46.);
+const BOTTOM_BAR_GAP: Pixels = px(10.);
 
+fn bottom_bar_height(reply: bool) -> Pixels {
+    theme::BOTTOM_BAR_HEIGHT
+        + if reply {
+            REPLY_STRIP_HEIGHT + BOTTOM_BAR_GAP
+        } else {
+            px(0.)
+        }
+}
+
+/// Leave a visual gap between the final row and the composer, not a drag dead zone.
 fn list_padding(reply: bool) -> (Pixels, Pixels) {
-    let extra = if reply {
-        REPLY_STRIP_HEIGHT + px(10.)
+    (theme::HEADER_HEIGHT, bottom_bar_height(reply) + px(16.))
+}
+
+fn drag_past_edge(pointer: Pixels, height: Pixels, reply: bool) -> Pixels {
+    if pointer < HEADER_SOLID {
+        pointer - HEADER_SOLID
     } else {
-        px(0.)
-    };
-    (
-        theme::HEADER_HEIGHT,
-        theme::BOTTOM_BAR_HEIGHT + px(16.) + extra,
-    )
+        (pointer - (height - bottom_bar_height(reply))).max(px(0.))
+    }
 }
 
 impl Focusable for ChatView {
@@ -1352,6 +1359,16 @@ mod tests {
             events.borrow().last().map(String::as_str),
             Some("open handoff:handoffs/sample-task")
         );
+    }
+
+    #[test]
+    fn dragging_into_the_reply_strip_crosses_the_scroll_edge() {
+        let pointer = HEIGHT - theme::BOTTOM_BAR_HEIGHT - REPLY_STRIP_HEIGHT / 2.;
+        assert_eq!(drag_past_edge(pointer, HEIGHT, false), px(0.));
+        assert!(drag_past_edge(pointer, HEIGHT, true) > px(0.));
+
+        let just_above = HEIGHT - bottom_bar_height(true) - px(1.);
+        assert_eq!(drag_past_edge(just_above, HEIGHT, true), px(0.));
     }
 
     #[gpui::test]
