@@ -1,3 +1,5 @@
+![OpenPickle cover](.github/assets/cover.png)
+
 <h1 align="center">openpickle</h1>
 
 <p align="center">
