@@ -5,6 +5,7 @@ pub mod asweb;
 pub mod backend;
 pub mod content;
 pub mod convert;
+pub(crate) mod dock_icon;
 pub mod model;
 pub mod phone;
 pub mod profile;
