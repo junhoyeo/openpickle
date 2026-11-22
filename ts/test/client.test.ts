@@ -466,7 +466,7 @@ test("getHandoff supplies empty arrays for omitted lists only", async () => {
   });
 
   expect(await pickle.getHandoff("omitted")).toEqual({ ...base, plan_blocks: [], log_entries: [], log_nodes: [] });
-  expect(await pickle.getHandoff("partial")).toEqual({ ...partial, log_nodes: [] });
+  expect<unknown>(await pickle.getHandoff("partial")).toEqual({ ...partial, log_nodes: [] });
 });
 
 test("getPhoneCall reads live, ending, and completed transcript shapes and encodes the id as one segment", async () => {
