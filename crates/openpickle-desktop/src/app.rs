@@ -436,6 +436,9 @@ impl Shell {
                 if room_id == self.room_id {
                     self.is_character = is_character;
                     self.can_send = can_send;
+                    if is_character {
+                        crate::dock_icon::apply(avatar.as_deref());
+                    }
                     let avatar = avatar.map(ImageSource::from);
                     self.room_header = Identity {
                         name: name.clone().into(),
@@ -459,6 +462,7 @@ impl Shell {
                 }
             }
             Update::Identity { name, avatar } => {
+                crate::dock_icon::apply(avatar.as_deref());
                 self.set_identity(name, avatar.map(ImageSource::from), cx);
             }
             Update::Upsert { room_id, messages } => {
@@ -718,6 +722,7 @@ impl Shell {
 
     /// Drops every local projection of the signed-in account before another one can open.
     fn forget_account(&mut self, cx: &mut Context<Self>) {
+        crate::dock_icon::apply(None);
         self.tab = Tab::Chat;
         self.explore = None;
         self.friends = None;
