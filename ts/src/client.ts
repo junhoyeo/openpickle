@@ -23,6 +23,7 @@ import type {
   PhoneCodeRequested,
   Profile,
   RegisterResponse,
+  ReplyTo,
   SecureAccount,
   SendMessageResponse,
   SessionRequest,
@@ -326,17 +327,26 @@ export class PickleClient {
    * `POST /api/rooms/{room}/messages`. The reply arrives on `events()`: `chat` events carry
    * `client_msg_id` as the message `id` and as the `target_id` of reactions to it. The app sends
    * `context` when the message comes from an Explore offer, with the offer's `cta_label` as text.
+   * `replyTo` sends a `reply_to` field inferred from stored history, not a captured send.
    */
   async sendMessage(
     roomId: string,
     text: string,
-    options: { clientMsgId?: string; inCall?: boolean; context?: MessageContext } = {},
+    options: { clientMsgId?: string; inCall?: boolean; context?: MessageContext; replyTo?: ReplyTo } = {},
   ): Promise<SendMessageResponse & { client_msg_id: string }> {
     const clientMsgId = options.clientMsgId ?? crypto.randomUUID();
     const response = await this.request<SendMessageResponse>(
       "POST",
       `/api/rooms/${encodeURIComponent(roomId)}/messages`,
-      { body: { text, client_msg_id: clientMsgId, in_call: options.inCall ?? false, context: options.context } },
+      {
+        body: {
+          text,
+          client_msg_id: clientMsgId,
+          in_call: options.inCall ?? false,
+          context: options.context,
+          reply_to: options.replyTo ?? undefined,
+        },
+      },
     );
     return { ...response, client_msg_id: clientMsgId };
   }

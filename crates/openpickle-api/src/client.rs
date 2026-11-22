@@ -236,6 +236,8 @@ pub struct SendMessageOptions {
     /// What the message is about, when it is sent from something on screen: an offer on the
     /// Explore tab ([`MessageContext::offer`]).
     pub context: Option<MessageContext>,
+    /// The quoted message part. The outbound `reply_to` field is inferred from stored history.
+    pub reply_to: Option<ReplyTo>,
 }
 
 /// Options of [`PickleClient::end_phone_call`].
@@ -683,6 +685,9 @@ impl PickleClient {
             json!({ "text": text, "client_msg_id": client_msg_id, "in_call": options.in_call });
         if let Some(context) = &options.context {
             body["context"] = serde_json::to_value(context).map_err(Error::Encode)?;
+        }
+        if let Some(reply_to) = &options.reply_to {
+            body["reply_to"] = serde_json::to_value(reply_to).map_err(Error::Encode)?;
         }
         let mut response: SendMessageResponse = self
             .request(Method::POST, &path, RequestOptions::default().json(&body)?)

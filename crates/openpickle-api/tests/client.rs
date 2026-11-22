@@ -9,7 +9,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use mock_server::{MockServer, Reply};
 use openpickle_api::{
     ClientOptions, Credentials, EndPhoneCallOptions, Error, LoginSession, Method, PickleClient,
-    RequestOptions, decode_access_token,
+    ReplyTo, RequestOptions, SendMessageOptions, decode_access_token,
 };
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
@@ -342,7 +342,7 @@ async fn an_offer_is_asked_for_with_its_text_and_its_id() {
         .report_offer_impressions(std::slice::from_ref(&offer.offer_id))
         .await
         .unwrap();
-    let options = openpickle_api::SendMessageOptions {
+    let options = SendMessageOptions {
         client_msg_id: Some("m1".into()),
         context: Some(openpickle_api::MessageContext::offer(&offer.offer_id)),
         ..Default::default()
@@ -365,6 +365,68 @@ async fn an_offer_is_asked_for_with_its_text_and_its_id() {
             "in_call": false,
             "context": { "kind": "offer", "id": "o1" },
         })
+    );
+}
+
+#[tokio::test]
+async fn send_message_only_includes_reply_to_when_set() {
+    let server =
+        MockServer::start(|_| Reply::json(200, r#"{"status":"ok","responder":"chat","seq":null}"#))
+            .await;
+    let pickle = client(&server, Credentials::AccessToken("synthetic-token".into()));
+
+    pickle
+        .send_message(
+            "room",
+            "Hello",
+            SendMessageOptions {
+                client_msg_id: Some("m1".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    pickle
+        .send_message(
+            "room",
+            "That works",
+            SendMessageOptions {
+                client_msg_id: Some("m2".into()),
+                reply_to: Some(ReplyTo {
+                    target_id: "example-target".into(),
+                    part: 1,
+                    text: "See you tomorrow".into(),
+                    role: "assistant".into(),
+                    kind: None,
+                    path: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let sent: Vec<serde_json::Value> = server
+        .take()
+        .iter()
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            serde_json::json!({ "text": "Hello", "client_msg_id": "m1", "in_call": false }),
+            serde_json::json!({
+                "text": "That works",
+                "client_msg_id": "m2",
+                "in_call": false,
+                "reply_to": {
+                    "target_id": "example-target",
+                    "part": 1,
+                    "text": "See you tomorrow",
+                    "role": "assistant",
+                },
+            }),
+        ]
     );
 }
 

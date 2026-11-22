@@ -362,14 +362,19 @@ test("reportOfferImpressions sends the shown offer ids", async () => {
   expect(calls[0]!.init.body).toBe('{"offer_ids":["offer-1","offer-2"]}');
 });
 
-test("sendMessage sends a context only when given one", async () => {
+test("sendMessage sends context and reply_to only when provided", async () => {
   const { calls, fetch } = recorder(200, '{"status":"ok","responder":"chat","seq":null}');
   const pickle = new PickleClient({ accessToken: "t", fetch });
   await pickle.sendMessage("room-1", "hi", { clientMsgId: "m1" });
   await pickle.sendMessage("room-1", offer.cta_label, { clientMsgId: "m2", context: { id: offer.offer_id, kind: "offer" } });
+  await pickle.sendMessage("room-1", "That works", {
+    clientMsgId: "m3",
+    replyTo: { target_id: "example-target", part: 1, text: "See you tomorrow", role: "assistant" },
+  });
   expect(calls.map((call) => call.init.body)).toEqual([
     '{"text":"hi","client_msg_id":"m1","in_call":false}',
     '{"text":"Find refunds I am owed","client_msg_id":"m2","in_call":false,"context":{"id":"offer-1","kind":"offer"}}',
+    '{"text":"That works","client_msg_id":"m3","in_call":false,"reply_to":{"target_id":"example-target","part":1,"text":"See you tomorrow","role":"assistant"}}',
   ]);
 });
 

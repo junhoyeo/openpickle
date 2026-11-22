@@ -109,7 +109,7 @@ All of these were in the captures. `scripts/verify-capture.ts` checks each one a
 | GET | `/api/rooms/{room}/history/page?limit=&before_seq=` | `getHistoryPage(room, { beforeSeq, limit })` | Up to 250 messages before a sequence number, with reactions and card states. See [History pages and attachments](#history-pages-and-attachments). |
 | GET | `/api/attachments/{path}/thumbnail` | `getAttachmentThumbnail(path)` | A JPEG preview of a photo or PDF in a message. Returns `{ bytes, contentType }`. |
 | GET | `/api/attachments/{path}` | `getAttachment(path)` | The attachment itself, the original file. Returns `{ bytes, contentType }`. |
-| POST | `/api/rooms/{room}/messages` | `sendMessage(room, text, { clientMsgId?, inCall?, context? })` | Returns `{ status, responder, seq: null }`. The reply arrives on `events()`. `context` marks a message sent from an [Explore](#explore) offer. |
+| POST | `/api/rooms/{room}/messages` | `sendMessage(room, text, { clientMsgId?, inCall?, context?, replyTo? })` | Returns `{ status, responder, seq: null }`. The reply arrives on `events()`. `context` marks a message sent from an [Explore](#explore) offer. `replyTo` sends a top-level `reply_to` using the stored history shape; the outbound format is inferred, not captured. |
 | PUT | `/api/rooms/{room}/read` | `markRead(room, seq)` | Moves this device's read cursor. |
 | GET | `/api/phone-calls/{call_id}` | `getPhoneCall(callId)` | Current call state and transcript. The id is encoded as one path segment. |
 | POST | `/api/actions` | `endPhoneCall(callId, { actionId?, inCall? })` | Sends only the captured `end_phone_call` action. Reuse `actionId` for a retry. |

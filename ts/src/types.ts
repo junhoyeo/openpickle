@@ -344,6 +344,16 @@ export interface ProfileCard {
   character_avatar_url: string;
 }
 
+/** A quoted message part. */
+export interface ReplyTo {
+  target_id: string;
+  part: number;
+  text: string;
+  role: string;
+  kind?: string;
+  path?: string;
+}
+
 /** A stored room message. Optional fields appear only on some messages. */
 export interface HistoryItem {
   role: Open<"user" | "assistant" | "agent_request" | "subagent">;
@@ -370,7 +380,7 @@ export interface HistoryItem {
   };
   state?: Open<"pending">;
   context?: { kind: Open<"offer" | "button">; id: string; quote?: string; button_index?: number };
-  reply_to?: { target_id: string; part: number; text: string; role: string; kind?: string; path?: string } | null;
+  reply_to?: ReplyTo | null;
   path?: string;
   title?: string;
   /** Attachment paths (`attachments/<date>/<file>`). */

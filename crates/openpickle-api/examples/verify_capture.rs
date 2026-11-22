@@ -20,7 +20,7 @@ use futures_util::StreamExt as _;
 use mock_server::{MockServer, Recorded, Reply};
 use openpickle_api::{
     ClientOptions, ClientProfile, Credentials, EndPhoneCallOptions, Error, LogStoreListingsRequest,
-    MessageContext, PermissionSnapshot, PickleClient, PickleEvent, SendMessageOptions,
+    MessageContext, PermissionSnapshot, PickleClient, PickleEvent, ReplyTo, SendMessageOptions,
     SessionRequest,
 };
 use serde_json::Value;
@@ -306,6 +306,7 @@ async fn call(client: &PickleClient, flow: &Flow, json: &Value) -> Option<Result
                 client_msg_id: Some(s("client_msg_id")),
                 in_call: json["in_call"].as_bool().unwrap_or_default(),
                 context: json.get("context").map(from::<MessageContext>),
+                reply_to: from::<Option<ReplyTo>>(&json["reply_to"]),
             };
             done(client.send_message(room, &s("text"), options).await)
         }
