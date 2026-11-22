@@ -459,7 +459,7 @@ impl MessageContext {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplyTo {
     pub target_id: String,
     pub part: i64,

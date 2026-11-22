@@ -3,6 +3,7 @@
 use std::{ops::Range, sync::Arc};
 
 use chrono::{DateTime, Local, TimeZone};
+use openpickle_api::ReplyTo;
 
 use crate::content::{Card, CardRow, RichText};
 
@@ -161,12 +162,35 @@ pub struct Message {
     pub at: f64,
     pub side: Side,
     pub parts: Vec<Part>,
+    /// Wire role for confirmed messages with unambiguous text bubble indices.
+    pub reply_role: Option<&'static str>,
     pub decorations: MessageDecorations,
 }
 
 impl Message {
+    pub(crate) fn reply_target(&self, index: usize) -> Option<ReplyTo> {
+        let role = self.reply_role?;
+        if self.seq == 0 || self.seq > UNCONFIRMED_SEQ || self.id.is_empty() {
+            return None;
+        }
+        let Part::Bubble(body) = self.parts.get(index)? else {
+            return None;
+        };
+        const REPLY_TEXT_LIMIT: usize = 500;
+        let text: String = body.text.chars().take(REPLY_TEXT_LIMIT).collect();
+        (!text.trim().is_empty()).then(|| ReplyTo {
+            target_id: self.id.clone(),
+            part: index as i64,
+            text,
+            role: role.to_owned(),
+            kind: None,
+            path: None,
+        })
+    }
+
     pub fn part_decorations(&self, index: usize) -> MessageDecorations {
         MessageDecorations {
+            reply_target: self.reply_target(index).map(Arc::new),
             quote: if index == 0 {
                 self.decorations.quote.clone()
             } else {
@@ -181,9 +205,10 @@ impl Message {
     }
 }
 
-/// Read-only context outside the selectable message body.
+/// Quote and reaction display, plus the reply target for a text row.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MessageDecorations {
+    pub(crate) reply_target: Option<Arc<ReplyTo>>,
     pub quote: Option<Arc<Quote>>,
     pub reactions: Option<Arc<[ReactionBadge]>>,
 }
@@ -455,6 +480,7 @@ mod tests {
             at,
             side,
             parts: vec![part; parts],
+            reply_role: None,
             decorations: Default::default(),
         }
     }

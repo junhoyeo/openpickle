@@ -367,6 +367,18 @@ pub(crate) fn message_with_reactions<'a>(
         _ => (Side::Theirs, bubbles(text, true)),
     };
     let mut parts = parts;
+    // Only offer replies when desktop rows map to the message's text bubble indices.
+    // Cards, files and other mixed-content messages have a different part layout.
+    let reply_role = match item.role.as_str() {
+        "user" if matches!(parts.as_slice(), [Part::Bubble(_)]) => Some("user"),
+        "assistant"
+            if !parts.is_empty() && parts.iter().all(|part| matches!(part, Part::Bubble(_))) =>
+        {
+            let tagged = text.matches("<bubble>").count();
+            (tagged == parts.len() || (tagged == 0 && parts.len() == 1)).then_some("assistant")
+        }
+        _ => None,
+    };
     // Only character-authored Markdown is normalized. Literal links in user messages stay as
     // typed; the message's own maps are the sole authority for attachment aliases.
     if item.role != "user" {
@@ -414,6 +426,15 @@ pub(crate) fn message_with_reactions<'a>(
     }
     // Pictures and files the message carries, as the app shows them.
     let carried = attachments(item);
+    // `parts` contains offsets; a reply's `part` is the ordinal into that list.
+    // If the server's part count differs from how we split the text, do not guess.
+    let reply_role = reply_role.filter(|_| {
+        carried.is_empty()
+            && item
+                .parts
+                .as_ref()
+                .is_none_or(|offsets| offsets.len() == parts.len())
+    });
     if !carried.is_empty() {
         parts.push(Part::Files(Arc::new(Files { items: carried })));
     }
@@ -423,7 +444,9 @@ pub(crate) fn message_with_reactions<'a>(
         at: item.at,
         side,
         parts,
+        reply_role,
         decorations: MessageDecorations {
+            reply_target: None,
             quote: item
                 .reply_to
                 .as_ref()
@@ -433,7 +456,7 @@ pub(crate) fn message_with_reactions<'a>(
     }
 }
 
-fn quoted_reply(reply: &ReplyTo) -> Quote {
+pub(crate) fn quoted_reply(reply: &ReplyTo) -> Quote {
     const SNIPPET_GRAPHEMES: usize = 120;
     let author = match reply.role.as_str() {
         "user" => Some("User"),
@@ -648,6 +671,7 @@ pub fn outgoing(id: String, text: &str, seq: u64, at: f64) -> Message {
         at,
         side: Side::Mine,
         parts: bubbles(text, false),
+        reply_role: None,
         decorations: Default::default(),
     }
 }
@@ -934,6 +958,33 @@ mod tests {
             "id": "call:7", "kind": "call", "label": "Call", "date_label": "Nov 2", "segments": [],
         });
         assert_eq!(found(call).seq, None);
+    }
+
+    #[test]
+    fn replies_target_confirmed_text_bubbles_without_guessing_mixed_part_indices() {
+        let second = "한".repeat(510);
+        let source = item(serde_json::json!({
+            "id":"assistant-1", "role":"assistant", "seq":9, "at":1.0,
+            "parts":[0, 22], "text":format!("<bubble>First</bubble><bubble>{second}</bubble>")
+        }));
+        let message = message(&source, None);
+        assert!(message.reply_target(2).is_none());
+        let reply = message.reply_target(1).unwrap();
+        assert_eq!(reply.target_id, "assistant-1");
+        assert_eq!(reply.part, 1);
+        assert_eq!(reply.role, "assistant");
+        assert_eq!(reply.text, "한".repeat(500));
+
+        let mixed = item(serde_json::json!({
+            "id":"assistant-2", "role":"assistant", "seq":10, "at":1.0,
+            "text":"<bubble>Report</bubble>\n```card\n- **Example** value\n```"
+        }));
+        assert!(super::message(&mixed, None).reply_target(0).is_none());
+        assert!(
+            outgoing("pending".into(), "Unconfirmed", u64::MAX, 1.0)
+                .reply_target(0)
+                .is_none()
+        );
     }
 
     #[test]

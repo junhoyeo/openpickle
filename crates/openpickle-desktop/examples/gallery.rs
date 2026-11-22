@@ -577,6 +577,10 @@ fn message(seq: u64, minutes_ago: f64, side: Side, text: &str) -> Message {
         at: Local::now().timestamp() as f64 - minutes_ago * 60.,
         side,
         parts,
+        reply_role: match side {
+            Side::Mine => Some("user"),
+            Side::Theirs => Some("assistant"),
+        },
         decorations: Default::default(),
     }
 }
@@ -614,6 +618,7 @@ fn main() {
             options: vec![],
             status: RequestStatus::Expired,
         }))],
+        reply_role: None,
         decorations: Default::default(),
     });
     messages.push(message(5, 20., Side::Theirs, "<bubble>확인 시간이 지나서 그 자리는 다시 풀렸어요! 빈자리 알림은 계속 켜 둘게요.</bubble>"));

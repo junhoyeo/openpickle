@@ -19,7 +19,7 @@ use futures::{Stream, StreamExt, channel::mpsc::UnboundedSender as Updates};
 use openpickle_api::{
     ALL_SOCIAL_SCOPES, CardState, ClientOptions, Credentials, Error, ExploreSectionsScreen,
     HistoryItem, LoginSession, LoginSessionRefresh, MessageContext, PickleClient, PickleEvent,
-    Reaction, SendMessageOptions, SocialSnapshot,
+    Reaction, ReplyTo, SendMessageOptions, SocialSnapshot,
     events::{ChatEvent, RoomEvent},
 };
 use serde::{Deserialize, Serialize};
@@ -481,6 +481,8 @@ impl HistoryLog {
 struct Conversation {
     room_id: String,
     items: HashMap<String, HistoryItem>,
+    /// Live text announcements await attachment and part metadata from history.
+    announced_only: HashSet<String>,
     /// Sparse search neighbors are not logged and cannot advance either history cursor.
     search_context: HashSet<String>,
     card_states: HashMap<String, CardState>,
@@ -521,7 +523,12 @@ impl Conversation {
             .get(&item.id)
             .into_iter()
             .flat_map(HashMap::values);
-        convert::message_with_reactions(item, self.card_states.get(&item.id), reactions)
+        let mut message =
+            convert::message_with_reactions(item, self.card_states.get(&item.id), reactions);
+        if self.announced_only.contains(&item.id) {
+            message.reply_role = None;
+        }
+        message
     }
 
     /// Accepts a record once, whether it arrives from history or the live stream first.
@@ -587,6 +594,7 @@ impl Conversation {
         }
         for item in items {
             changed.push(item.id.clone());
+            self.announced_only.remove(&item.id);
             self.search_context.remove(&item.id);
             self.items.insert(item.id.clone(), item);
         }
@@ -626,6 +634,7 @@ impl Conversation {
                 }
             }
             None => {
+                self.announced_only.insert(id.clone());
                 self.items.insert(id.clone(), heard);
             }
         }
@@ -986,7 +995,7 @@ async fn conversation_loop(
                     return Ended::Closed;
                 }
                 Some(Command::SignOut) => return Ended::SignedOut,
-                Some(Command::Send { room_id, id, text, offer }) => {
+                Some(Command::Send { room_id, id, text, offer, reply_to }) => {
                     let sync_failure = if room_id == live.conversation.room_id
                         && (live.roster_rev.is_none() || live.roster_refresh.is_some())
                     {
@@ -1002,8 +1011,10 @@ async fn conversation_loop(
                         sync_failure
                     } else if let Some(reason) = live.send_block_reason(&room_id) {
                         Some(reason.to_owned())
+                    } else if let Some(reply) = &reply_to && !live.can_reply_to(reply) {
+                        Some("Not sent. The message you replied to changed or is no longer available.".to_owned())
                     } else {
-                        match live.send_message(&room_id, id.clone(), &text, offer).await {
+                        match live.send_message(&room_id, id.clone(), &text, offer, reply_to).await {
                             Ok(()) => None,
                             Err(error) if session_is_gone(&error) => return Ended::SignedOut,
                             Err(error) => Some(not_sent(&error)),
@@ -1668,6 +1679,20 @@ impl Live {
         }
     }
 
+    /// Recheck the selected part in the open room before sending. Never silently turn a reply
+    /// into an ordinary message after a room switch or an edit to the target.
+    fn can_reply_to(&self, reply: &ReplyTo) -> bool {
+        let Ok(index) = usize::try_from(reply.part) else {
+            return false;
+        };
+        self.conversation
+            .items
+            .get(&reply.target_id)
+            .and_then(|item| self.conversation.message(item).reply_target(index))
+            .as_ref()
+            == Some(reply)
+    }
+
     /// Sends a message the UI already shows. The server's copy, which carries the same id,
     /// replaces it when it arrives.
     async fn send_message(
@@ -1676,10 +1701,12 @@ impl Live {
         id: String,
         text: &str,
         offer: Option<String>,
+        reply_to: Option<Arc<ReplyTo>>,
     ) -> openpickle_api::Result<()> {
         let options = SendMessageOptions {
             client_msg_id: Some(id),
             context: offer.map(MessageContext::offer),
+            reply_to: reply_to.map(Arc::unwrap_or_clone),
             ..Default::default()
         };
         self.client
@@ -3649,6 +3676,37 @@ mod tests {
         }
         assert!(rejected);
         assert!(!conversation_emitted);
+    }
+
+    #[tokio::test]
+    async fn outgoing_reply_requires_the_same_text_part_in_the_open_room() {
+        let server = HistoryServer::start();
+        let (mut live, _) = fixture_live("reply-target", &server);
+        let target: HistoryItem = serde_json::from_value(serde_json::json!({
+            "role":"assistant", "id":"synthetic", "text":"<bubble>one</bubble><bubble>two</bubble>",
+            "seq":7, "at":1.0,
+        }))
+        .unwrap();
+        let reply = convert::message(&target, None).reply_target(1).unwrap();
+        assert!(!live.can_reply_to(&reply));
+        let live_only = live.conversation.hear(target.clone()).unwrap();
+        assert!(live_only.reply_target(1).is_none());
+        assert!(!live.can_reply_to(&reply));
+        let mut with_file = target.clone();
+        with_file.attachments = Some(vec!["attachments/sample/photo.jpg".into()]);
+        let mixed = live.conversation.apply(vec![with_file], vec![], vec![]);
+        assert!(mixed[0].reply_target(1).is_none());
+        assert!(!live.can_reply_to(&reply));
+        let hydrated = live.conversation.apply(vec![target], vec![], vec![]);
+        assert_eq!(hydrated[0].reply_target(1), Some(reply.clone()));
+        assert!(live.can_reply_to(&reply));
+        let stale = ReplyTo {
+            text: "outdated".into(),
+            ..reply.clone()
+        };
+        assert!(!live.can_reply_to(&stale));
+        live.conversation = Conversation::load(&live.store, "peer");
+        assert!(!live.can_reply_to(&reply));
     }
 
     #[tokio::test]
