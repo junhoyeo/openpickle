@@ -78,12 +78,36 @@ test("unknown frames do not interrupt the client event iterator", async () => {
   const events: PickleEvent[] = [];
   for await (const event of client.events()) events.push(event);
   expect(events).toEqual([
+    { event: "retry", delayMs: 1250 },
     { event: "unknown", name: "notice", data: raw },
     { event: "unknown", name: "chat", data: futureChat },
     { event: "unknown", name: "usage", data: futureUsage },
     { event: "unknown", name: "chat", data: malformedChat },
     { event: "chat", data: valid },
   ]);
+});
+
+test("events emits valid retry hints before payloads and does not reconnect", async () => {
+  const body =
+    "retry: -1\n\n" +
+    "retry: 1.5\n\n" +
+    "retry: 9007199254740993\n\n" +
+    'event: sync\ndata: {"v":1,"rev":2}\nretry: 0\n\n';
+  let calls = 0;
+  const client = new PickleClient({
+    accessToken: "synthetic-token",
+    fetch: async () => {
+      if (++calls > 1) throw new Error("Unexpected reconnect");
+      return new Response(body, { headers: { "content-type": "text/event-stream" } });
+    },
+  });
+  const events: PickleEvent[] = [];
+  for await (const event of client.events()) events.push(event);
+  expect(events).toEqual([
+    { event: "retry", delayMs: 0 },
+    { event: "sync", data: { v: 1, rev: 2 } },
+  ]);
+  expect(calls).toBe(1);
 });
 
 test("typed events require the version and the declared field shapes", () => {

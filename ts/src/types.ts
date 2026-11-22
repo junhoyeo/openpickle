@@ -458,10 +458,12 @@ export interface HistoryPage {
   next_before: number;
 }
 
-/** What a message was sent from. Only `offer` (an Explore offer, `id` = its `offer_id`) was seen. */
+/** What a message was sent from. Only `offer` (`id` = `offer_id`) was seen in send captures. */
 export interface MessageContext {
   id: string;
   kind: Open<"offer">;
+  quote?: string;
+  button_index?: number;
 }
 
 export interface SendMessageResponse {

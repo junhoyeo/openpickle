@@ -166,7 +166,7 @@ type RoomEvent = {
   room: Omit<Room, "log_epoch" | "projection_version">;
 };
 
-export type PickleEvent =
+type PicklePayloadEvent =
   | { event: "chat"; data: V1<ChatEvent> }
   | { event: "usage"; data: V1<UsageEvent> }
   | { event: "status"; data: V1<CharacterStatus> }
@@ -175,6 +175,11 @@ export type PickleEvent =
   | { event: "sync"; data: V1<{ rev: number }> }
   | { event: "room"; data: V1<RoomEvent> }
   | { event: "unknown"; name: string; data: unknown };
+
+export type PickleEvent =
+  | PicklePayloadEvent
+  /** Suggested reconnect delay in milliseconds, as a non-negative safe integer. */
+  | { event: "retry"; delayMs: number };
 
 type Check<T> = (value: unknown) => value is T;
 type Fields<T> = { [K in keyof T]-?: Check<T[K]> };
@@ -345,8 +350,8 @@ const isRoom = variants<RoomEvent>({
   },
 });
 
-/** Empty data (including retry-only frames) yields nothing. Unknown events keep JSON or raw text. */
-export function toPickleEvent({ event: name, data: raw }: SseFrame): PickleEvent | undefined {
+/** Decodes non-empty payloads, not retry hints. Unknown events keep JSON or raw text. */
+export function toPickleEvent({ event: name, data: raw }: SseFrame): PicklePayloadEvent | undefined {
   if (raw === "") return undefined;
   let data: unknown;
   try {
