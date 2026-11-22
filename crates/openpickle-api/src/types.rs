@@ -322,9 +322,12 @@ pub struct Character {
     pub jaum_material: String,
     pub jaum_color: String,
     pub solid_color: String,
-    pub critter_species_name: String,
-    /// ISO 8601
-    pub critter_drawn_at: String,
+    /// `null` for jaum characters (`body_kind` is `jaum`); set for critters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critter_species_name: Option<String>,
+    /// ISO 8601. `null` for jaum characters; set for critters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critter_drawn_at: Option<String>,
     pub jars_remaining: i64,
     pub jaum_portrait_version: i64,
 }
@@ -1157,4 +1160,87 @@ pub struct LogStoreListings {
     pub expires_ms: i64,
     pub discovery: LogStoreListing,
     pub nodes: Vec<NodeLogStoreListing>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Character;
+
+    /// Wire shape measured from a live `GET /api/character` for a jaum character:
+    /// `critter_species_name` and `critter_drawn_at` are JSON `null`. Those used to be
+    /// required `String`s, so decode failed and the desktop kept the default blank avatar.
+    fn jaum_character_json(critter_species_name: &str, critter_drawn_at: &str) -> String {
+        format!(
+            r#"{{
+                "name": "Aa",
+                "voice": "voice",
+                "avatar_url": "https://character-avatars-prod.picklemem.com/example.png?sig=1",
+                "status": {{
+                    "color_combo_id": "",
+                    "level": 1,
+                    "xp": 0,
+                    "xp_next": 40,
+                    "satiety": 1,
+                    "portrait_redraw_due": false,
+                    "body_color": "",
+                    "line_id": "",
+                    "body_hex": "",
+                    "line_hex": "",
+                    "energy_pct": 50,
+                    "energy_exhausted": false,
+                    "jelly_count": 0,
+                    "jelly_checkin_available": false,
+                    "jelly_checkin_amount": 0,
+                    "jelly_notice_kind": "",
+                    "jelly_notice_amount": 0,
+                    "level_milestones": [],
+                    "next_level_reward_level": 5,
+                    "next_level_reward_amount": 10
+                }},
+                "map_visibility": "friends",
+                "roam_radius_m": 1,
+                "roam_radius_mi": 1,
+                "outing_radius_m": 1,
+                "portrait_reference_views": [],
+                "body_kind": "jaum",
+                "jaum_glyph": "glyph",
+                "jaum_material": "mat",
+                "jaum_color": "",
+                "solid_color": "",
+                "critter_species_name": {critter_species_name},
+                "critter_drawn_at": {critter_drawn_at},
+                "jars_remaining": 1,
+                "jaum_portrait_version": 1
+            }}"#
+        )
+    }
+
+    #[test]
+    fn jaum_character_with_null_critter_fields_deserializes() {
+        let character: Character =
+            serde_json::from_str(&jaum_character_json("null", "null")).unwrap();
+        assert_eq!(character.name, "Aa");
+        assert!(
+            character
+                .avatar_url
+                .contains("character-avatars-prod.picklemem.com")
+        );
+        assert_eq!(character.body_kind, "jaum");
+        assert_eq!(character.critter_species_name, None);
+        assert_eq!(character.critter_drawn_at, None);
+    }
+
+    #[test]
+    fn critter_character_keeps_species_fields() {
+        let character: Character = serde_json::from_str(&jaum_character_json(
+            r#""capybara""#,
+            r#""2026-01-02T03:04:05Z""#,
+        ))
+        .unwrap();
+        assert_eq!(character.critter_species_name.as_deref(), Some("capybara"));
+        assert_eq!(
+            character.critter_drawn_at.as_deref(),
+            Some("2026-01-02T03:04:05Z")
+        );
+    }
 }

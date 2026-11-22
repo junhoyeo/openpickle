@@ -271,9 +271,10 @@ export interface Character {
   jaum_material: string;
   jaum_color: string;
   solid_color: string;
-  critter_species_name: string;
-  /** ISO 8601 */
-  critter_drawn_at: string;
+  /** `null` for jaum characters (`body_kind` is `jaum`); set for critters. */
+  critter_species_name: string | null;
+  /** ISO 8601. `null` for jaum characters; set for critters. */
+  critter_drawn_at: string | null;
   jars_remaining: number;
   jaum_portrait_version: number;
 }
