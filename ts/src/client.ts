@@ -116,7 +116,8 @@ export type PickleClientOptions = Credentials & {
 };
 
 export interface RequestOptions {
-  query?: Record<string, string | number | undefined>;
+  /** Pass URLSearchParams to preserve duplicate query keys and their order. */
+  query?: Record<string, string | number | undefined> | URLSearchParams;
   /** Serialized as JSON. */
   body?: unknown;
   headers?: Record<string, string>;
@@ -380,7 +381,8 @@ export class PickleClient {
 
   /**
    * `GET /api/events`: the live event stream (chat turns, reactions, room cursors, usage, widgets).
-   * The server opens with its current state. The generator ends when the server closes the stream;
+   * The server opens with its current state. A `retry` event suggests a reconnect delay and
+   * precedes any payload in the same frame. The generator ends when the server closes the stream;
    * reconnecting is up to the caller.
    */
   async *events(options: { signal?: AbortSignal } = {}): AsyncGenerator<PickleEvent> {
@@ -396,6 +398,8 @@ export class PickleClient {
         const { done, value } = await reader.read();
         if (done) return;
         for (const frame of parser.push(value)) {
+          const delayMs = frame.retry;
+          if (delayMs !== undefined && Number.isSafeInteger(delayMs)) yield { event: "retry", delayMs };
           const event = toPickleEvent(frame);
           if (event) yield event;
         }
@@ -477,9 +481,15 @@ export class PickleClient {
     return this.request("GET", "/api/screens/message-search", { query: { query } });
   }
 
-  /** `GET /api/screens/handoff?name=`: one task's plan and progress log. */
-  getHandoff(name: string): Promise<HandoffScreen> {
-    return this.request("GET", "/api/screens/handoff", { query: { name } });
+  /** `GET /api/screens/handoff?name=`: one task's plan and progress log. Omitted lists default to `[]`. */
+  async getHandoff(name: string): Promise<HandoffScreen> {
+    const screen = await this.request<HandoffScreen>("GET", "/api/screens/handoff", { query: { name } });
+    if (screen !== null && typeof screen === "object" && !Array.isArray(screen)) {
+      if (screen.plan_blocks === undefined) screen.plan_blocks = [];
+      if (screen.log_entries === undefined) screen.log_entries = [];
+      if (screen.log_nodes === undefined) screen.log_nodes = [];
+    }
+    return screen;
   }
 
   // ---- Explore ----
@@ -696,7 +706,8 @@ export class PickleClient {
  * else is percent-encoded.
  */
 function queryString(query: RequestOptions["query"]): string {
-  return Object.entries(query ?? {})
+  const pairs = query instanceof URLSearchParams ? [...query] : Object.entries(query ?? {});
+  return pairs
     .filter((entry): entry is [string, string | number] => entry[1] !== undefined)
     .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value).replace(/%2C/g, ",")}`)
     .join("&");

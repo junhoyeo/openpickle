@@ -1,12 +1,12 @@
 # @openpickle/client
 
 A typed TypeScript client for the Pickle character API (`https://character-api-prod.picklemem.com`),
-the backend of the Pickle iOS app. It was built from seven Proxyman captures of the iOS app
-(version 1.1.19, build 202611071128) taken on 2026-11-16 and 2026-11-17, 39 endpoints in all. A
-full history export and login session refreshes were run against the live API; phone sign-in and
-phone-call methods have only been replayed against captures. The client covers 34 endpoints. It has no runtime dependencies and
-uses `fetch`. It runs on Bun, and on Node versions that load TypeScript directly (tested on
-Node 26); older Node needs a bundler.
+the backend of the Pickle iOS app. The initial implementation was based on seven Proxyman
+captures of the iOS app (version 1.1.19, build 202611071128) taken on 2026-11-16 and 2026-11-17.
+A full history export and login session refreshes were tested live during that work; see
+[Verification](#verification) for what was tested. The SDK has no runtime dependencies and uses
+`fetch`. It runs on Bun and on Node versions that load TypeScript directly (tested on Node 26);
+older Node needs a bundler.
 
 ```ts
 import { PickleClient } from "@openpickle/client";
@@ -24,8 +24,9 @@ for await (const event of pickle.events()) {
 
 ## Authentication
 
-Every call except sign-in, the refresh and `getUiDefinitions()` sends `Authorization: Bearer <token>`.
-The token is an ES256 JWT issued by the API:
+Authenticated Pickle methods send `Authorization: Bearer <token>`. Sign-in, login-session
+refresh and `getUiDefinitions()` do not need that bearer. The token is an ES256 JWT issued by
+the API:
 
 | claim | meaning |
 | --- | --- |
@@ -34,7 +35,7 @@ The token is an ES256 JWT issued by the API:
 | `exp` | access token expiry: **5 minutes** after `iat` |
 | `sexp` | login session expiry: 7 days after `iat` |
 
-### Signing in with a phone number
+### Signing in with a phone number (SMS)
 
 ```ts
 const signedOut = new PickleClient();
@@ -54,7 +55,8 @@ const pickle = new PickleClient({
 
 A new sign-in starts its own login session and leaves the others alone: after the phone signed in
 again, an older session kept working. So the client and the phone app can both stay signed in.
-The app also offers Apple, Kakao and LINE sign-in; those calls are not in the captures.
+The original captures covered SMS sign-in only. The SDK also supports
+[Kakao sign-in](#kakao-login-library); it does not implement Apple or LINE login.
 
 ### Login sessions
 
@@ -92,13 +94,13 @@ new random UUIDs; pass your own to keep them stable. Transport headers are left 
 
 ## Endpoints
 
-All of these were in the captures. `scripts/verify-capture.ts` checks each one against them (see
-[Verification](#verification)).
+These are the SDK's Pickle API methods, not a list of Bun CLI commands. The
+[replay verifier](#verification) checks supported requests from a supplied capture.
 
 | Method | Path | Client method | Notes |
 | --- | --- | --- | --- |
 | POST | `/api/login-sessions/phone-code` | `requestPhoneCode(phone, { region?, carrier? })` | Texts a sign-in code. No token needed. |
-| POST | `/api/login-sessions` | `verifyPhoneCode(pendingId, code)` | Trades the code for a login session. No token needed. |
+| POST | `/api/login-sessions` | `verifyPhoneCode(pendingId, code)`, `loginWithKakaoIdToken(idToken)` | Issues a Pickle login session from an SMS code or a Kakao ID token. No Pickle bearer needed. |
 | POST | `/api/login-sessions/refresh` | `refreshLoginSession(token)` | Rotates the refresh token. See [Authentication](#authentication). |
 | POST | `/api/account/register` | `registerAccount()` | Called on every launch. Returns account state; `registered: false` for an existing account. |
 | POST | `/api/session` | `startSession(overrides?)` | Account, plan, credits, character, and a LiveKit room token. About 100 keys; the useful ones are typed. |
@@ -108,15 +110,16 @@ All of these were in the captures. `scripts/verify-capture.ts` checks each one a
 | GET | `/api/rooms/{room}/history/delta?after_seq=&limit=` | `getHistoryDelta(room, { afterSeq, limit })`, `history(room)` | Messages, reactions and card states after a sequence number, up to 500 per page. `history()` pages from the start. |
 | GET | `/api/rooms/{room}/history/page?limit=&before_seq=` | `getHistoryPage(room, { beforeSeq, limit })` | Up to 250 messages before a sequence number, with reactions and card states. See [History pages and attachments](#history-pages-and-attachments). |
 | GET | `/api/attachments/{path}/thumbnail` | `getAttachmentThumbnail(path)` | A JPEG preview of a photo or PDF in a message. Returns `{ bytes, contentType }`. |
-| GET | `/api/attachments/{path}` | `getAttachment(path)` | The attachment itself, the original file. Returns `{ bytes, contentType }`. |
-| POST | `/api/rooms/{room}/messages` | `sendMessage(room, text, { clientMsgId?, inCall?, context?, replyTo? })` | Returns `{ status, responder, seq: null }`. The reply arrives on `events()`. `context` marks a message sent from an [Explore](#explore) offer. `replyTo` sends a top-level `reply_to` using the stored history shape; the outbound format is inferred, not captured. |
+| GET | `/api/attachments/{path}` | `getAttachment(path)`, `getAttachmentResponse(path)` | The original file as buffered `{ bytes, contentType }` or a raw response for streaming. |
+| POST | `/api/rooms/{room}/messages` | `sendMessage(room, text, { clientMsgId?, inCall?, context?, replyTo? })` | Acknowledges the send; the character's response arrives on `events()`. See [Sending messages](#sending-messages). |
 | PUT | `/api/rooms/{room}/read` | `markRead(room, seq)` | Moves this device's read cursor. |
 | GET | `/api/phone-calls/{call_id}` | `getPhoneCall(callId)` | Current call state and transcript. The id is encoded as one path segment. |
 | POST | `/api/actions` | `endPhoneCall(callId, { actionId?, inCall? })` | Sends only the captured `end_phone_call` action. Reuse `actionId` for a retry. |
 | GET | `/api/character` | `getCharacter()` | Look, level, XP, energy, jelly. |
 | GET | `/api/profile?region=` | `getProfile(region?)` | Your profile, including phone and birthday. |
 | GET | `/api/social/snapshot?scopes=` | `getSocialSnapshot(scopes?)` | Friends, requests, blocked, invite, activity. Each scope has its own status. |
-| GET | `/api/screens/{kind}` | `getScreen(kind, query?)` | Data for server-driven screens. `handoffs`, `extra-conversations`, `roulette-promo`, `message-search` and `explore-sections` are typed. |
+| GET | `/api/screens/{kind}` | `getScreen(kind, query?)` | Data for server-driven screens. `handoffs`, `extra-conversations`, `roulette-promo`, `message-search` and `explore-sections` have typed overloads. |
+| GET | `/api/screens/handoff?name=` | `getHandoff(name)` | One task's plan and progress log. Missing `plan_blocks`, `log_entries` and `log_nodes` default to empty arrays. |
 | GET | `/api/screens/message-search?query=` | `searchMessages(query)` | Messages containing the text, newest first. See [Message search](#message-search). |
 | GET | `/api/screens/explore-sections` | `getExploreSections()` | Things the character offers to do, in sections. See [Explore](#explore). |
 | POST | `/api/offers/impressions` | `reportOfferImpressions(offerIds)` | Reports which offers were shown. Answered with `{}`. |
@@ -131,8 +134,20 @@ All of these were in the captures. `scripts/verify-capture.ts` checks each one a
 | GET | `/api/secure/ledger` | `getSharedLedger()` | The node ledger, encrypted with a key only your devices hold. |
 | GET | `/api/secure/transfers` | `getTransfers()` | Pending master-key transfers between devices. |
 
-`request(method, path, options)` and `send(...)` call any other path with the same headers and
-error handling.
+`request(method, path, options)` returns JSON; `send(method, path, options)` returns the raw
+response. A caller-provided `Authorization` header on either method takes precedence over the
+SDK's bearer, without looking up or refreshing the client's credentials or retrying an expired
+token through its login session. This also applies to the Rust SDK's raw requests. These
+methods do not establish the request format for undocumented actions.
+
+## Sending messages
+
+`sendMessage()` returns an acknowledgment with the local `client_msg_id`, not the character's
+answer. Read the answer from `events()`. The SDK accepts [Explore offer context](#explore)
+and can send a quoted reply through `replyTo`. That option adds a top-level `reply_to` with `target_id`, `part`, `text`,
+`role`, and optional `kind` and `path`. The outbound format was inferred from stored history;
+quoted replies have not been verified against the live service. The CLI's `send <room> <text>`
+sends plain text only and does not expose quote, offer, or in-call options.
 
 ## Phone calls
 
@@ -141,16 +156,19 @@ A line's `speaker` is `me` or `them`; `keys` appears on keypad lines. Start, ans
 and outcome fields are optional because the server adds them as the call moves through its
 lifecycle. A live response may later set `hangup_requested` while the end action is being handled.
 
-Ending is always explicit. `endPhoneCall()` sends `{ action_id, in_call, payload: { call_id },
+The SDK's `endPhoneCall()` sends `{ action_id, in_call, payload: { call_id },
 kind: "end_phone_call" }`. It creates a UUID when `actionId` is omitted. Pass the same `actionId`
-when retrying the same user action. The CLI exposes only the read-only `phone-call <id>` command;
-it does not expose call-ending mutation. Native callers must own confirmation, fresh-call
-verification, and stable retry state before using the library method.
+when retrying the same user action. The desktop app asks for confirmation before sending the
+request. The SDK does not provide a confirmation prompt or check whether the call is still live;
+callers must do both. The CLI's `phone-call <id>` only reads status and transcript once. It
+cannot end a call. Neither the SDK nor the CLI dials numbers or streams call audio.
 
 No phone call was created, read, or ended live while implementing this support. The capture was
 replayed only against local in-memory clients and localhost mock servers.
 
-### Left out on purpose
+## API limits
+
+### No dedicated SDK method
 
 - `POST /api/telemetry`: the app's analytics batches. It authenticates with the LiveKit token from
   `startSession()`, not the API token.
@@ -161,13 +179,12 @@ replayed only against local in-memory clients and localhost mock servers.
 - `GET /api/screens/connection-catalog`: the catalog of services the character can connect to,
   for the app's connections screen. `getScreen("connection-catalog")` returns it untyped.
 
-### Not in the captures
+### Not established by the original captures
 
-- **Apple, Kakao and LINE sign-in.** Only phone sign-in was captured.
 - **Other screen kinds.** The UI definitions name these data kinds: `activity`, `bubble`,
   `bubbles`, `character-voices`, `character_avatar_history`, `character_colors`,
   `character_settings`, `character_sharing`, `clone_brief`, `connection-detail`, `connections`,
-  `friend`, `friend-request`, `handle_check`, `handoff`, `notification_settings`, `page`,
+  `friend`, `friend-request`, `handle_check`, `notification_settings`, `page`,
   `phone_call`, `scheduled-action`, `scheduled-action-run`, `scheduled-actions`, `ticket-history`,
   `vault`.
   Whether each one is served at `/api/screens/{kind}` is unverified. `profile` is also a data kind,
@@ -318,10 +335,9 @@ scroll back through a room. The parameters go in that order, `limit` first. The 
 }
 ```
 
-`messages` are the messages before `before_seq`, oldest first, and have no inline `reactions`.
-While `has_more` is true, `next_before` is the oldest `seq` of the page: pass it as the next
-`beforeSeq`. The `attachments` CLI command starts from `getHistory()` and pages back from its
-oldest message the same way.
+`messages` holds messages before `before_seq`, in server order and without inline `reactions`.
+While `has_more` is true, pass `next_before` as the next `beforeSeq`. The `attachments` CLI
+command starts from `getHistory()` and pages back from its oldest message the same way.
 
 Messages refer to photos and files by attachment path, `attachments/<date>/<file name>`:
 
@@ -358,13 +374,15 @@ request, and a file large enough to need one.
 
 ## Events
 
-`events()` opens `GET /api/events` and yields typed events until the server closes the stream.
+`events()` opens `GET /api/events` and yields events until the server closes the stream.
 The server first sends its current state (usage, character status, widgets, sync revision), then
-changes as they happen. Reconnecting is up to the caller. The server suggests a delay with
-`retry:` (1.25 s and 2.2 s in the captures), but `events()` does not pass that value on.
+changes as they happen. A `retry:` field yields `{ event: "retry", delayMs }` with the
+server's suggested delay in milliseconds, before any data event from the same frame. The SDK
+neither waits for that delay nor reconnects on its own; reconnecting is up to the caller.
 
 | `event` | `data.kind` | Payload |
 | --- | --- | --- |
+| `retry` | – | `delayMs` on the event itself; no `data` field |
 | `chat` | `user` | Your message as stored: `id` (= `client_msg_id`), `text`, `seq`, `at` |
 | `chat` | `assistant` | A stored character reply; `text` wraps each chat bubble in `<bubble>…</bubble>` |
 | `chat` | `assistant_partial` | A partial reply before the server assigns its room sequence number |
@@ -379,9 +397,13 @@ changes as they happen. Reconnecting is up to the caller. The server suggests a 
 | `status` | – | Character status (level, XP, energy, jelly) |
 | `widget` | `bgm_catalog`, `state` | Background music catalog, timer and music widget state |
 
-An event name outside this list arrives as `{ event: "unknown", name, data }`.
+The SDK types data events with `v: 1` and a recognized payload shape. Other data events arrive
+as `{ event: "unknown", name, data }`, keeping the parsed JSON or raw text.
 
 ## CLI
+
+The Bun CLI signs in by SMS only. For Kakao sign-in, use the SDK or the current macOS desktop
+app.
 
 ```sh
 # A login session file: {"login_session_token": "ls_…"}. The CLI locks the file's session
@@ -401,14 +423,15 @@ bun src/cli.ts thumbnail "attachments/2026-01-02/scan 1.pdf" scan.jpg  # JPEG th
 bun src/cli.ts download "attachments/2026-01-02/scan 1.pdf" scan.pdf   # the file itself
 bun src/cli.ts export ./messages    # full history of every room, one JSON file per room
 bun src/cli.ts events               # one JSON object per line
-bun src/cli.ts screen handoffs
+bun src/cli.ts screen handoffs      # list tasks and calls
+bun src/cli.ts handoff "Task name"  # read one task's plan and progress log once
 bun src/cli.ts get /api/secure/transfers
 bun src/cli.ts token                # claims and seconds left of PICKLE_TOKEN
 ```
 
-Never point `PICKLE_SESSION_FILE` at the desktop app's own login-session file. Give this CLI
-its own file. The CLI refuses to run when its sibling `.lock` directory already exists; if a
-crash left it behind, remove it only after confirming no other CLI is using that session.
+Never point `PICKLE_SESSION_FILE` at the desktop app's own login-session file. The CLI refuses
+to run when its sibling `.lock` directory already exists; if a crash left it behind, remove it
+only after confirming no other CLI is using that session.
 `download` streams into a temporary file and only replaces the chosen output after success.
 
 ## Verification
@@ -417,7 +440,7 @@ crash left it behind, remove it only after confirming no other CLI is using that
 bun install
 bun run typecheck
 bun test
-bun run verify:capture ~/Downloads/character-api-prod.picklemem.com_11-17-2026-02-42-21.proxymanlogv2
+bun run verify:capture path/to/capture.proxymanlogv2
 ```
 
 The client was also run against the live API. With an access token from the second capture,
@@ -429,17 +452,17 @@ third capture shows the other side of that: the phone's next refresh, with its s
 `401 session_not_found`, and the client's chain still refreshed afterwards. Phone sign-in has not
 been run live; it needs a code texted to the owner's phone.
 
-`verify:capture` replays a Proxyman capture without touching the network. For every recorded
-request it calls the matching client method, with `fetch` replaced by one that answers with the
-recorded response. It then checks that the client sent the same method, path, raw query string,
-JSON body and app headers, and that it parsed the response or raised `PickleApiError` for the
-recorded status. Run it on a new capture after an app update to see what changed; endpoints
-without a client method are listed as `skip`.
+`verify:capture` replays supported requests in a Proxyman capture without touching the network.
+It calls the matching client method with `fetch` replaced by one that returns the recorded
+response. It then checks the method, path, raw query string, JSON body, and app headers, and
+checks that the client parses the response or raises `PickleApiError` for the recorded status.
+Requests the verifier cannot dispatch, including unsupported variants of a known route, are
+listed separately as `skip`. Replay does not establish live compatibility.
 
 Captures contain bearer tokens and personal data. `.gitignore` excludes `*.proxymanlogv2` and
 `.capture/`; keep them out of the repository.
 
-### Kakao login (library)
+## Kakao login (library)
 
 `PickleClient` exposes `requestKakaoAuthorizeUrl`, `exchangeKakaoCode`, and
 `loginWithKakaoIdToken`, plus `parseKakaoCode` from `src/kakao.ts`. The flow is
@@ -447,9 +470,16 @@ Kakao authorize with PKCE, a `kakao<client id>://oauth?code=…` redirect, a tok
 exchange at `kauth.kakao.com` with no client secret or App Attest, and
 `POST /api/login-sessions` with `{provider: "kakao", kind: "id_token"}`. Public
 configuration defaults are named constants in `src/kakao.ts`; they are native-client
-identifiers, not secrets. SMS login is unchanged.
+identifiers, not secrets. The Rust SDK has matching helpers: `request_kakao_authorize_url`,
+`exchange_kakao_code`, `login_with_kakao_id_token`, and `KakaoConfig::parse_code`.
 
-### Rust / desktop terminal entry point
+### Kakao sign-in in the desktop app
+
+On macOS, current desktop builds offer **Continue with Kakao** on the sign-in form. The app
+opens the macOS authentication session, handles the callback, and saves its own login session.
+See the [desktop setup instructions](../crates/openpickle-desktop/README.md#kakao-sign-in-on-macos).
+
+### Manual desktop terminal fallback
 
 Quit the desktop app, then run from the repository root:
 
@@ -461,10 +491,4 @@ Open the printed URL, capture its redirect, and paste the redirect URL or code i
 that same terminal. The verifier stays in memory. This writes through the desktop
 `Store::start_session` path, clearing old account caches and preserving the normal
 rotation behavior; restart the desktop app afterwards. It uses the same public
-`PICKLE_KAKAO_*` overrides. Do not point the TS CLI at the desktop session file.
-
-The Rust API exposes `request_kakao_authorize_url`, `exchange_kakao_code`, and
-`login_with_kakao_id_token`, plus `KakaoConfig::parse_code`. The minimal desktop
-entry point is terminal-based: GPUI Kakao buttons, macOS `CFBundleURLTypes`
-registration, and incoming-URL event routing are still pending. The bundle does not
-claim the Kakao URL scheme until a working in-app receiver is wired up.
+`PICKLE_KAKAO_*` overrides. This is a desktop developer command, not a Bun CLI login method.

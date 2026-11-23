@@ -981,7 +981,11 @@ impl PickleClient {
         options: RequestOptions,
         timeout: Option<Duration>,
     ) -> Result<Response> {
-        if !matches!(options.auth, Auth::Bearer | Auth::BearerOnly) {
+        // An explicit bearer belongs to this request, not to our managed login session.
+        // In particular it must not rotate that session or trigger its token-expired retry.
+        if options.headers.contains_key(AUTHORIZATION)
+            || !matches!(options.auth, Auth::Bearer | Auth::BearerOnly)
+        {
             return self.execute(method, path, options, None, timeout).await;
         }
         let bearer = self.bearer_header().await?;

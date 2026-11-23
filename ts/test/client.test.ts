@@ -281,6 +281,15 @@ test("query options join a path that already has a query", async () => {
   ]);
 });
 
+test("screen query options preserve repeated keys and their order", async () => {
+  const { calls, fetch } = recorder(200, "{}");
+  const pickle = new PickleClient({ accessToken: "t", fetch });
+  await pickle.getScreen("sample-screen", new URLSearchParams([
+    ["tag", "first"], ["q", "two words"], ["tag", "second"],
+  ]));
+  expect(calls[0]?.url).toBe(`${pickle.baseUrl}/api/screens/sample-screen?tag=first&q=two%20words&tag=second`);
+});
+
 test("token claims are read as UTF-8", () => {
   const claims = { sub: "피클", sid: "s", iat: 1, exp: 2, sexp: 3 };
   const bytes = new TextEncoder().encode(JSON.stringify(claims));
@@ -371,10 +380,30 @@ test("sendMessage sends context and reply_to only when provided", async () => {
     clientMsgId: "m3",
     replyTo: { target_id: "example-target", part: 1, text: "See you tomorrow", role: "assistant" },
   });
-  expect(calls.map((call) => call.init.body)).toEqual([
-    '{"text":"hi","client_msg_id":"m1","in_call":false}',
-    '{"text":"Find refunds I am owed","client_msg_id":"m2","in_call":false,"context":{"id":"offer-1","kind":"offer"}}',
-    '{"text":"That works","client_msg_id":"m3","in_call":false,"reply_to":{"target_id":"example-target","part":1,"text":"See you tomorrow","role":"assistant"}}',
+  await pickle.sendMessage("room-1", "Use this option", {
+    clientMsgId: "m4",
+    context: { id: "button-1", kind: "button", quote: "Option A", button_index: 0 },
+  });
+  expect(calls.map((call) => JSON.parse(String(call.init.body)))).toEqual([
+    { text: "hi", client_msg_id: "m1", in_call: false },
+    {
+      text: offer.cta_label,
+      client_msg_id: "m2",
+      in_call: false,
+      context: { id: offer.offer_id, kind: "offer" },
+    },
+    {
+      text: "That works",
+      client_msg_id: "m3",
+      in_call: false,
+      reply_to: { target_id: "example-target", part: 1, text: "See you tomorrow", role: "assistant" },
+    },
+    {
+      text: "Use this option",
+      client_msg_id: "m4",
+      in_call: false,
+      context: { id: "button-1", kind: "button", quote: "Option A", button_index: 0 },
+    },
   ]);
 });
 
@@ -426,6 +455,18 @@ test("getHandoff reads progress with open node kinds and encodes the name", asyn
   );
   expect(calls[0]!.init.method).toBe("GET");
   expect(calls[0]!.init.body).toBeUndefined();
+});
+
+test("getHandoff supplies empty arrays for omitted lists only", async () => {
+  const base = { kind: "handoff", state: "planned", title: "Day trip", requested_at_epoch_ms: 1_700_000_000_000 };
+  const partial = { ...base, plan_blocks: null, log_entries: "malformed" };
+  const pickle = new PickleClient({
+    accessToken: "synthetic-token",
+    fetch: async (url) => Response.json(new URL(url).searchParams.get("name") === "partial" ? partial : base),
+  });
+
+  expect(await pickle.getHandoff("omitted")).toEqual({ ...base, plan_blocks: [], log_entries: [], log_nodes: [] });
+  expect<unknown>(await pickle.getHandoff("partial")).toEqual({ ...partial, log_nodes: [] });
 });
 
 test("getPhoneCall reads live, ending, and completed transcript shapes and encodes the id as one segment", async () => {

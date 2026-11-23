@@ -41,6 +41,38 @@ fn client(server: &MockServer, credentials: Credentials) -> PickleClient {
 const SYNC: &str = r#"{"rooms":[],"rev":4}"#;
 
 #[tokio::test]
+async fn raw_authorization_bypasses_credential_lookup_and_session_retry() {
+    let server = MockServer::start(|request| {
+        assert_eq!(request.path, "/api/sync");
+        assert_eq!(request.header("authorization"), Some("Bearer explicit"));
+        Reply::json(401, r#"{"detail":"token_expired"}"#)
+    })
+    .await;
+    for credentials in [
+        Credentials::SignedOut,
+        Credentials::LoginSession(LoginSession::new("ls_fixture", |_| {
+            panic!("an explicit bearer must not rotate the managed session")
+        })),
+    ] {
+        let pickle = client(&server, credentials);
+        let mut options = RequestOptions::default();
+        options
+            .headers
+            .insert(AUTHORIZATION, HeaderValue::from_static("Bearer explicit"));
+        let error = pickle
+            .send(Method::GET, "/api/sync", options)
+            .await
+            .unwrap_err();
+        let api = error.api().unwrap();
+        assert_eq!(
+            (api.status, api.detail.as_deref()),
+            (401, Some("token_expired"))
+        );
+        assert_eq!(server.take().len(), 1);
+    }
+}
+
+#[tokio::test]
 async fn login_session_refreshes_once_for_concurrent_requests() {
     let refreshes = Arc::new(AtomicUsize::new(0));
     let access = jwt(300);

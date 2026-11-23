@@ -41,7 +41,9 @@ const drain = async (events: AsyncIterable<unknown>) => {
 const routes: [method: string, path: RegExp, call: Call][] = [
   ["POST", /^\/api\/login-sessions\/phone-code$/, (c, _f, j) =>
     c.requestPhoneCode(j.phone, { region: j.region, carrier: j.carrier })],
-  ["POST", /^\/api\/login-sessions$/, (c, _f, j) => c.verifyPhoneCode(j.pending_id, j.code)],
+  ["POST", /^\/api\/login-sessions$/, (c, _f, j) => j.kind === "phone_code"
+    ? c.verifyPhoneCode(j.pending_id, j.code)
+    : c.loginWithKakaoIdToken(j.id_token)],
   ["POST", /^\/api\/login-sessions\/refresh$/, (c, _f, j) => c.refreshLoginSession(j.login_session_token)],
   ["POST", /^\/api\/account\/register$/, (c) => c.registerAccount()],
   ["POST", /^\/api\/session$/, (c, _f, json) => c.startSession(json)],
@@ -76,8 +78,8 @@ const routes: [method: string, path: RegExp, call: Call][] = [
   ["GET", /^\/api\/screens\/message-search$/, (c, f) => c.searchMessages(new URLSearchParams(f.query).get("query")!)],
   ["GET", /^\/api\/screens\/handoff$/, (c, f) => c.getHandoff(new URLSearchParams(f.query).get("name")!)],
   ["GET", /^\/api\/screens\/explore-sections$/, (c) => c.getExploreSections()],
-  ["GET", /^\/api\/screens\/(handoffs|extra-conversations|roulette-promo)$/, (c, _f, _j, [kind]) =>
-    c.getScreen(kind!)],
+  ["GET", /^\/api\/screens\/([^/]+)$/, (c, f, _j, [kind]) =>
+    c.getScreen(kind!, new URLSearchParams(f.query))],
   ["POST", /^\/api\/offers\/impressions$/, (c, _f, j) => c.reportOfferImpressions(j.offer_ids)],
   ["PUT", /^\/api\/device\/permissions$/, (c, _f, j) => c.reportPermissions(j.snapshots)],
   ["POST", /^\/api\/device\/location\/token$/, (c) => c.requestLocationToken()],
@@ -197,19 +199,32 @@ const flows = readCapture(file).sort((a, b) => a.name.localeCompare(b.name, unde
 const results = new Map<string, { count: number; problems: Set<string> }>();
 const uncovered = new Map<string, number>();
 
+// A path can carry multiple operations. Replay only the bodies our SDK actually models.
+function coversBody(flow: Flow, json: unknown): boolean {
+  if (flow.method !== "POST") return true;
+  const body = typeof json === "object" && json !== null
+    ? json as Record<string, unknown>
+    : {};
+  if (flow.path === "/api/login-sessions") {
+    return body.kind === "phone_code" || (body.kind === "id_token" && body.provider === "kakao");
+  }
+  if (flow.path === "/api/actions") return body.kind === "end_phone_call";
+  return true;
+}
+
 for (const flow of flows) {
   const route = routes.find(([method, path]) => method === flow.method && path.test(flow.path));
+  const json = route && flow.body ? JSON.parse(flow.body) : undefined;
   const label = `${flow.method} ${flow.path
     .replace(/\/rooms\/[^/]+/, "/rooms/{room}")
     .replace(/\/phone-calls\/[^/]+/, "/phone-calls/{call_id}")
     .replace(/\/nodes\/[^/]{43}/, "/nodes/{node}")
     .replace(/^\/api\/attachments\/.+\/thumbnail$/, "/api/attachments/{path}/thumbnail")
     .replace(/^\/api\/attachments\/(?!\{path\}).+$/, "/api/attachments/{path}")}`;
-  if (!route) {
+  if (!route || !coversBody(flow, json)) {
     uncovered.set(label, (uncovered.get(label) ?? 0) + 1);
     continue;
   }
-  const json = flow.body ? JSON.parse(flow.body) : undefined;
   const sent: Sent[] = [];
   const problems: string[] = [];
   try {
@@ -232,6 +247,6 @@ for (const [label, { count, problems }] of results) {
   console.log(`${problems.size ? "FAIL" : "ok  "} ${label} x${count}`);
   for (const p of problems) console.log(`       ${p}`);
 }
-for (const [label, count] of uncovered) console.log(`skip ${label} x${count} (no client method)`);
+for (const [label, count] of uncovered) console.log(`skip ${label} x${count} (no matching client operation)`);
 console.log(`\n${results.size - failed}/${results.size} endpoints match, ${uncovered.size} not covered`);
 process.exit(failed ? 1 : 0);

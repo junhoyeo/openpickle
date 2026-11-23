@@ -43,8 +43,9 @@ servers the iOS app does, with your own account.
   and Select All. Select All includes loaded messages beyond what is on screen.
 - **Cached chat.** For a returning session, the app can show cached messages before the
   network refresh. See [what the gallery benchmark measures](#speed).
-- **Its own sign-in.** You sign in with your phone number and a texted code. The app gets a login
-  session of its own, so your phone stays signed in.
+- **Its own sign-in.** Sign in with your phone number and a texted code. On macOS, the app also
+  offers [Continue with Kakao](crates/openpickle-desktop/README.md#kakao-sign-in-on-macos).
+  The app gets a separate login session, so your phone stays signed in.
 
 <p align="center">
   <img src="docs/screenshots/phone-card.png" alt="A call Pickle placed for you: its card in the chat, over the end of the transcript" height="540" />
@@ -60,10 +61,12 @@ servers the iOS app does, with your own account.
 Right-click a confirmed text bubble and choose **Reply** to attach a quote to your next
 message. Clear it with the × in the composer or Escape. Mixed-content messages do not offer
 Reply because their part numbering is not established. Outbound reply compatibility is
-inferred from saved history and has not been verified against the live service. The app also displays reactions in
-received messages. It does not send reactions or request-card answers, upload or share files, generate website
-previews, or manage friends, tickets, or account settings. Direct microphone chat is not
-implemented. See the [desktop README](crates/openpickle-desktop/README.md) for details.
+inferred from saved history and has not been verified against the live service. The app also
+shows reactions on received messages. It does not send reactions or request-card answers,
+upload or share files, generate website previews, or manage friends, tickets, or account
+settings. Direct microphone chat is not implemented. See the
+[desktop README](crates/openpickle-desktop/README.md) for details.
+
 The published v1.0.0 downloads predate the newer source changes.
 
 ## Searching your chat from coding agents
@@ -98,16 +101,15 @@ still blocks it, use **System Settings > Privacy & Security > Open Anyway**.
 On Windows, extract the zip and run `OpenPickle.exe`. The app is not code-signed. If SmartScreen
 blocks it, choose **More info > Run anyway** after verifying that you trust the download.
 
-To build or run it from source:
+To run it from source, use `cargo run --release -p openpickle-desktop`. Building needs a recent
+stable Rust (1.98 was used). To build a package from the repository root:
 
-```sh
-# Build a DMG for this Mac, or pass aarch64-apple-darwin / x86_64-apple-darwin.
-./crates/openpickle-desktop/macos/package.sh
-
-cargo run --release -p openpickle-desktop
-```
-
-Building needs a recent stable Rust (1.98 was used). macOS packaging also needs Xcode.
+- **macOS:** Run `./crates/openpickle-desktop/macos/package.sh` to build a DMG in `target/macos/`.
+  It builds for this Mac by default. Pass `aarch64-apple-darwin` or `x86_64-apple-darwin` to
+  select a target. The release build needs the macOS build tools.
+- **Windows:** In PowerShell, run `.\crates\openpickle-desktop\windows\package.ps1` to build an
+  x86-64 zip in `target/windows/`. The build uses the MSVC Rust target and needs `fxc.exe` from
+  the Windows SDK.
 
 ## Speed
 
@@ -127,14 +129,15 @@ with larger histories.
 
 ## How it was built
 
-The API is not documented. It was read off seven [Proxyman](https://proxyman.com) captures of the
-iOS app. Each client is checked by replaying the captured requests it covers and comparing
-what it sends with what the app sent: method, path, raw query string, JSON body and headers.
-The verifier reports uncovered routes separately instead of treating them as passing.
+The API is not documented. The initial API work came from seven [Proxyman](https://proxyman.com)
+captures of the iOS app. The Rust and TypeScript replay tools check supported requests offline
+by comparing the method, path, raw query string, JSON body and headers with the capture.
+Unsupported requests are reported separately. Replay does not verify that the live service still
+accepts a request.
 
 ```sh
-cargo run -p openpickle-api --example verify_capture -- <capture.proxymanlogv2>
-cd ts && bun run verify:capture <capture.proxymanlogv2>
+cargo run -p openpickle-api --example verify_capture -- path/to/capture.proxymanlogv2
+cd ts && bun run verify:capture path/to/capture.proxymanlogv2
 ```
 
 The notes on the API (endpoints, phone sign-in, login sessions, the event stream) are in
@@ -144,9 +147,10 @@ The notes on the API (endpoints, phone sign-in, login sessions, the event stream
 
 | Path | What it is |
 | --- | --- |
-| [`crates/openpickle-desktop`](crates/openpickle-desktop/README.md) | The desktop app: GPUI views, a backend thread for the network and the disk, the macOS packaging. |
-| `crates/openpickle-api` | The Rust client for the captured Pickle API: phone sign-in, login session refresh, typed event stream, message search, attachments and phone-call transcripts/actions. |
-| [`ts/`](ts/README.md) | The TypeScript client the Rust one was ported from, a small CLI, and the API notes. |
+| [`crates/openpickle-desktop`](crates/openpickle-desktop/README.md) | The native app: GPUI views, a backend thread for network and disk work, and macOS and Windows packaging. |
+| [`crates/openpickle-api`](crates/openpickle-api/) | The Rust SDK used by the desktop app, including SMS and Kakao login, session refresh, chat and events, attachments, task handoffs, and phone-call transcript and end-call requests. |
+| [`ts/`](ts/README.md) | The TypeScript SDK, a smaller Bun CLI with SMS-only login, and the API notes. |
+| [`skills/pickle-sessions`](skills/pickle-sessions/SKILL.md) | A read-only agent skill for searching the desktop app's local conversation cache. |
 
 ## Chat links and attachment previews
 

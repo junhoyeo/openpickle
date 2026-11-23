@@ -259,8 +259,13 @@ async fn call(client: &PickleClient, flow: &Flow, json: &Value) -> Option<Result
                     .await,
             )
         }
-        ("POST", ["", "api", "login-sessions"]) => {
+        ("POST", ["", "api", "login-sessions"]) if json["kind"] == "phone_code" => {
             done(client.verify_phone_code(&s("pending_id"), &s("code")).await)
+        }
+        ("POST", ["", "api", "login-sessions"])
+            if json["kind"] == "id_token" && json["provider"] == "kakao" =>
+        {
+            done(client.login_with_kakao_id_token(&s("id_token")).await)
         }
         ("POST", ["", "api", "login-sessions", "refresh"]) => done(
             client
@@ -588,7 +593,7 @@ async fn main() -> ExitCode {
         }
     }
     for (label, count) in &uncovered {
-        println!("skip {label} x{count} (no client method)");
+        println!("skip {label} x{count} (no matching client operation)");
     }
     println!(
         "\n{}/{} endpoints match, {} not covered",
