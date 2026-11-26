@@ -167,8 +167,9 @@ Everything is under the user's application-support directory
    `/Applications/OpenPickle.app`. Replace an older installed copy if necessary.
 4. On the signed-out phone form, click **Continue with Kakao**. If already signed in, use
    the app's Sign out control first (this clears the local session and cache).
-5. Finish Kakao sign-in in the macOS authentication session. The app
-   exchanges the callback and enters the same signed-in chat flow as SMS login.
+5. Finish Kakao sign-in in the macOS authentication session. If Pickle issues a login
+   session, the app opens the chat. If Pickle requires phone verification, the app
+   returns to the phone sign-in form.
 
 Kakao first uses `ASWebAuthenticationSession` through a small Objective-C bridge,
 compiled with Clang and Command Line Tools (no Swift SPM or full Xcode dependency).

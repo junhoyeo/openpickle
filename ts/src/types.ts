@@ -236,6 +236,11 @@ export interface LoginSessionIssued extends LoginSessionRefresh {
   user_id: string;
 }
 
+export type KakaoLoginOutcome = LoginSessionIssued | {
+  status: "phone_verification_required";
+  identity_ticket: string;
+};
+
 // ---- Profile and character ----
 
 export interface Profile {

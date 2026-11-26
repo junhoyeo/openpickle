@@ -1,5 +1,5 @@
 //! Manual terminal fallback for development; normal users sign in through GPUI.
-use openpickle_api::{ClientOptions, PickleClient, kakao::KakaoConfig};
+use openpickle_api::{ClientOptions, KakaoLoginOutcome, PickleClient, kakao::KakaoConfig};
 use openpickle_desktop::store::{Session, Store};
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -38,7 +38,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let issued = runtime.block_on(async {
+    let outcome = runtime.block_on(async {
         let id_token = client
             .exchange_kakao_code(&config, &code, &pending.verifier)
             .await?;
@@ -48,6 +48,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|_| -> Box<dyn std::error::Error> { "Pickle Kakao login failed".into() })
     })?;
+    let KakaoLoginOutcome::Issued(issued) = outcome else {
+        return Err(
+            "Kakao sign-in succeeded. Open OpenPickle to sign in with your phone number.".into(),
+        );
+    };
     store.start_session(&Session {
         login_session_token: issued.login_session_token,
         device_id,

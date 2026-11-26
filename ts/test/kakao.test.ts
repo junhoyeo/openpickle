@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { PickleClient } from "../src/client.ts";
 import { DEFAULT_KAKAO_CONFIG, kakaoAuthorize, parseKakaoCode, pkceChallenge } from "../src/kakao.ts";
+import type { KakaoLoginOutcome } from "../src/types.ts";
 
 const issued = { status: "ok", user_id: "fixture-user", login_session_token: "fixture-session", login_session_jwt: "fixture-jwt", expires_at: "2030-01-01" };
 test("PKCE uses RFC 7636 S256 vector and fresh independent random verifiers", async () => {
@@ -36,9 +37,21 @@ test("Kakao and SMS request contracts; no credentials cross hosts", async () => 
   expect(new Headers(token.init.headers).get("content-type")).toBe("application/x-www-form-urlencoded");
   expect(Object.fromEntries(new URLSearchParams(String(token.init.body)))).toEqual({ grant_type: "authorization_code", client_id: config.clientId,
     redirect_uri: config.redirectUri, code: "a+&", code_verifier: "verifier", ios_bundle_id: config.iosBundleId });
-  await client.loginWithKakaoIdToken("fixture-id");
+  expect(await client.loginWithKakaoIdToken("fixture-id")).toEqual(issued);
   expect(JSON.parse(String(calls[1]!.init.body))).toEqual({ provider: "kakao", kind: "id_token", id_token: "fixture-id" });
   await client.verifyPhoneCode("pending", "123456");
   expect(JSON.parse(String(calls[2]!.init.body))).toEqual({ pending_id: "pending", code: "123456", kind: "phone_code" });
   for (const call of calls) expect(new Headers(call.init.headers).has("authorization")).toBe(false);
+});
+
+test("Kakao login can require phone verification without issuing a session", async () => {
+  const required = {
+    status: "phone_verification_required",
+    identity_ticket: "fixture-ticket",
+  } satisfies KakaoLoginOutcome;
+  const client = new PickleClient({ fetch: async () => Response.json(required) });
+  const outcome = await client.loginWithKakaoIdToken("fixture-id");
+  if (!("identity_ticket" in outcome)) throw new Error("Expected a phone verification ticket");
+  expect(outcome.identity_ticket).toBe("fixture-ticket");
+  expect(outcome).toEqual(required);
 });

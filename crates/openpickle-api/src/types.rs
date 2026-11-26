@@ -285,6 +285,28 @@ pub struct LoginSessionIssued {
     pub login_session_token: String,
 }
 
+/// The result of exchanging a Kakao ID token with Pickle.
+#[derive(Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum KakaoLoginOutcome {
+    /// Pickle accepted the Kakao identity and requires a phone verification step.
+    PhoneVerificationRequired { identity_ticket: String },
+    /// Pickle issued a session with the same token fields as phone sign-in.
+    #[serde(untagged, deserialize_with = "deserialize_kakao_session")]
+    Issued(LoginSessionIssued),
+}
+
+fn deserialize_kakao_session<'de, D>(deserializer: D) -> Result<LoginSessionIssued, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let session = LoginSessionIssued::deserialize(deserializer)?;
+    if session.status == "phone_verification_required" {
+        return Err(serde::de::Error::missing_field("identity_ticket"));
+    }
+    Ok(session)
+}
+
 // ---- Profile and character ----
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

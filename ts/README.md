@@ -473,6 +473,9 @@ configuration defaults are named constants in `src/kakao.ts`; they are native-cl
 identifiers, not secrets. The Rust SDK has matching helpers: `request_kakao_authorize_url`,
 `exchange_kakao_code`, `login_with_kakao_id_token`, and `KakaoConfig::parse_code`.
 
+The Kakao login result is either a login session or `phone_verification_required`
+with an `identity_ticket`. Only the session result has login tokens.
+
 ### Kakao sign-in in the desktop app
 
 On macOS, current desktop builds offer **Continue with Kakao** on the sign-in form. The app

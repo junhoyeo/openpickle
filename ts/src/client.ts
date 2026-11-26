@@ -10,6 +10,7 @@ import type {
   HistoryDelta,
   HistoryPage,
   HistoryWindow,
+  KakaoLoginOutcome,
   KnownScreens,
   LoginSessionIssued,
   LoginSessionRefresh,
@@ -225,7 +226,7 @@ export class PickleClient {
     return exchangeKakaoCode(this.fetchImpl, code, verifier, config);
   }
 
-  loginWithKakaoIdToken(idToken: string): Promise<LoginSessionIssued> {
+  loginWithKakaoIdToken(idToken: string): Promise<KakaoLoginOutcome> {
     return this.request("POST", "/api/login-sessions", {
       auth: "app", body: { provider: "kakao", kind: "id_token", id_token: idToken },
       headers: this.signInHeaders(), signal: AbortSignal.timeout(30_000),

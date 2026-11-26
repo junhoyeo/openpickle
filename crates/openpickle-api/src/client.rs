@@ -500,8 +500,8 @@ impl PickleClient {
         config.exchange_code(code, verifier).await
     }
 
-    /// The result uses exactly the same persistence and rotation path as SMS login.
-    pub async fn login_with_kakao_id_token(&self, id_token: &str) -> Result<LoginSessionIssued> {
+    /// `POST /api/login-sessions`: issues a login session or asks for phone verification.
+    pub async fn login_with_kakao_id_token(&self, id_token: &str) -> Result<KakaoLoginOutcome> {
         let options = self.sign_in_options()?.json(&json!({
             "provider": "kakao", "kind": "id_token", "id_token": id_token,
         }))?;
