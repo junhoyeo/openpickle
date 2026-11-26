@@ -8,8 +8,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use mock_server::{MockServer, Reply};
 use openpickle_api::{
-    ClientOptions, Credentials, EndPhoneCallOptions, Error, LoginSession, Method, PickleClient,
-    ReplyTo, RequestOptions, SendMessageOptions, decode_access_token,
+    ClientOptions, Credentials, EndPhoneCallOptions, Error, KakaoLoginOutcome, LoginSession,
+    Method, PickleClient, ReplyTo, RequestOptions, SendMessageOptions, decode_access_token,
 };
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
@@ -724,8 +724,15 @@ async fn kakao_and_sms_issue_the_same_session_without_bearer_or_app_proof() {
         .login_with_kakao_id_token("fixture-id")
         .await
         .unwrap();
+    let KakaoLoginOutcome::Issued(kakao) = kakao else {
+        panic!("expected an issued session");
+    };
     let sms = pickle.verify_phone_code("pending", "123456").await.unwrap();
+    assert_eq!(kakao.status, sms.status);
+    assert_eq!(kakao.user_id, sms.user_id);
     assert_eq!(kakao.login_session_token, sms.login_session_token);
+    assert_eq!(kakao.login_session_jwt, sms.login_session_jwt);
+    assert_eq!(kakao.expires_at, sms.expires_at);
     let calls = server.take();
     assert_eq!(calls.len(), 2);
     assert_eq!(
@@ -741,4 +748,33 @@ async fn kakao_and_sms_issue_the_same_session_without_bearer_or_app_proof() {
         assert_eq!(call.header("authorization"), None);
         assert_eq!(call.header("x-pickle-sign-in-flow"), Some("2"));
     }
+}
+
+#[tokio::test]
+async fn kakao_preserves_identity_ticket_when_pickle_requires_phone_verification() {
+    let server = MockServer::start(|_| {
+        Reply::json(
+            200,
+            r#"{"status":"phone_verification_required","identity_ticket":"fixture-ticket"}"#,
+        )
+    })
+    .await;
+    let pickle = client(&server, Credentials::default());
+
+    let outcome = pickle
+        .login_with_kakao_id_token("fixture-id")
+        .await
+        .unwrap();
+
+    let KakaoLoginOutcome::PhoneVerificationRequired { identity_ticket } = outcome else {
+        panic!("expected phone verification");
+    };
+    assert_eq!(identity_ticket, "fixture-ticket");
+    assert_eq!(server.take().len(), 1);
+}
+
+#[test]
+fn kakao_phone_verification_requires_an_identity_ticket() {
+    let response = r#"{"status":"phone_verification_required","user_id":"fixture-user","login_session_token":"fixture-session","login_session_jwt":"fixture-jwt","expires_at":"2030-01-01T00:00:00Z"}"#;
+    assert!(serde_json::from_str::<KakaoLoginOutcome>(response).is_err());
 }

@@ -21,7 +21,9 @@ pub enum LoginEvent {
 
 enum Step {
     Kakao,
-    Phone,
+    Phone {
+        verification_required: bool,
+    },
     /// Waiting for the code texted to this number.
     Code(SharedString),
 }
@@ -58,7 +60,9 @@ impl LoginView {
             cx.subscribe(&code, on_input),
         ];
         Self {
-            step: Step::Phone,
+            step: Step::Phone {
+                verification_required: false,
+            },
             phone,
             code,
             busy: false,
@@ -83,7 +87,9 @@ impl LoginView {
     /// The last request failed; show why and let the user try again.
     pub fn failed(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
         if matches!(self.step, Step::Kakao) {
-            self.step = Step::Phone;
+            self.step = Step::Phone {
+                verification_required: false,
+            };
         }
         self.busy = false;
         self.error = Some(message.into());
@@ -91,9 +97,29 @@ impl LoginView {
     }
 
     pub fn kakao_cancelled(&mut self, cx: &mut Context<Self>) {
-        self.step = Step::Phone;
+        self.step = Step::Phone {
+            verification_required: false,
+        };
         self.busy = false;
         self.error = None;
+        cx.notify();
+    }
+
+    pub fn kakao_phone_verification_required(
+        &mut self,
+        attempt: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_kakao_attempt(attempt) {
+            return;
+        }
+        self.step = Step::Phone {
+            verification_required: true,
+        };
+        self.busy = false;
+        self.error = None;
+        window.focus(&self.phone.focus_handle(cx));
         cx.notify();
     }
 
@@ -102,7 +128,7 @@ impl LoginView {
     }
 
     fn start_kakao(&mut self, cx: &mut Context<Self>) {
-        if self.busy || !matches!(self.step, Step::Phone) {
+        if self.busy || !matches!(self.step, Step::Phone { .. }) {
             return;
         }
         self.kakao_attempt += 1;
@@ -119,7 +145,7 @@ impl LoginView {
         }
         match &self.step {
             Step::Kakao => return,
-            Step::Phone => match normalize_phone(self.phone.read(cx).text()) {
+            Step::Phone { .. } => match normalize_phone(self.phone.read(cx).text()) {
                 Some(phone) => {
                     self.busy = true;
                     self.error = None;
@@ -153,12 +179,9 @@ impl LoginView {
         if matches!(self.step, Step::Kakao) {
             cx.emit(LoginEvent::CancelKakao);
         }
-        self.step = Step::Phone;
-        self.busy = false;
-        self.error = None;
         self.code.update(cx, |code, cx| code.set_text("", cx));
         window.focus(&self.phone.focus_handle(cx));
-        cx.notify();
+        self.kakao_cancelled(cx);
     }
 }
 
@@ -194,7 +217,7 @@ fn field(id: &'static str, input: &Entity<TextInput>) -> Stateful<Div> {
 impl Focusable for LoginView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match self.step {
-            Step::Phone | Step::Kakao => self.phone.focus_handle(cx),
+            Step::Phone { .. } | Step::Kakao => self.phone.focus_handle(cx),
             Step::Code(_) => self.code.focus_handle(cx),
         }
     }
@@ -209,8 +232,15 @@ impl Render for LoginView {
                 field("phone", &self.phone),
                 "Waiting for Kakao…",
             ),
-            Step::Phone => (
-                "Sign in with your phone number".into(),
+            Step::Phone {
+                verification_required,
+            } => (
+                if *verification_required {
+                    "Kakao sign-in succeeded. Verify your phone number to sign in to Pickle."
+                } else {
+                    "Sign in with your phone number"
+                }
+                .into(),
                 field("phone", &self.phone),
                 "Text me a code",
             ),
@@ -259,7 +289,7 @@ impl Render for LoginView {
                     .child(prompt),
             )
             .when(!waiting, |form| form.child(input).child(button));
-        if matches!(self.step, Step::Phone) {
+        if matches!(self.step, Step::Phone { .. }) {
             form = form.child(
                 div()
                     .id("kakao")
@@ -322,6 +352,28 @@ impl Render for LoginView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn kakao_phone_verification_returns_to_the_phone_form(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| LoginView::new(cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.start_kakao(cx);
+                view.kakao_phone_verification_required(0, window, cx);
+                assert!(view.is_kakao_attempt(1));
+                view.kakao_phone_verification_required(1, window, cx);
+                assert!(matches!(
+                    view.step,
+                    Step::Phone {
+                        verification_required: true
+                    }
+                ));
+                assert!(!view.busy);
+                assert!(view.error.is_none());
+                assert!(view.focus_handle(cx).is_focused(window));
+            });
+        });
+    }
 
     #[gpui::test]
     fn kakao_cancel_and_failure_leave_sms_usable(cx: &mut gpui::TestAppContext) {

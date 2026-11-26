@@ -112,6 +112,8 @@ pub enum Update {
     CodeSent,
     /// PKCE is pending in memory; register the callback handler, then open this URL.
     KakaoAuthorize { attempt: u64, url: String },
+    /// Pickle accepted the Kakao identity and requires phone verification.
+    KakaoPhoneVerificationRequired { attempt: u64 },
     /// OAuth failed for this attempt; ignore it after cancellation or retry.
     KakaoFailed { attempt: u64, reason: String },
     /// Requesting or verifying sign-in failed; the text is shown to the user.

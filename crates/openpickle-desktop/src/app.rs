@@ -325,6 +325,13 @@ impl Shell {
                     }).detach();
                 }
             }
+            Update::KakaoPhoneVerificationRequired { attempt } => {
+                if let Screen::Login(login) = &self.screen {
+                    login.update(cx, |login, cx| {
+                        login.kakao_phone_verification_required(attempt, window, cx);
+                    });
+                }
+            }
             Update::KakaoFailed { attempt, reason } => {
                 if let Screen::Login(login) = &self.screen
                     && login.read(cx).is_kakao_attempt(attempt)

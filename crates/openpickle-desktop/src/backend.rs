@@ -18,8 +18,8 @@ use std::{
 use futures::{Stream, StreamExt, channel::mpsc::UnboundedSender as Updates};
 use openpickle_api::{
     ALL_SOCIAL_SCOPES, CardState, ClientOptions, Credentials, Error, ExploreSectionsScreen,
-    HistoryItem, LoginSession, LoginSessionRefresh, MessageContext, PickleClient, PickleEvent,
-    Reaction, ReplyTo, SendMessageOptions, SocialSnapshot,
+    HistoryItem, KakaoLoginOutcome, LoginSession, LoginSessionRefresh, MessageContext,
+    PickleClient, PickleEvent, Reaction, ReplyTo, SendMessageOptions, SocialSnapshot,
     events::{ChatEvent, RoomEvent},
 };
 use serde::{Deserialize, Serialize};
@@ -269,7 +269,13 @@ async fn sign_in(
                     }
                 };
                 let reason = match result {
-                    Ok(issued) => {
+                    Ok(KakaoLoginOutcome::PhoneVerificationRequired { .. }) => {
+                        updates
+                            .unbounded_send(Update::KakaoPhoneVerificationRequired { attempt })
+                            .ok();
+                        continue;
+                    }
+                    Ok(KakaoLoginOutcome::Issued(issued)) => {
                         let session = Session {
                             login_session_token: issued.login_session_token,
                             device_id: uuid::Uuid::new_v4().to_string().to_uppercase(),
